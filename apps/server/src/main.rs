@@ -22,6 +22,7 @@ use platform_core::{
     CreateTaskRequest, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus, WorkspaceRoot,
 };
 use runtime::{CodexRuntimeSession, RuntimeEvent};
+use serde::Deserialize;
 use tokio::{
     process::Command,
     sync::{mpsc, Mutex},
@@ -48,6 +49,23 @@ struct BoardState {
 struct TaskExecutionContext {
     workspace_root: PathBuf,
     prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudInstallRestartTaskRequest {
+    host: String,
+    port: Option<u16>,
+    username: String,
+    auth_method: Option<String>,
+    credential_hint: Option<String>,
+    deploy_path: Option<String>,
+    service_hint: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StackDetection {
+    stacks: Vec<&'static str>,
+    evidence: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -84,6 +102,14 @@ fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
         .route(
             "/api/projects/{project_id}/tasks/seed-docs",
             post(seed_doc_tasks),
+        )
+        .route(
+            "/api/projects/{project_id}/tasks/local-build-restart",
+            post(create_local_build_restart_task),
+        )
+        .route(
+            "/api/projects/{project_id}/tasks/cloud-install-restart",
+            post(create_cloud_install_restart_task),
         )
         .route("/api/projects/{project_id}/explore", post(explore_project))
         .route(
@@ -226,6 +252,35 @@ async fn seed_doc_tasks(
     ensure_project_exists(&guard, project_id)?;
     merge_unique_tasks(&mut guard.tasks, seed_tasks_from_docs(project_id));
     Ok(Json(snapshot_from_state(&guard)))
+}
+
+async fn create_local_build_restart_task(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Task>> {
+    let project = {
+        let guard = state.inner.lock().await;
+        find_project(&guard, project_id)?.clone()
+    };
+    let task = build_local_build_restart_task(&project);
+    let mut guard = state.inner.lock().await;
+    guard.tasks.insert(0, task.clone());
+    Ok(Json(task))
+}
+
+async fn create_cloud_install_restart_task(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    Json(request): Json<CloudInstallRestartTaskRequest>,
+) -> AppResult<Json<Task>> {
+    let project = {
+        let guard = state.inner.lock().await;
+        find_project(&guard, project_id)?.clone()
+    };
+    let task = build_cloud_install_restart_task(&project, request)?;
+    let mut guard = state.inner.lock().await;
+    guard.tasks.insert(0, task.clone());
+    Ok(Json(task))
 }
 
 async fn bootstrap_tasks(
@@ -765,6 +820,332 @@ fn compose_task_prompt(task: &Task, project: &Project, prompt_override: Option<S
     prompt
 }
 
+impl StackDetection {
+    fn summary(&self) -> String {
+        if self.stacks.is_empty() {
+            "未识别到常见构建清单；当前目录可能是文档目录、交付目录，或需要在更深层继续探索。"
+                .into()
+        } else if self.evidence.is_empty() {
+            format!("{}", self.stacks.join("、"))
+        } else {
+            format!(
+                "{}（线索：{}）",
+                self.stacks.join("、"),
+                self.evidence.join("，")
+            )
+        }
+    }
+}
+
+fn build_local_build_restart_task(project: &Project) -> Task {
+    let workspace_root = primary_workspace_path(project).ok();
+    let stack_detection = workspace_root
+        .as_deref()
+        .map(detect_project_stack)
+        .unwrap_or_default();
+    let workspace_path = workspace_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "未配置主工作目录".into());
+
+    Task {
+        id: Uuid::new_v4(),
+        project_id: project.id,
+        title: "本地编译重启".into(),
+        description: format!(
+            "请在当前项目工作目录中完成一次“本地编译重启”尝试，并输出中文结论。\n\
+主工作目录：{}\n\
+初步识别：{}\n\
+\n\
+执行目标：\n\
+1. 先识别项目类型与主要语言，优先判断 Rust、C++、Python、JavaScript / TypeScript，也可补充其他语言或运行时。\n\
+2. 判断当前目录是否具备可执行的依赖安装、构建、打包、启动或重启入口。\n\
+3. 若具备条件，安装缺失依赖、完成本地编译或打包，并重启相关服务；若存在多个服务，要明确说明本次处理范围。\n\
+4. 若缺少入口、配置、环境变量、二进制依赖或启动参数，要明确列出阻塞点与人工确认项。\n\
+5. 若项目根目录没有 deploy.md，请新增；若已有 deploy.md，请补充本地编译、启动、重启、校验和回滚说明。\n\
+\n\
+执行约束：\n\
+- 不要假设当前目录一定是完整代码仓库。\n\
+- 如遇 Word、PDF、图片或其他二进制文件，不要臆造内容，可基于文件名和目录结构做谨慎判断。\n\
+- 不要对项目外目录做破坏性修改。\n\
+- 对需要管理员权限、系统级安装、覆盖已有进程或危险重启的动作，要先说明风险再执行。\n\
+\n\
+交付内容：\n\
+- 识别出的技术栈与关键入口\n\
+- 依赖安装、编译/打包、重启结果\n\
+- deploy.md 的新增或更新说明\n\
+- 风险、阻塞项与下一步建议",
+            workspace_path,
+            stack_detection.summary(),
+        ),
+        status: TaskStatus::Open,
+        claimed_by: None,
+        activities: vec![new_activity(
+            "task.local_build_restart_created",
+            format!("已为项目“{}”创建本地编译重启任务", project.name),
+        )],
+        runtime: None,
+    }
+}
+
+fn build_cloud_install_restart_task(
+    project: &Project,
+    request: CloudInstallRestartTaskRequest,
+) -> AppResult<Task> {
+    let host = request.host.trim();
+    let username = request.username.trim();
+    if host.is_empty() || username.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "云端服务器地址和 SSH 用户名不能为空".into(),
+        ));
+    }
+
+    let auth_method = request
+        .auth_method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("SSH 证书");
+    let credential_hint = sanitize_credential_hint(auth_method, request.credential_hint.as_deref());
+    let deploy_path = request
+        .deploy_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("待确认部署目录");
+    let service_hint = request
+        .service_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("待确认服务名或重启命令");
+    let workspace_root = primary_workspace_path(project).ok();
+    let stack_detection = workspace_root
+        .as_deref()
+        .map(detect_project_stack)
+        .unwrap_or_default();
+
+    Ok(Task {
+        id: Uuid::new_v4(),
+        project_id: project.id,
+        title: "云端安装重启".into(),
+        description: format!(
+            "请为当前项目执行一次“云端安装重启”任务，并输出中文结论。\n\
+\n\
+远端信息：\n\
+- 主机/IP：{}\n\
+- 端口：{}\n\
+- SSH 用户：{}\n\
+- 认证方式：{}\n\
+- 凭据说明：{}\n\
+- 部署目录：{}\n\
+- 服务信息：{}\n\
+\n\
+本地初步识别：{}\n\
+\n\
+执行目标：\n\
+1. 结合本地项目内容识别主要技术栈，优先判断 Rust、C++、Python、JavaScript / TypeScript，也可补充其他语言或运行时。\n\
+2. 规划并执行远端依赖安装、构建/打包、发布、服务重启与可用性校验步骤。\n\
+3. 若凭据和网络条件具备，可尝试通过 SSH 登录并执行；若不具备，要明确说明阻塞点和所需人工补充信息。\n\
+4. 若项目根目录没有 deploy.md，请新增；若已有 deploy.md，请补充远端部署、重启、回滚和校验方法。\n\
+5. 对覆盖发布、系统级安装、服务停机、数据迁移等高风险操作，要先记录风险与回滚方案。\n\
+\n\
+安全要求：\n\
+- 不要把明文密码写入 deploy.md、任务结论或长期日志。\n\
+- 优先使用已配置 SSH 证书、私钥路径或凭据别名。\n\
+- 如需临时补充密码，建议在任务启动前通过提示词补充，不要长期保存在任务描述。\n\
+\n\
+交付内容：\n\
+- 远端连通性与认证结果\n\
+- 依赖安装、构建/部署、重启与校验结果\n\
+- deploy.md 的新增或更新说明\n\
+- 风险、阻塞项与下一步建议",
+            host,
+            request.port.unwrap_or(22),
+            username,
+            auth_method,
+            credential_hint,
+            deploy_path,
+            service_hint,
+            stack_detection.summary(),
+        ),
+        status: TaskStatus::Open,
+        claimed_by: None,
+        activities: vec![new_activity(
+            "task.cloud_install_restart_created",
+            format!("已为项目“{}”创建云端安装重启任务", project.name),
+        )],
+        runtime: None,
+    })
+}
+
+fn sanitize_credential_hint(auth_method: &str, credential_hint: Option<&str>) -> String {
+    let trimmed = credential_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if auth_method.contains("密码") {
+        if trimmed.is_some() {
+            "已收到密码类凭据，但为安全起见不在任务描述中回显；请在启动任务前临时补充。".into()
+        } else {
+            "未记录明文密码；如需密码登录，请在启动任务前临时补充。".into()
+        }
+    } else {
+        trimmed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "建议使用已配置 SSH 证书、私钥路径或系统凭据别名".into())
+    }
+}
+
+fn detect_project_stack(workspace_root: &Path) -> StackDetection {
+    let files = collect_workspace_files(workspace_root, 2);
+    let rules = [
+        ("Rust", ["Cargo.toml"].as_slice()),
+        (
+            "JavaScript / TypeScript",
+            [
+                "package.json",
+                "pnpm-workspace.yaml",
+                "package-lock.json",
+                "yarn.lock",
+                "tsconfig.json",
+            ]
+            .as_slice(),
+        ),
+        (
+            "Python",
+            ["pyproject.toml", "requirements.txt", "Pipfile", "setup.py"].as_slice(),
+        ),
+        (
+            "C++",
+            [
+                "CMakeLists.txt",
+                "meson.build",
+                "conanfile.txt",
+                "conanfile.py",
+                "Makefile",
+            ]
+            .as_slice(),
+        ),
+    ];
+
+    let mut detection = StackDetection::default();
+    for (stack, file_names) in rules {
+        let matches = files
+            .iter()
+            .filter_map(|path| {
+                let file_name = path.file_name()?.to_str()?;
+                file_names
+                    .contains(&file_name)
+                    .then(|| display_relative_path(workspace_root, path))
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            detection.stacks.push(stack);
+            detection.evidence.extend(matches);
+        }
+    }
+
+    if detection.stacks.is_empty() {
+        let extension_rules = [
+            ("Rust", ["rs"].as_slice()),
+            (
+                "JavaScript / TypeScript",
+                ["js", "jsx", "ts", "tsx"].as_slice(),
+            ),
+            ("Python", ["py"].as_slice()),
+            ("C++", ["cpp", "cc", "cxx", "hpp", "hh", "h"].as_slice()),
+        ];
+        for (stack, extensions) in extension_rules {
+            let matches = files
+                .iter()
+                .filter_map(|path| {
+                    let extension = path.extension()?.to_str()?;
+                    extensions
+                        .contains(&extension)
+                        .then(|| display_relative_path(workspace_root, path))
+                })
+                .take(2)
+                .collect::<Vec<_>>();
+            if !matches.is_empty() {
+                detection.stacks.push(stack);
+                detection.evidence.extend(matches);
+            }
+        }
+    }
+
+    detection
+}
+
+fn collect_workspace_files(base: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_workspace_files_inner(base, base, 0, max_depth, &mut files);
+    files
+}
+
+fn collect_workspace_files_inner(
+    base: &Path,
+    current: &Path,
+    depth: usize,
+    max_depth: usize,
+    files: &mut Vec<PathBuf>,
+) {
+    if depth > max_depth {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+            continue;
+        }
+
+        if !path.is_dir() || depth == max_depth {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if should_skip_workspace_dir(base, &path, name) {
+            continue;
+        }
+
+        collect_workspace_files_inner(base, &path, depth + 1, max_depth, files);
+    }
+}
+
+fn should_skip_workspace_dir(base: &Path, path: &Path, name: &str) -> bool {
+    [
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        ".turbo",
+        ".venv",
+        "venv",
+        "__pycache__",
+    ]
+    .contains(&name)
+        || path == base.join("tmp")
+}
+
+fn display_relative_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
 fn build_exploration_task(project: &Project) -> Task {
     let workspace_list = project
         .workspace_roots
@@ -952,15 +1333,18 @@ fn timestamp_compact() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_app, RuntimeMode};
+    use super::{build_app, detect_project_stack, sanitize_credential_hint, RuntimeMode};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
     use platform_core::{
-        AgentInvocationRequest, AgentResumeRequest, BoardSnapshot, CreateTaskRequest,
+        AgentInvocationRequest, AgentResumeRequest, BoardSnapshot, CreateTaskRequest, Task,
     };
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use tower::util::ServiceExt;
 
     fn test_app() -> axum::Router {
@@ -973,6 +1357,13 @@ mod tests {
     }
 
     async fn read_snapshot(response: axum::response::Response) -> BoardSnapshot {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn read_task(response: axum::response::Response) -> Task {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1092,6 +1483,97 @@ mod tests {
             .tasks
             .iter()
             .any(|task| { task.project_id == project_id && task.title == "补充回归测试" }));
+    }
+
+    #[tokio::test]
+    async fn local_build_restart_endpoint_creates_task_with_stack_hint() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let spotlight_project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.is_spotlight_self)
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/projects/{}/tasks/local-build-restart",
+                        spotlight_project.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let task = read_task(response).await;
+        assert_eq!(task.project_id, spotlight_project.id);
+        assert_eq!(task.title, "本地编译重启");
+        assert!(task.description.contains("deploy.md"));
+        assert!(task.description.contains("Rust"));
+    }
+
+    #[tokio::test]
+    async fn cloud_install_restart_endpoint_redacts_password_like_hint() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let payload = serde_json::json!({
+            "host": "10.0.0.8",
+            "port": 22,
+            "username": "deploy",
+            "auth_method": "密码",
+            "credential_hint": "super-secret",
+            "deploy_path": "/srv/spotlight",
+            "service_hint": "systemctl restart spotlight"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/projects/{}/tasks/cloud-install-restart",
+                        project_id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let task = read_task(response).await;
+        assert_eq!(task.title, "云端安装重启");
+        assert!(task.description.contains("10.0.0.8"));
+        assert!(task.description.contains("已收到密码类凭据"));
+        assert!(!task.description.contains("super-secret"));
     }
 
     #[tokio::test]
@@ -1292,5 +1774,38 @@ mod tests {
             .find(|candidate| candidate.id == agent.id)
             .unwrap();
         assert_eq!(updated_agent.status, "空闲");
+    }
+
+    #[test]
+    fn detect_project_stack_can_find_nested_python_workspace() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!("spotlight-stack-test-{unique}"));
+        let nested_dir = temp_root.join("services").join("api");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(
+            nested_dir.join("pyproject.toml"),
+            "[project]\nname='demo'\n",
+        )
+        .unwrap();
+
+        let detection = detect_project_stack(&temp_root);
+
+        assert!(detection.stacks.contains(&"Python"));
+        assert!(detection
+            .evidence
+            .iter()
+            .any(|item| item.contains("pyproject.toml")));
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn sanitize_credential_hint_redacts_plaintext_passwords() {
+        let hint = sanitize_credential_hint("密码", Some("plain-text-password"));
+        assert!(hint.contains("不在任务描述中回显"));
+        assert!(!hint.contains("plain-text-password"));
     }
 }

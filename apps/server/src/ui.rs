@@ -77,6 +77,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       color: var(--text);
       border: 1px solid var(--border);
     }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
     button.warn { background: var(--warn); }
     button.success { background: var(--success); }
     input, textarea, select {
@@ -110,6 +114,15 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .project-card { margin-bottom: 12px; }
     .project-card h3, .detail-card h3, .detail-card h4 { margin: 0 0 8px; }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .section-head h4 { margin: 0; }
     .create-box { display: grid; gap: 8px; margin-bottom: 14px; }
     .task-list {
       display: grid;
@@ -159,6 +172,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       overflow: auto;
       line-height: 1.55;
       white-space: pre-wrap;
+    }
+    .log-textarea {
+      min-height: 180px;
+      resize: none;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: pre-wrap;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 13px;
+    }
+    .copy-feedback {
+      min-height: 18px;
+      font-size: 12px;
     }
     .log-item {
       padding-bottom: 10px;
@@ -244,8 +270,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             </div>
           </div>
           <div class="detail-card">
-            <h4>会话日志</h4>
-            <div id="runtimeLog" class="log muted">请选择左侧任务后查看日志。</div>
+            <div class="section-head">
+              <h4>会话日志</h4>
+              <div class="inline-actions">
+                <span id="runtimeLogCopyFeedback" class="copy-feedback muted" aria-live="polite"></span>
+                <button id="copyRuntimeLogButton" class="secondary" type="button" onclick="copyRuntimeLog()" disabled>复制日志</button>
+              </div>
+            </div>
+            <textarea id="runtimeLog" class="log log-textarea muted" readonly spellcheck="false">请选择左侧任务后查看日志。</textarea>
           </div>
           <div class="detail-card">
             <h4>活动记录</h4>
@@ -344,6 +376,74 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       await loadBoard();
     }
 
+    async function createLocalBuildRestartTask() {
+      if (!selectedProjectId) return;
+      const task = await request(`/api/projects/${selectedProjectId}/tasks/local-build-restart`, {
+        method: "POST"
+      });
+      selectedTaskId = task.id;
+      await loadBoard();
+    }
+
+    async function createCloudInstallRestartTask() {
+      if (!selectedProjectId) return;
+      const host = window.prompt("请输入云端服务器 IP 或域名：");
+      if (!host || !host.trim()) {
+        return;
+      }
+      const username = window.prompt("请输入 SSH 用户名：", "root");
+      if (!username || !username.trim()) {
+        return;
+      }
+      const portInput = window.prompt("请输入 SSH 端口：", "22");
+      if (portInput === null) {
+        return;
+      }
+      const authMethod = window.prompt(
+        "请输入认证方式（例如：SSH 证书、SSH 私钥、密码）：",
+        "SSH 证书"
+      );
+      if (authMethod === null) {
+        return;
+      }
+      const credentialHint = window.prompt(
+        "请输入凭据说明（建议填写证书路径或凭据别名；如使用密码，建议不要在这里填写明文密码）：",
+        "使用本机已配置 SSH 证书"
+      );
+      if (credentialHint === null) {
+        return;
+      }
+      const deployPath = window.prompt("请输入部署目录（可选）：", "/srv/app");
+      if (deployPath === null) {
+        return;
+      }
+      const serviceHint = window.prompt("请输入服务名或重启命令（可选）：", "");
+      if (serviceHint === null) {
+        return;
+      }
+
+      const normalizedPort = portInput.trim() ? Number(portInput.trim()) : 22;
+      if (!Number.isInteger(normalizedPort) || normalizedPort <= 0) {
+        alert("SSH 端口必须是正整数。");
+        return;
+      }
+
+      const task = await request(`/api/projects/${selectedProjectId}/tasks/cloud-install-restart`, {
+        method: "POST",
+        body: JSON.stringify({
+          host: host.trim(),
+          port: normalizedPort,
+          username: username.trim(),
+          auth_method: authMethod.trim(),
+          credential_hint: credentialHint.trim(),
+          deploy_path: deployPath.trim(),
+          service_hint: serviceHint.trim()
+        })
+      });
+      selectedTaskId = task.id;
+      await loadBoard();
+    }
+
     function selectedAgentId() {
       return document.getElementById("agentSelect").value;
     }
@@ -395,6 +495,73 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       await loadBoard();
     }
 
+    function formatRuntimeEntries(entries) {
+      return entries
+        .map(item => `[${item.kind}]\n${item.message}`)
+        .join("\n\n");
+    }
+
+    function resizeRuntimeLog() {
+      const runtimeLog = document.getElementById("runtimeLog");
+      if (!runtimeLog) {
+        return;
+      }
+
+      runtimeLog.style.height = "auto";
+      const viewportLimit = Math.max(Math.floor(window.innerHeight * 0.52), 220);
+      const nextHeight = Math.min(runtimeLog.scrollHeight, viewportLimit);
+      runtimeLog.style.height = `${Math.max(nextHeight, 180)}px`;
+    }
+
+    function setRuntimeLogText(text, muted = false, copyEnabled = false) {
+      const runtimeLog = document.getElementById("runtimeLog");
+      const copyButton = document.getElementById("copyRuntimeLogButton");
+      const feedback = document.getElementById("runtimeLogCopyFeedback");
+
+      runtimeLog.value = text;
+      runtimeLog.classList.toggle("muted", muted);
+      copyButton.disabled = !copyEnabled;
+      feedback.textContent = "";
+      resizeRuntimeLog();
+    }
+
+    let runtimeLogCopyFeedbackTimer = null;
+
+    function showRuntimeLogCopyFeedback(message) {
+      const feedback = document.getElementById("runtimeLogCopyFeedback");
+      if (!feedback) {
+        return;
+      }
+
+      feedback.textContent = message;
+      if (runtimeLogCopyFeedbackTimer) {
+        clearTimeout(runtimeLogCopyFeedbackTimer);
+      }
+      runtimeLogCopyFeedbackTimer = setTimeout(() => {
+        feedback.textContent = "";
+      }, 1800);
+    }
+
+    async function copyRuntimeLog() {
+      const runtimeLog = document.getElementById("runtimeLog");
+      const text = runtimeLog?.value?.trim() || "";
+
+      if (!text) {
+        showRuntimeLogCopyFeedback("当前没有可复制的日志。");
+        return;
+      }
+
+      try {
+        await navigator.clipboard.writeText(text);
+        showRuntimeLogCopyFeedback("日志已复制到剪贴板。");
+      } catch (error) {
+        runtimeLog.focus();
+        runtimeLog.select();
+        const copied = document.execCommand && document.execCommand("copy");
+        showRuntimeLogCopyFeedback(copied ? "日志已复制到剪贴板。" : "复制失败，请手动选择文本。");
+      }
+    }
+
     async function toggleSelectedAgentAutoMode() {
       const agentId = selectedAgentId();
       if (!agentId) return;
@@ -441,10 +608,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <button class="secondary" onclick="seedDocs()">从文档补种任务</button>
           ` : ``}
         </div>
+        <div class="toolbar" style="margin-top:8px;">
+          <button class="secondary" onclick="createLocalBuildRestartTask()">本地编译重启</button>
+          <button class="secondary" onclick="createCloudInstallRestartTask()">云端安装重启</button>
+        </div>
         <div class="muted" style="margin-top:10px;">
           ${project.is_spotlight_self
-            ? "这是 Spotlight 自举项目，会自动从文档中生成版本任务。"
-            : "这个项目目录可以是空的，也可以只有文档；点击“探索目录”会创建一条预制探索任务。"}
+            ? "这是 Spotlight 自举项目，会自动从文档中生成版本任务；也可以直接生成本地编译或云端部署重启任务。"
+            : "这个项目目录可以是空的，也可以只有文档；点击“探索目录”会创建探索任务，也可以直接生成本地编译或云端部署重启任务。"}
         </div>
       `;
     }
@@ -487,12 +658,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     function renderDetail() {
       const task = tasksForCurrentProject().find(item => item.id === selectedTaskId);
       const taskDetail = document.getElementById("taskDetail");
-      const runtimeLog = document.getElementById("runtimeLog");
       const activityLog = document.getElementById("activityLog");
 
       if (!task) {
         taskDetail.innerHTML = `<div class="muted">当前项目还没有选中的任务。</div>`;
-        runtimeLog.textContent = "暂无日志。";
+        setRuntimeLogText("暂无日志。", true, false);
         activityLog.textContent = "暂无活动。";
         return;
       }
@@ -508,14 +678,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       `;
 
       const runtimeEntries = task.runtime?.log || [];
-      runtimeLog.innerHTML = runtimeEntries.length
-        ? runtimeEntries.map(item => `
-            <div class="log-item">
-              <strong>${escapeHtml(item.kind)}</strong>
-              <div>${escapeHtml(item.message)}</div>
-            </div>
-          `).join("")
-        : "当前任务还没有会话日志。";
+      setRuntimeLogText(
+        runtimeEntries.length ? formatRuntimeEntries(runtimeEntries) : "当前任务还没有会话日志。",
+        !runtimeEntries.length,
+        runtimeEntries.length > 0
+      );
 
       activityLog.innerHTML = task.activities.length
         ? [...task.activities].reverse().map(item => `
@@ -588,7 +755,38 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     loadBoard();
     setInterval(loadBoard, 2500);
+    window.addEventListener("resize", resizeRuntimeLog);
   </script>
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::INDEX_HTML;
+
+    #[test]
+    fn runtime_log_uses_copyable_textarea() {
+        assert!(INDEX_HTML.contains("id=\"copyRuntimeLogButton\""));
+        assert!(INDEX_HTML.contains("onclick=\"copyRuntimeLog()\""));
+        assert!(INDEX_HTML.contains("<textarea id=\"runtimeLog\""));
+        assert!(INDEX_HTML.contains("readonly spellcheck=\"false\""));
+        assert!(INDEX_HTML.contains("document.execCommand(\"copy\")"));
+    }
+
+    #[test]
+    fn runtime_log_resizes_with_viewport_changes() {
+        assert!(INDEX_HTML.contains("function resizeRuntimeLog()"));
+        assert!(INDEX_HTML.contains("window.addEventListener(\"resize\", resizeRuntimeLog)"));
+        assert!(INDEX_HTML.contains("overflow-wrap: anywhere;"));
+    }
+
+    #[test]
+    fn project_card_includes_local_and_cloud_restart_actions() {
+        assert!(INDEX_HTML.contains("createLocalBuildRestartTask()"));
+        assert!(INDEX_HTML.contains("createCloudInstallRestartTask()"));
+        assert!(INDEX_HTML.contains("本地编译重启"));
+        assert!(INDEX_HTML.contains("云端安装重启"));
+        assert!(INDEX_HTML.contains("证书路径或凭据别名"));
+    }
+}
