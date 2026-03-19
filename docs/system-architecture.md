@@ -287,6 +287,12 @@ This enables:
 - Postgres required
 - WebSocket gateway can be embedded in the same service
 
+Pragmatic bootstrap note for `0.1.x` local development:
+
+- before the shared Postgres service is introduced, the local bootstrap server may persist board state, users, projects, tasks, and runtime summaries to a local state file
+- this local persistence is only a self-hosting bridge for early iterations, not the final multi-user source of truth
+- once central coordination is enabled for shared use, Postgres remains the required system of record
+
 ### 10.3 Future Split
 
 Possible future service decomposition:

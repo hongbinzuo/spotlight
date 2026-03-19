@@ -215,8 +215,22 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <header>
-    <h1>Spotlight 0.1.0</h1>
-    <p>左侧是任务看板，右侧是 Agent 面板。当前支持项目切换、自动认领、探索目录、启动任务、暂停、补充提示词后恢复。</p>
+    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;">
+      <div>
+        <h1>Spotlight 0.1.0</h1>
+        <p>左侧是任务看板，右侧是 Agent 面板。当前支持项目切换、自动认领、探索目录、启动任务、暂停、补充提示词后恢复。</p>
+      </div>
+      <div class="detail-card" style="min-width:280px; padding:12px 14px;">
+        <div class="section-head" style="margin-bottom:6px;">
+          <h4>当前用户</h4>
+          <span id="currentUserBadge" class="pill">未登录</span>
+        </div>
+        <div class="inline-actions">
+          <select id="userSelect" style="min-width:160px;"></select>
+          <button class="secondary" onclick="loginSelectedUser()">切换用户</button>
+        </div>
+      </div>
+    </div>
   </header>
   <main>
     <section class="panel">
@@ -288,7 +302,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     </section>
   </main>
   <script>
-    let board = { projects: [], tasks: [], agents: [] };
+    let board = { current_user: null, users: [], projects: [], tasks: [], agents: [] };
     let selectedProjectId = null;
     let selectedTaskId = null;
     let selectedAgentIdState = null;
@@ -306,6 +320,39 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function selectedProject() {
       return board.projects.find(project => project.id === selectedProjectId) || null;
+    }
+
+    function currentUser() {
+      return board.current_user || board.users[0] || null;
+    }
+
+    function userById(userId) {
+      return board.users.find(user => user.id === userId) || null;
+    }
+
+    function agentById(agentId) {
+      return board.agents.find(agent => agent.id === agentId) || null;
+    }
+
+    function taskCreatorLabel(task) {
+      const creator = userById(task.creator_user_id);
+      return creator ? creator.display_name : "未记录创建者";
+    }
+
+    function taskClaimLabel(task) {
+      if (!task.claimed_by) {
+        return "未认领";
+      }
+
+      const agent = agentById(task.claimed_by);
+      if (!agent) {
+        return "已认领";
+      }
+
+      const owner = userById(agent.owner_user_id);
+      return owner
+        ? `${agent.name} / ${owner.display_name}`
+        : agent.name;
     }
 
     function tasksForCurrentProject() {
@@ -342,6 +389,17 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       } catch (error) {
         console.error(error);
       }
+    }
+
+    async function loginSelectedUser() {
+      const select = document.getElementById("userSelect");
+      const username = select?.value;
+      if (!username) return;
+      await request("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username })
+      });
+      await loadBoard();
     }
 
     async function createTask() {
@@ -574,6 +632,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       await loadBoard();
     }
 
+    function renderHeaderAuth() {
+      const current = currentUser();
+      const badge = document.getElementById("currentUserBadge");
+      const select = document.getElementById("userSelect");
+
+      badge.textContent = current ? `${current.display_name} / ${current.role}` : "未登录";
+      select.innerHTML = board.users.map(user => `
+        <option value="${user.username}" ${current && user.id === current.id ? "selected" : ""}>
+          ${escapeHtml(user.display_name)} / ${escapeHtml(user.role)}
+        </option>
+      `).join("");
+    }
+
     function renderProjectCard() {
       const project = selectedProject();
       const root = document.getElementById("projectCard");
@@ -649,7 +720,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="muted">${escapeHtml(task.description.slice(0, 72))}${task.description.length > 72 ? "..." : ""}</div>
           <div class="meta">
             <span class="pill">${statusLabel(task.status)}</span>
-            <span class="pill">${task.claimed_by ? "已有 Agent" : "未认领"}</span>
+            <span class="pill">创建者 ${escapeHtml(taskCreatorLabel(task))}</span>
+            <span class="pill">${escapeHtml(taskClaimLabel(task))}</span>
           </div>
         </article>
       `).join("");
@@ -672,6 +744,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="meta">
           <span class="pill">${statusLabel(task.status)}</span>
           <span class="pill">任务 ID ${task.id.slice(0, 8)}</span>
+          <span class="pill">创建者 ${escapeHtml(taskCreatorLabel(task))}</span>
+          <span class="pill">认领 ${escapeHtml(taskClaimLabel(task))}</span>
           <span class="pill">${task.runtime?.thread_id ? "长会话已建立" : "尚未建立长会话"}</span>
         </div>
         <p class="description">${escapeHtml(task.description)}</p>
@@ -725,6 +799,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function render() {
+      renderHeaderAuth();
       renderProjectCard();
       renderSummary();
       renderTaskList();

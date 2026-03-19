@@ -27,12 +27,24 @@ impl Project {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    pub username: String,
+    pub display_name: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
     pub project_id: Uuid,
     pub title: String,
     pub description: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub creator_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub assignee_user_id: Option<Uuid>,
     pub claimed_by: Option<Uuid>,
     pub activities: Vec<TaskActivity>,
     pub runtime: Option<TaskRuntime>,
@@ -88,6 +100,8 @@ pub struct RuntimeLogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: Uuid,
+    #[serde(default)]
+    pub owner_user_id: Option<Uuid>,
     pub name: String,
     pub provider: String,
     pub status: String,
@@ -98,6 +112,8 @@ pub struct Agent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardSnapshot {
+    pub current_user: Option<User>,
+    pub users: Vec<User>,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     pub agents: Vec<Agent>,
@@ -271,6 +287,8 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
         title: title.into(),
         description: description.into(),
         status: TaskStatus::Open,
+        creator_user_id: None,
+        assignee_user_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.seeded",

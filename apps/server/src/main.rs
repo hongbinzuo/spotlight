@@ -10,19 +10,20 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
-    response::Html,
+    extract::{Json as ExtractJson, Path as AxumPath, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use platform_core::{
     merge_unique_tasks, new_activity, new_runtime_entry, seed_tasks_from_agents_markdown,
     seed_tasks_from_docs, Agent, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
-    CreateTaskRequest, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus, WorkspaceRoot,
+    CreateTaskRequest, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus, User,
+    WorkspaceRoot,
 };
 use runtime::{CodexRuntimeSession, RuntimeEvent};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
     sync::{mpsc, Mutex},
@@ -36,10 +37,12 @@ struct AppState {
     inner: Arc<Mutex<BoardState>>,
     runtime_mode: RuntimeMode,
     runtime_sessions: Arc<Mutex<HashMap<Uuid, Arc<CodexRuntimeSession>>>>,
+    store_path: PathBuf,
 }
 
 #[derive(Clone)]
 struct BoardState {
+    users: Vec<User>,
     projects: Vec<Project>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
@@ -75,6 +78,25 @@ struct GitTaskBranchPlan {
     remote_name: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedState {
+    users: Vec<User>,
+    projects: Vec<Project>,
+    tasks: Vec<Task>,
+    agents: Vec<Agent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthSnapshot {
+    current_user: Option<User>,
+    users: Vec<User>,
+}
+
 #[derive(Clone, Copy)]
 enum RuntimeMode {
     RealCodex,
@@ -100,6 +122,8 @@ async fn main() {
 fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/api/me", get(get_me))
+        .route("/api/auth/login", post(login))
         .route("/api/board", get(get_board))
         .route("/api/tasks", post(create_task))
         .route(
@@ -131,21 +155,19 @@ fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
 }
 
 fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState {
-    let projects = default_projects(&workspace_root);
-    let mut tasks = Vec::new();
-    if let Some(spotlight_project) = projects.iter().find(|project| project.is_spotlight_self) {
-        merge_unique_tasks(&mut tasks, seed_tasks_from_docs(spotlight_project.id));
-        merge_unique_tasks(&mut tasks, seed_tasks_from_agents_file(spotlight_project));
-    }
+    let store_path = state_store_path(&workspace_root);
+    let persisted = load_or_initialize_state(&workspace_root, &store_path);
 
     AppState {
         inner: Arc::new(Mutex::new(BoardState {
-            projects,
-            tasks,
-            agents: default_agents(),
+            users: persisted.users,
+            projects: persisted.projects,
+            tasks: persisted.tasks,
+            agents: persisted.agents,
         })),
         runtime_mode,
         runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
+        store_path,
     }
 }
 
@@ -181,10 +203,35 @@ fn default_projects(workspace_root: &Path) -> Vec<Project> {
     ]
 }
 
-fn default_agents() -> Vec<Agent> {
+fn default_users() -> Vec<User> {
+    let username = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "spotlight".into());
+
+    vec![
+        User {
+            id: Uuid::new_v4(),
+            username: username.clone(),
+            display_name: username,
+            role: "admin".into(),
+        },
+        User {
+            id: Uuid::new_v4(),
+            username: "reviewer".into(),
+            display_name: "评审用户".into(),
+            role: "member".into(),
+        },
+    ]
+}
+
+fn default_agents(users: &[User]) -> Vec<Agent> {
+    let primary_user_id = users.first().map(|user| user.id);
+    let reviewer_user_id = users.get(1).map(|user| user.id).or(primary_user_id);
+
     vec![
         Agent {
             id: Uuid::new_v4(),
+            owner_user_id: primary_user_id,
             name: "本地 Codex Agent".into(),
             provider: "codex".into(),
             status: "空闲".into(),
@@ -194,6 +241,7 @@ fn default_agents() -> Vec<Agent> {
         },
         Agent {
             id: Uuid::new_v4(),
+            owner_user_id: reviewer_user_id,
             name: "评审助理".into(),
             provider: "codex".into(),
             status: "空闲".into(),
@@ -202,6 +250,61 @@ fn default_agents() -> Vec<Agent> {
             last_action: "等待补充提示词、验收说明或人工协作".into(),
         },
     ]
+}
+
+fn state_store_path(workspace_root: &Path) -> PathBuf {
+    #[cfg(test)]
+    {
+        let _ = workspace_root;
+        return std::env::temp_dir().join(format!(
+            "spotlight-server-state-{}.json",
+            Uuid::new_v4()
+        ));
+    }
+
+    #[cfg(not(test))]
+    workspace_root
+        .join(".spotlight")
+        .join("server-state.json")
+}
+
+fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> PersistedState {
+    if let Ok(content) = std::fs::read_to_string(store_path) {
+        if let Ok(state) = serde_json::from_str::<PersistedState>(&content) {
+            return state;
+        }
+    }
+
+    let users = default_users();
+    let projects = default_projects(workspace_root);
+    let mut tasks = Vec::new();
+    if let Some(spotlight_project) = projects.iter().find(|project| project.is_spotlight_self) {
+        merge_unique_tasks(&mut tasks, seed_tasks_from_docs(spotlight_project.id));
+        merge_unique_tasks(&mut tasks, seed_tasks_from_agents_file(spotlight_project));
+    }
+    let primary_user_id = users.first().map(|user| user.id);
+    for task in &mut tasks {
+        task.creator_user_id = primary_user_id;
+    }
+
+    let state = PersistedState {
+        users: users.clone(),
+        projects,
+        tasks,
+        agents: default_agents(&users),
+    };
+    let _ = persist_state_to_path(store_path, &state);
+    state
+}
+
+fn persist_state_to_path(store_path: &Path, state: &PersistedState) -> Result<(), String> {
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建状态目录失败：{error}"))?;
+    }
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|error| format!("序列化服务端状态失败：{error}"))?;
+    std::fs::write(store_path, content).map_err(|error| format!("写入状态文件失败：{error}"))
 }
 
 fn seed_tasks_from_agents_file(project: &Project) -> Vec<Task> {
@@ -217,13 +320,57 @@ async fn index() -> Html<&'static str> {
     Html(ui::INDEX_HTML)
 }
 
-async fn get_board(State(state): State<AppState>) -> Json<BoardSnapshot> {
+async fn get_me(State(state): State<AppState>, headers: HeaderMap) -> Json<AuthSnapshot> {
     let guard = state.inner.lock().await;
-    Json(snapshot_from_state(&guard))
+    let current_user = resolve_current_user(&guard, &headers);
+    Json(AuthSnapshot {
+        current_user,
+        users: guard.users.clone(),
+    })
+}
+
+async fn login(
+    State(state): State<AppState>,
+    ExtractJson(request): ExtractJson<LoginRequest>,
+) -> AppResult<Response> {
+    let guard = state.inner.lock().await;
+    let user = guard
+        .users
+        .iter()
+        .find(|user| user.username == request.username.trim())
+        .cloned()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到对应用户".into()))?;
+    let users = guard.users.clone();
+    drop(guard);
+
+    let cookie_value = build_auth_cookie(&user.id);
+    let response = (
+        [(header::SET_COOKIE, HeaderValue::from_str(&cookie_value).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("设置登录 Cookie 失败：{error}"),
+            )
+        })?)],
+        Json(AuthSnapshot {
+            current_user: Some(user),
+            users,
+        }),
+    )
+        .into_response();
+    Ok(response)
+}
+
+async fn get_board(State(state): State<AppState>, headers: HeaderMap) -> Json<BoardSnapshot> {
+    let guard = state.inner.lock().await;
+    Json(snapshot_from_state_with_user(
+        &guard,
+        resolve_current_user(&guard, &headers),
+    ))
 }
 
 async fn create_task(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<CreateTaskRequest>,
 ) -> AppResult<Json<Task>> {
     let title = request.title.trim();
@@ -234,12 +381,15 @@ async fn create_task(
 
     let mut guard = state.inner.lock().await;
     let project = resolve_project_for_new_task(&guard, request.project_id)?.clone();
+    let current_user = resolve_current_user(&guard, &headers);
     let task = Task {
         id: Uuid::new_v4(),
         project_id: project.id,
         title: title.to_string(),
         description: description.to_string(),
         status: TaskStatus::Open,
+        creator_user_id: current_user.as_ref().map(|user| user.id),
+        assignee_user_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.created",
@@ -248,6 +398,8 @@ async fn create_task(
         runtime: None,
     };
     guard.tasks.insert(0, task.clone());
+    drop(guard);
+    persist_state(&state).await?;
     Ok(Json(task))
 }
 
@@ -258,35 +410,52 @@ async fn seed_doc_tasks(
     let mut guard = state.inner.lock().await;
     ensure_project_exists(&guard, project_id)?;
     merge_unique_tasks(&mut guard.tasks, seed_tasks_from_docs(project_id));
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn create_local_build_restart_task(
     AxumPath(project_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<Task>> {
-    let project = {
+    let (project, current_user) = {
         let guard = state.inner.lock().await;
-        find_project(&guard, project_id)?.clone()
+        (
+            find_project(&guard, project_id)?.clone(),
+            resolve_current_user(&guard, &headers),
+        )
     };
-    let task = build_local_build_restart_task(&project);
+    let mut task = build_local_build_restart_task(&project);
+    task.creator_user_id = current_user.as_ref().map(|user| user.id);
     let mut guard = state.inner.lock().await;
     guard.tasks.insert(0, task.clone());
+    drop(guard);
+    persist_state(&state).await?;
     Ok(Json(task))
 }
 
 async fn create_cloud_install_restart_task(
     AxumPath(project_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<CloudInstallRestartTaskRequest>,
 ) -> AppResult<Json<Task>> {
-    let project = {
+    let (project, current_user) = {
         let guard = state.inner.lock().await;
-        find_project(&guard, project_id)?.clone()
+        (
+            find_project(&guard, project_id)?.clone(),
+            resolve_current_user(&guard, &headers),
+        )
     };
-    let task = build_cloud_install_restart_task(&project, request)?;
+    let mut task = build_cloud_install_restart_task(&project, request)?;
+    task.creator_user_id = current_user.as_ref().map(|user| user.id);
     let mut guard = state.inner.lock().await;
     guard.tasks.insert(0, task.clone());
+    drop(guard);
+    persist_state(&state).await?;
     Ok(Json(task))
 }
 
@@ -301,24 +470,35 @@ async fn bootstrap_tasks(
     let incoming = seed_tasks_from_agents_file(&project);
     let mut guard = state.inner.lock().await;
     merge_unique_tasks(&mut guard.tasks, incoming);
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn explore_project(
     AxumPath(project_id): AxumPath<Uuid>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<BoardSnapshot>> {
-    let project = {
+    let (project, current_user) = {
         let guard = state.inner.lock().await;
-        find_project(&guard, project_id)?.clone()
+        (
+            find_project(&guard, project_id)?.clone(),
+            resolve_current_user(&guard, &headers),
+        )
     };
     if let Ok(path) = primary_workspace_path(&project) {
         let _ = std::fs::create_dir_all(&path);
     }
-    let task = build_exploration_task(&project);
+    let mut task = build_exploration_task(&project);
+    task.creator_user_id = current_user.as_ref().map(|user| user.id);
     let mut guard = state.inner.lock().await;
     guard.tasks.insert(0, task);
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn toggle_agent_auto_mode(
@@ -337,7 +517,10 @@ async fn toggle_agent_auto_mode(
     } else {
         "已关闭自动认领，只接受手动分配".into()
     };
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn claim_task(
@@ -345,11 +528,11 @@ async fn claim_task(
     State(state): State<AppState>,
 ) -> AppResult<Json<BoardSnapshot>> {
     let mut guard = state.inner.lock().await;
-    let agent_name = guard
+    let (agent_name, owner_user_id) = guard
         .agents
         .iter()
         .find(|agent| agent.id == agent_id)
-        .map(|agent| agent.name.clone())
+        .map(|agent| (agent.name.clone(), agent.owner_user_id))
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到 Agent".into()))?;
     let task = find_task_mut(&mut guard, task_id)?;
     if let Some(claimed_by) = task.claimed_by {
@@ -361,12 +544,16 @@ async fn claim_task(
         return Err((StatusCode::CONFLICT, "当前任务状态不允许重新认领".into()));
     }
     task.claimed_by = Some(agent_id);
+    task.assignee_user_id = owner_user_id;
     task.status = TaskStatus::Claimed;
     task.activities.push(new_activity(
         "task.claimed",
         format!("任务已由 {} 认领", agent_name),
     ));
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn start_task(
@@ -405,7 +592,10 @@ async fn start_task(
                 Some("stub-thread".into()),
                 Some("stub-turn".into()),
             )?;
-            Ok(Json(snapshot_from_state(&guard)))
+            let snapshot = snapshot_from_state(&guard);
+            drop(guard);
+            persist_state(&state).await?;
+            Ok(Json(snapshot))
         }
         RuntimeMode::RealCodex => {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -437,7 +627,10 @@ async fn start_task(
                 event_rx,
             ));
             let guard = state.inner.lock().await;
-            Ok(Json(snapshot_from_state(&guard)))
+            let snapshot = snapshot_from_state(&guard);
+            drop(guard);
+            persist_state(&state).await?;
+            Ok(Json(snapshot))
         }
     }
 }
@@ -461,7 +654,10 @@ async fn pause_task(
                 }
             }
             reset_agent_if_needed(&mut guard, task_id, "任务已暂停，等待恢复");
-            return Ok(Json(snapshot_from_state(&guard)));
+            let snapshot = snapshot_from_state(&guard);
+            drop(guard);
+            persist_state(&state).await?;
+            return Ok(Json(snapshot));
         }
         RuntimeMode::RealCodex => {}
     }
@@ -499,7 +695,10 @@ async fn pause_task(
     session.interrupt_turn(&thread_id, &turn_id).await?;
 
     let guard = state.inner.lock().await;
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn resume_task(
@@ -538,7 +737,10 @@ async fn resume_task(
                 runtime.active_turn_id = None;
             }
             reset_agent_if_needed(&mut guard, task_id, "最近一次任务已完成");
-            return Ok(Json(snapshot_from_state(&guard)));
+            let snapshot = snapshot_from_state(&guard);
+            drop(guard);
+            persist_state(&state).await?;
+            return Ok(Json(snapshot));
         }
         RuntimeMode::RealCodex => {}
     }
@@ -587,7 +789,10 @@ async fn resume_task(
     if let Some(runtime) = task.runtime.as_mut() {
         runtime.active_turn_id = Some(turn_id);
     }
-    Ok(Json(snapshot_from_state(&guard)))
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn runtime_event_loop(
@@ -723,6 +928,8 @@ async fn runtime_event_loop(
             }
         }
 
+        let _ = persist_state(&state).await;
+
         if remove_runtime {
             state.runtime_sessions.lock().await.remove(&task_id);
             break;
@@ -731,11 +938,59 @@ async fn runtime_event_loop(
 }
 
 fn snapshot_from_state(state: &BoardState) -> BoardSnapshot {
+    snapshot_from_state_with_user(state, state.users.first().cloned())
+}
+
+fn snapshot_from_state_with_user(state: &BoardState, current_user: Option<User>) -> BoardSnapshot {
     BoardSnapshot {
+        current_user,
+        users: state.users.clone(),
         projects: state.projects.clone(),
         tasks: state.tasks.clone(),
         agents: state.agents.clone(),
     }
+}
+
+fn build_auth_cookie(user_id: &Uuid) -> String {
+    format!("spotlight_user_id={user_id}; Path=/; HttpOnly; SameSite=Lax")
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|part| {
+        let (cookie_key, cookie_value) = part.trim().split_once('=')?;
+        (cookie_key == key).then_some(cookie_value.trim())
+    })
+}
+
+fn resolve_current_user(state: &BoardState, headers: &HeaderMap) -> Option<User> {
+    if let Some(raw_user_id) = cookie_value(headers, "spotlight_user_id") {
+        if let Ok(user_id) = Uuid::parse_str(raw_user_id) {
+            if let Some(user) = state.users.iter().find(|user| user.id == user_id) {
+                return Some(user.clone());
+            }
+        }
+    }
+
+    state.users.first().cloned()
+}
+
+async fn persist_state(state: &AppState) -> AppResult<()> {
+    let (persisted, store_path) = {
+        let guard = state.inner.lock().await;
+        (
+            PersistedState {
+                users: guard.users.clone(),
+                projects: guard.projects.clone(),
+                tasks: guard.tasks.clone(),
+                agents: guard.agents.clone(),
+            },
+            state.store_path.clone(),
+        )
+    };
+
+    persist_state_to_path(&store_path, &persisted)
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
 }
 
 fn resolve_project_for_new_task(
@@ -921,6 +1176,8 @@ fn build_local_build_restart_task(project: &Project) -> Task {
             stack_detection.summary(),
         ),
         status: TaskStatus::Open,
+        creator_user_id: None,
+        assignee_user_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.local_build_restart_created",
@@ -1013,6 +1270,8 @@ fn build_cloud_install_restart_task(
             stack_detection.summary(),
         ),
         status: TaskStatus::Open,
+        creator_user_id: None,
+        assignee_user_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.cloud_install_restart_created",
@@ -1218,6 +1477,8 @@ fn build_exploration_task(project: &Project) -> Task {
             workspace_list
         ),
         status: TaskStatus::Open,
+        creator_user_id: None,
+        assignee_user_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.explore_created",
@@ -2105,6 +2366,91 @@ mod tests {
             .tasks
             .iter()
             .any(|task| { task.project_id == project_id && task.title == "补充回归测试" }));
+    }
+
+    #[tokio::test]
+    async fn login_and_me_endpoints_return_current_user() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let username = snapshot.users.first().unwrap().username.clone();
+
+        let login_payload = serde_json::json!({ "username": username });
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(login_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        assert!(login_response.headers().contains_key("set-cookie"));
+
+        let me_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn created_task_records_creator_user() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+        let creator_id = snapshot.current_user.as_ref().unwrap().id;
+
+        let payload = serde_json::to_vec(&CreateTaskRequest {
+            project_id: Some(project_id),
+            title: "记录创建者".into(),
+            description: "验证新建任务会记录当前用户".into(),
+        })
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let task = read_task(response).await;
+        assert_eq!(task.creator_user_id, Some(creator_id));
     }
 
     #[tokio::test]
