@@ -231,8 +231,19 @@ Implementation approach:
 Before a task run enters execution:
 
 - detect writable repositories under active project workspaces
+- fetch the tracked remote default branch when available
+- switch back to the project default branch and fast-forward it from remote when possible
+- create a task-scoped working branch such as `task/<task_id>`
 - create a standardized pre-run tag in each repository
 - record repository cleanliness, branch, HEAD, and tag result
+
+After a task run completes successfully:
+
+- auto-commit pending task-branch changes when the worktree is still dirty
+- re-fetch the remote default branch
+- fast-forward the local default branch from remote first
+- merge the task branch back into the default branch only when the update and merge both succeed
+- keep the task branch for manual handling when fetch, fast-forward, auto-commit, or merge fails
 
 Recommended tag pattern:
 
