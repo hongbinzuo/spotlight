@@ -339,6 +339,23 @@ Suggested commands:
 - `interrupt_acp_session`
 - `get_session_timeline`
 
+### 8.1 Bootstrap Local Project Surface
+
+During the `0.1.x` self-hosting bootstrap phase, the local desktop/server shell may also expose a small project-oriented surface before the full central API split is complete.
+
+Minimal useful operations:
+
+- register a project workspace root from a local absolute path
+- scan the current primary workspace and persist a lightweight project summary
+- create a project-scoped conversation that is not yet bound to a formal task
+- continue a previously opened project-scoped conversation inside the same local runtime process
+
+This bootstrap surface is intentionally local-first:
+
+- it helps users open a directory, inspect code/docs/assets, and ask clarifying questions before creating tasks
+- it is not the final multi-user coordination API
+- once the full desktop core and central service boundaries are established, these operations should be mapped into the provider-neutral local core API and persisted shared models
+
 ## 9. ACP Event Normalization
 
 Suggested normalized event envelope:

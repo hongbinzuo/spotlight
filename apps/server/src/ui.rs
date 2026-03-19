@@ -206,6 +206,36 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       flex-wrap: wrap;
       margin-top: 8px;
     }
+    .session-select {
+      margin-bottom: 8px;
+    }
+    .conversation {
+      display: grid;
+      gap: 10px;
+      max-height: 340px;
+      overflow: auto;
+    }
+    .message {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 10px 12px;
+      background: #fffdf9;
+    }
+    .message.user {
+      background: #fff1df;
+      border-color: #d8b485;
+    }
+    .message.assistant {
+      background: #f8f5ef;
+    }
+    .message-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     @media (max-width: 960px) {
       main { grid-template-columns: 1fr; }
       .task-list { max-height: none; }
@@ -260,6 +290,16 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
       <div class="panel-body">
         <div class="detail-layout">
+          <div class="two-col">
+            <div class="detail-card">
+              <h4>项目目录与扫描</h4>
+              <div id="projectContextCard"></div>
+            </div>
+            <div class="detail-card">
+              <h4>项目会话</h4>
+              <div id="projectSessionCard"></div>
+            </div>
+          </div>
           <div class="detail-card">
             <div id="taskDetail"></div>
           </div>
@@ -303,9 +343,13 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </main>
   <script>
     let board = { current_user: null, users: [], projects: [], tasks: [], agents: [] };
+    let projectContext = { project_id: null, primary_workspace: null, latest_scan: null, sessions: [] };
     let selectedProjectId = null;
     let selectedTaskId = null;
     let selectedAgentIdState = null;
+    let selectedProjectSessionId = null;
+    const workspaceDraft = { label: "", path: "", writable: true, isPrimaryDefault: true };
+    const projectSessionDraft = { title: "", prompt: "" };
 
     function statusLabel(status) {
       return {
@@ -320,6 +364,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function selectedProject() {
       return board.projects.find(project => project.id === selectedProjectId) || null;
+    }
+
+    function selectedProjectSession() {
+      return projectContext.sessions.find(session => session.id === selectedProjectSessionId) || null;
     }
 
     function currentUser() {
@@ -385,9 +433,29 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (!selectedAgentIdState || !board.agents.some(agent => agent.id === selectedAgentIdState)) {
           selectedAgentIdState = board.agents[0]?.id || null;
         }
+        await loadProjectContext(selectedProjectId);
         render();
       } catch (error) {
         console.error(error);
+      }
+    }
+
+    async function loadProjectContext(projectId) {
+      if (!projectId) {
+        projectContext = { project_id: null, primary_workspace: null, latest_scan: null, sessions: [] };
+        selectedProjectSessionId = null;
+        return;
+      }
+
+      try {
+        projectContext = await request(`/api/projects/${projectId}/context`);
+        if (!selectedProjectSessionId || !projectContext.sessions.some(session => session.id === selectedProjectSessionId)) {
+          selectedProjectSessionId = projectContext.sessions[0]?.id || null;
+        }
+      } catch (error) {
+        console.error(error);
+        projectContext = { project_id: projectId, primary_workspace: null, latest_scan: null, sessions: [] };
+        selectedProjectSessionId = null;
       }
     }
 
@@ -400,6 +468,60 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         body: JSON.stringify({ username })
       });
       await loadBoard();
+    }
+
+    async function registerWorkspaceRoot() {
+      if (!selectedProjectId) return;
+      const path = projectPathDraftValue();
+      if (!path) return;
+      await request(`/api/projects/${selectedProjectId}/workspaces`, {
+        method: "POST",
+        body: JSON.stringify({
+          label: workspaceDraft.label,
+          path,
+          isPrimaryDefault: workspaceDraft.isPrimaryDefault,
+          isWritable: workspaceDraft.writable
+        })
+      });
+      workspaceDraft.label = "";
+      await loadBoard();
+    }
+
+    async function scanCurrentProject() {
+      if (!selectedProjectId) return;
+      await request(`/api/projects/${selectedProjectId}/scan`, { method: "POST" });
+      await loadProjectContext(selectedProjectId);
+      render();
+    }
+
+    async function startProjectSession() {
+      if (!selectedProjectId) return;
+      const prompt = projectSessionDraft.prompt.trim();
+      if (!prompt) return;
+      await request(`/api/projects/${selectedProjectId}/sessions`, {
+        method: "POST",
+        body: JSON.stringify({
+          title: projectSessionDraft.title.trim() || null,
+          prompt
+        })
+      });
+      projectSessionDraft.prompt = "";
+      projectSessionDraft.title = "";
+      await loadProjectContext(selectedProjectId);
+      render();
+    }
+
+    async function continueProjectSession() {
+      const session = selectedProjectSession();
+      const prompt = projectSessionDraft.prompt.trim();
+      if (!session || !prompt) return;
+      await request(`/api/project-sessions/${session.id}/turns`, {
+        method: "POST",
+        body: JSON.stringify({ prompt })
+      });
+      projectSessionDraft.prompt = "";
+      await loadProjectContext(selectedProjectId);
+      render();
     }
 
     async function createTask() {
@@ -645,6 +767,128 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       `).join("");
     }
 
+    function projectPathDraftValue() {
+      return workspaceDraft.path.trim();
+    }
+
+    function formatUnixTime(value) {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return value || "未知时间";
+      return new Date(seconds * 1000).toLocaleString();
+    }
+
+    function sessionStatusLabel(status) {
+      return {
+        running: "运行中",
+        completed: "已完成",
+        failed: "失败",
+        paused: "已暂停"
+      }[status] || status || "未知";
+    }
+
+    function renderProjectContextCard() {
+      const root = document.getElementById("projectContextCard");
+      const project = selectedProject();
+      if (!project) {
+        root.innerHTML = `<div class="muted">当前还没有项目。</div>`;
+        return;
+      }
+
+      const scan = projectContext.latest_scan;
+      const workspace = projectContext.primary_workspace;
+      const scanBlock = scan ? `
+        <div class="meta">
+          <span class="pill">最近扫描 ${escapeHtml(formatUnixTime(scan.scanned_at))}</span>
+          <span class="pill">${escapeHtml(scan.workspace_label)}</span>
+        </div>
+        <p class="description" style="margin:8px 0 0;">${escapeHtml(scan.stack_summary)}</p>
+        <div class="meta">
+          ${scan.top_level_entries.map(item => `<span class="pill">${escapeHtml(item)}</span>`).join("")}
+        </div>
+        <div class="muted" style="margin-top:6px;">关键文件：${escapeHtml(scan.key_files.join("、") || "未识别")}</div>
+        <div class="muted" style="margin-top:4px;">文档文件：${escapeHtml(scan.document_files.join("、") || "未识别")}</div>
+        <div class="muted" style="margin-top:4px;">提示：${escapeHtml(scan.notes.join("；") || "暂无")}</div>
+      ` : `<div class="muted">还没有项目扫描摘要。接入目录后可以直接扫描，用于后续项目问答和任务拆解。</div>`;
+
+      root.innerHTML = `
+        <div class="muted" style="margin-bottom:8px;">
+          当前主目录：${escapeHtml(workspace?.path || "尚未配置")}
+        </div>
+        <div class="create-box">
+          <input
+            placeholder="目录标签，例如 backend / docs / desktop"
+            value="${escapeHtml(workspaceDraft.label)}"
+            oninput="workspaceDraft.label = this.value"
+          />
+          <input
+            placeholder="本机项目目录绝对路径"
+            value="${escapeHtml(workspaceDraft.path)}"
+            oninput="workspaceDraft.path = this.value"
+          />
+          <div class="inline-actions">
+            <button class="secondary" onclick="registerWorkspaceRoot()">接入目录</button>
+            <button onclick="scanCurrentProject()">扫描目录</button>
+          </div>
+        </div>
+        ${scanBlock}
+      `;
+    }
+
+    function renderProjectSessionCard() {
+      const root = document.getElementById("projectSessionCard");
+      const session = selectedProjectSession();
+      const sessionOptions = projectContext.sessions.map(item => `
+        <option value="${item.id}" ${item.id === selectedProjectSessionId ? "selected" : ""}>
+          ${escapeHtml(item.title)} / ${escapeHtml(sessionStatusLabel(item.status))}
+        </option>
+      `).join("");
+
+      const conversation = session
+        ? session.messages.map(message => `
+            <article class="message ${message.role === "user" ? "user" : "assistant"}">
+              <div class="message-meta">
+                <strong>${escapeHtml(message.role === "user" ? "你" : "Agent")}</strong>
+                <span>${escapeHtml(formatUnixTime(message.at))}</span>
+              </div>
+              <div class="description">${escapeHtml(message.content)}</div>
+            </article>
+          `).join("")
+        : `<div class="muted">还没有项目会话。你可以直接提问项目结构、文档位置、构建入口或下一步改动建议。</div>`;
+
+      root.innerHTML = `
+        ${projectContext.sessions.length ? `
+          <select class="session-select" onchange="changeProjectSession(this.value)">
+            ${sessionOptions}
+          </select>
+        ` : ``}
+        <div class="create-box">
+          <input
+            placeholder="本轮会话标题（可选）"
+            value="${escapeHtml(projectSessionDraft.title)}"
+            oninput="projectSessionDraft.title = this.value"
+          />
+          <textarea
+            placeholder="直接问项目问题，例如：桌面端入口在哪里？服务端现在缺少哪些持久化能力？"
+            oninput="projectSessionDraft.prompt = this.value"
+          >${escapeHtml(projectSessionDraft.prompt)}</textarea>
+          <div class="inline-actions">
+            <button onclick="startProjectSession()">发起项目问答</button>
+            <button class="secondary" onclick="continueProjectSession()" ${session ? "" : "disabled"}>
+              继续追问
+            </button>
+          </div>
+        </div>
+        ${session ? `
+          <div class="meta" style="margin-bottom:8px;">
+            <span class="pill">${escapeHtml(sessionStatusLabel(session.status))}</span>
+            <span class="pill">${escapeHtml(session.workspace_path || "未绑定目录")}</span>
+            ${session.last_error ? `<span class="pill">${escapeHtml(session.last_error)}</span>` : ``}
+          </div>
+        ` : ``}
+        <div class="conversation">${conversation}</div>
+      `;
+    }
+
     function renderProjectCard() {
       const project = selectedProject();
       const root = document.getElementById("projectCard");
@@ -800,6 +1044,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function render() {
       renderHeaderAuth();
+      renderProjectContextCard();
+      renderProjectSessionCard();
       renderProjectCard();
       renderSummary();
       renderTaskList();
@@ -807,10 +1053,16 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       renderDetail();
     }
 
-    function changeProject(projectId) {
+    async function changeProject(projectId) {
       selectedProjectId = projectId;
       const tasks = tasksForCurrentProject();
       selectedTaskId = tasks[0]?.id || null;
+      await loadProjectContext(projectId);
+      render();
+    }
+
+    function changeProjectSession(sessionId) {
+      selectedProjectSessionId = sessionId;
       render();
     }
 
@@ -863,5 +1115,15 @@ mod tests {
         assert!(INDEX_HTML.contains("本地编译重启"));
         assert!(INDEX_HTML.contains("云端安装重启"));
         assert!(INDEX_HTML.contains("证书路径或凭据别名"));
+    }
+
+    #[test]
+    fn project_context_and_session_panels_are_present() {
+        assert!(INDEX_HTML.contains("id=\"projectContextCard\""));
+        assert!(INDEX_HTML.contains("id=\"projectSessionCard\""));
+        assert!(INDEX_HTML.contains("registerWorkspaceRoot()"));
+        assert!(INDEX_HTML.contains("scanCurrentProject()"));
+        assert!(INDEX_HTML.contains("startProjectSession()"));
+        assert!(INDEX_HTML.contains("continueProjectSession()"));
     }
 }

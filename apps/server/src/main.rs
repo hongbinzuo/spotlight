@@ -46,6 +46,8 @@ struct BoardState {
     projects: Vec<Project>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
+    project_scans: HashMap<Uuid, ProjectScanSummary>,
+    project_sessions: Vec<ProjectSession>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,42 @@ struct StackDetection {
     evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectScanSummary {
+    project_id: Uuid,
+    workspace_id: Uuid,
+    workspace_label: String,
+    workspace_path: String,
+    scanned_at: String,
+    stack_summary: String,
+    detected_stacks: Vec<String>,
+    top_level_entries: Vec<String>,
+    key_files: Vec<String>,
+    document_files: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectSessionMessage {
+    role: String,
+    content: String,
+    at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectSession {
+    id: Uuid,
+    project_id: Uuid,
+    title: String,
+    status: String,
+    workspace_path: Option<String>,
+    thread_id: Option<String>,
+    active_turn_id: Option<String>,
+    messages: Vec<ProjectSessionMessage>,
+    log: Vec<RuntimeLogEntry>,
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct GitTaskBranchPlan {
     base_branch: String,
@@ -84,6 +122,10 @@ struct PersistedState {
     projects: Vec<Project>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
+    #[serde(default)]
+    project_scans: HashMap<Uuid, ProjectScanSummary>,
+    #[serde(default)]
+    project_sessions: Vec<ProjectSession>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +137,34 @@ struct LoginRequest {
 struct AuthSnapshot {
     current_user: Option<User>,
     users: Vec<User>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectContextSnapshot {
+    project_id: Uuid,
+    primary_workspace: Option<WorkspaceRoot>,
+    latest_scan: Option<ProjectScanSummary>,
+    sessions: Vec<ProjectSession>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterWorkspaceRequest {
+    label: String,
+    path: String,
+    is_primary_default: Option<bool>,
+    is_writable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartProjectSessionRequest {
+    title: Option<String>,
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContinueProjectSessionRequest {
+    prompt: String,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +195,23 @@ fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
         .route("/api/me", get(get_me))
         .route("/api/auth/login", post(login))
         .route("/api/board", get(get_board))
+        .route(
+            "/api/projects/{project_id}/context",
+            get(get_project_context),
+        )
+        .route(
+            "/api/projects/{project_id}/workspaces",
+            post(register_project_workspace),
+        )
+        .route("/api/projects/{project_id}/scan", post(scan_project))
+        .route(
+            "/api/projects/{project_id}/sessions",
+            post(start_project_session),
+        )
+        .route(
+            "/api/project-sessions/{session_id}/turns",
+            post(continue_project_session),
+        )
         .route("/api/tasks", post(create_task))
         .route(
             "/api/projects/{project_id}/tasks/bootstrap",
@@ -164,6 +251,8 @@ fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState
             projects: persisted.projects,
             tasks: persisted.tasks,
             agents: persisted.agents,
+            project_scans: persisted.project_scans,
+            project_sessions: persisted.project_sessions,
         })),
         runtime_mode,
         runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -292,6 +381,8 @@ fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> Persist
         projects,
         tasks,
         agents: default_agents(&users),
+        project_scans: HashMap::new(),
+        project_sessions: Vec::new(),
     };
     let _ = persist_state_to_path(store_path, &state);
     state
@@ -366,6 +457,376 @@ async fn get_board(State(state): State<AppState>, headers: HeaderMap) -> Json<Bo
         &guard,
         resolve_current_user(&guard, &headers),
     ))
+}
+
+async fn get_project_context(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ProjectContextSnapshot>> {
+    let guard = state.inner.lock().await;
+    let snapshot = project_context_snapshot(&guard, project_id)?;
+    Ok(Json(snapshot))
+}
+
+async fn register_project_workspace(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    Json(request): Json<RegisterWorkspaceRequest>,
+) -> AppResult<Json<Project>> {
+    let path = request.path.trim();
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "项目目录路径不能为空".into()));
+    }
+
+    let mut normalized_path = PathBuf::from(path);
+    if !normalized_path.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("项目目录不存在或不是文件夹：{path}"),
+        ));
+    }
+    if let Ok(canonicalized) = normalized_path.canonicalize() {
+        normalized_path = canonicalized;
+    }
+
+    let label = request.label.trim();
+    let workspace_label = if label.is_empty() {
+        normalized_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("项目目录")
+            .to_string()
+    } else {
+        label.to_string()
+    };
+
+    let mut guard = state.inner.lock().await;
+    let project = find_project_mut(&mut guard, project_id)?;
+    let workspace_path = normalized_path.to_string_lossy().into_owned();
+    let writable = request.is_writable.unwrap_or(true);
+
+    if let Some(existing_index) = project
+        .workspace_roots
+        .iter()
+        .position(|workspace| workspace.path == workspace_path)
+    {
+        let workspace = &mut project.workspace_roots[existing_index];
+        workspace.label = workspace_label;
+        workspace.writable = writable;
+        if request.is_primary_default.unwrap_or(false) && existing_index != 0 {
+            let workspace = project.workspace_roots.remove(existing_index);
+            project.workspace_roots.insert(0, workspace);
+        }
+    } else {
+        let workspace = WorkspaceRoot {
+            id: Uuid::new_v4(),
+            label: workspace_label,
+            path: workspace_path,
+            writable,
+        };
+        if request.is_primary_default.unwrap_or(false) {
+            project.workspace_roots.insert(0, workspace);
+        } else {
+            project.workspace_roots.push(workspace);
+        }
+    }
+
+    let updated_project = project.clone();
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(updated_project))
+}
+
+async fn scan_project(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ProjectContextSnapshot>> {
+    let project = {
+        let guard = state.inner.lock().await;
+        find_project(&guard, project_id)?.clone()
+    };
+    let workspace = project
+        .primary_workspace()
+        .cloned()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "当前项目还没有配置工作目录".into()))?;
+    let workspace_root = PathBuf::from(&workspace.path);
+    if !workspace_root.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("当前主工作目录不存在：{}", workspace.path),
+        ));
+    }
+
+    let summary = build_project_scan_summary(project_id, &workspace, &workspace_root);
+
+    let snapshot = {
+        let mut guard = state.inner.lock().await;
+        guard.project_scans.insert(project_id, summary);
+        project_context_snapshot(&guard, project_id)?
+    };
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
+}
+
+async fn start_project_session(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    Json(request): Json<StartProjectSessionRequest>,
+) -> AppResult<Json<ProjectContextSnapshot>> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "项目会话提问不能为空".into()));
+    }
+
+    let (project, latest_scan, workspace_root) = {
+        let guard = state.inner.lock().await;
+        let project = find_project(&guard, project_id)?.clone();
+        let latest_scan = guard.project_scans.get(&project_id).cloned();
+        let workspace_root = project
+            .primary_workspace()
+            .map(|workspace| PathBuf::from(&workspace.path));
+        (project, latest_scan, workspace_root)
+    };
+    if matches!(state.runtime_mode, RuntimeMode::RealCodex) && workspace_root.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "项目会话需要先为当前项目配置主工作目录".into(),
+        ));
+    }
+
+    let session_id = Uuid::new_v4();
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| truncate_title(prompt));
+    let workspace_path = workspace_root
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+
+    let user_message = ProjectSessionMessage {
+        role: "user".into(),
+        content: prompt.to_string(),
+        at: timestamp_string(),
+    };
+
+    {
+        let mut guard = state.inner.lock().await;
+        guard.project_sessions.insert(
+            0,
+            ProjectSession {
+                id: session_id,
+                project_id,
+                title,
+                status: "running".into(),
+                workspace_path,
+                thread_id: None,
+                active_turn_id: None,
+                messages: vec![user_message],
+                log: vec![new_runtime_entry("project.session.user", prompt.to_string())],
+                last_error: None,
+            },
+        );
+    }
+    persist_state(&state).await?;
+
+    match state.runtime_mode {
+        RuntimeMode::Stub => {
+            complete_stub_project_session(&state, session_id, &project, latest_scan.as_ref(), prompt)
+                .await?;
+            let guard = state.inner.lock().await;
+            return Ok(Json(project_context_snapshot(&guard, project_id)?));
+        }
+        RuntimeMode::RealCodex => {}
+    }
+
+    let workspace_root = workspace_root.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "项目会话需要先为当前项目配置主工作目录".into(),
+        )
+    })?;
+
+    let composed_prompt = compose_project_session_prompt(&project, latest_scan.as_ref(), prompt);
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let session = match CodexRuntimeSession::spawn(workspace_root.clone(), event_tx).await {
+        Ok(session) => session,
+        Err(error) => {
+            mark_project_session_failed(&state, session_id, &error.1).await;
+            persist_state(&state).await?;
+            return Err(error);
+        }
+    };
+    let thread_id = match session
+        .start_thread(&workspace_root, &project_session_developer_instructions())
+        .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            mark_project_session_failed(&state, session_id, &error.1).await;
+            persist_state(&state).await?;
+            return Err(error);
+        }
+    };
+    let turn_id = match session
+        .start_turn(&workspace_root, &thread_id, &composed_prompt)
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            mark_project_session_failed(&state, session_id, &error.1).await;
+            persist_state(&state).await?;
+            return Err(error);
+        }
+    };
+
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(project_session) = find_project_session_mut(&mut guard, session_id) {
+            project_session.thread_id = Some(thread_id);
+            project_session.active_turn_id = Some(turn_id);
+        }
+    }
+    state
+        .runtime_sessions
+        .lock()
+        .await
+        .insert(session_id, session.clone());
+    tokio::spawn(project_session_event_loop(
+        state.clone(),
+        session_id,
+        event_rx,
+    ));
+    persist_state(&state).await?;
+
+    let guard = state.inner.lock().await;
+    Ok(Json(project_context_snapshot(&guard, project_id)?))
+}
+
+async fn continue_project_session(
+    AxumPath(session_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    Json(request): Json<ContinueProjectSessionRequest>,
+) -> AppResult<Json<ProjectContextSnapshot>> {
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "补充提问不能为空".into()));
+    }
+
+    let (project_id, project, latest_scan, thread_id, workspace_root) = {
+        let mut guard = state.inner.lock().await;
+        let (project_id, thread_id) = {
+            let project_session = find_project_session_mut(&mut guard, session_id)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到项目会话".into()))?;
+            if project_session.active_turn_id.is_some() {
+                return Err((StatusCode::CONFLICT, "当前项目会话仍在运行，请稍后再试".into()));
+            }
+            project_session.status = "running".into();
+            project_session.last_error = None;
+            project_session.messages.push(ProjectSessionMessage {
+                role: "user".into(),
+                content: prompt.to_string(),
+                at: timestamp_string(),
+            });
+            project_session
+                .log
+                .push(new_runtime_entry("project.session.user", prompt.to_string()));
+            (project_session.project_id, project_session.thread_id.clone())
+        };
+
+        let project = find_project(&guard, project_id)?.clone();
+        let latest_scan = guard.project_scans.get(&project_id).cloned();
+        let workspace_root = project
+            .primary_workspace()
+            .map(|workspace| PathBuf::from(&workspace.path));
+        (
+            project_id,
+            project,
+            latest_scan,
+            thread_id,
+            workspace_root,
+        )
+    };
+    if matches!(state.runtime_mode, RuntimeMode::RealCodex) && workspace_root.is_none() {
+        mark_project_session_failed(&state, session_id, "项目会话需要先为当前项目配置主工作目录").await;
+        persist_state(&state).await?;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "项目会话需要先为当前项目配置主工作目录".into(),
+        ));
+    }
+    if matches!(state.runtime_mode, RuntimeMode::RealCodex) && thread_id.is_none() {
+        mark_project_session_failed(&state, session_id, "当前项目会话缺少 thread_id，请新建一个项目会话").await;
+        persist_state(&state).await?;
+        return Err((
+            StatusCode::CONFLICT,
+            "当前项目会话缺少 thread_id，请新建一个项目会话".into(),
+        ));
+    }
+    persist_state(&state).await?;
+
+    match state.runtime_mode {
+        RuntimeMode::Stub => {
+            complete_stub_project_session(&state, session_id, &project, latest_scan.as_ref(), prompt)
+                .await?;
+            let guard = state.inner.lock().await;
+            return Ok(Json(project_context_snapshot(&guard, project_id)?));
+        }
+        RuntimeMode::RealCodex => {}
+    }
+
+    let thread_id = thread_id.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "当前项目会话缺少 thread_id，请新建一个项目会话".into(),
+        )
+    })?;
+    let workspace_root = workspace_root.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "项目会话需要先为当前项目配置主工作目录".into(),
+        )
+    })?;
+    let composed_prompt = compose_project_session_prompt(&project, latest_scan.as_ref(), prompt);
+
+    let session = state
+        .runtime_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "当前服务进程内没有找到可恢复的项目会话，请新建一个项目会话".into(),
+            )
+        })?;
+
+    let turn_id = match session
+        .start_turn(&workspace_root, &thread_id, &composed_prompt)
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            mark_project_session_failed(&state, session_id, &error.1).await;
+            persist_state(&state).await?;
+            return Err(error);
+        }
+    };
+
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(project_session) = find_project_session_mut(&mut guard, session_id) {
+            project_session.active_turn_id = Some(turn_id);
+        }
+    }
+    persist_state(&state).await?;
+
+    let guard = state.inner.lock().await;
+    Ok(Json(project_context_snapshot(&guard, project_id)?))
 }
 
 async fn create_task(
@@ -984,6 +1445,8 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
                 projects: guard.projects.clone(),
                 tasks: guard.tasks.clone(),
                 agents: guard.agents.clone(),
+                project_scans: guard.project_scans.clone(),
+                project_sessions: guard.project_sessions.clone(),
             },
             state.store_path.clone(),
         )
@@ -991,6 +1454,407 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
 
     persist_state_to_path(&store_path, &persisted)
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
+}
+
+fn project_context_snapshot(
+    state: &BoardState,
+    project_id: Uuid,
+) -> AppResult<ProjectContextSnapshot> {
+    let project = find_project(state, project_id)?;
+    let sessions = state
+        .project_sessions
+        .iter()
+        .filter(|session| session.project_id == project_id)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(ProjectContextSnapshot {
+        project_id,
+        primary_workspace: project.primary_workspace().cloned(),
+        latest_scan: state.project_scans.get(&project_id).cloned(),
+        sessions,
+    })
+}
+
+fn truncate_title(input: &str) -> String {
+    let compact = input.replace('\n', " ").trim().to_string();
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(24).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else if preview.is_empty() {
+        "项目会话".into()
+    } else {
+        preview
+    }
+}
+
+fn timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+
+fn build_project_scan_summary(
+    project_id: Uuid,
+    workspace: &WorkspaceRoot,
+    workspace_root: &Path,
+) -> ProjectScanSummary {
+    let detection = detect_project_stack(workspace_root);
+    let files = collect_workspace_files(workspace_root, 2);
+    let top_level_entries = collect_top_level_entries(workspace_root, 10);
+    let key_files = files
+        .iter()
+        .filter_map(|path| {
+            is_key_project_file(path)
+                .then(|| display_relative_path(workspace_root, path))
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    let document_files = files
+        .iter()
+        .filter_map(|path| {
+            is_document_file(path)
+                .then(|| display_relative_path(workspace_root, path))
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+
+    let mut notes = Vec::new();
+    if top_level_entries.is_empty() {
+        notes.push("当前目录看起来几乎为空，建议先确认是否打开了正确目录。".into());
+    }
+    if detection.stacks.is_empty() {
+        notes.push("暂未识别到常见构建清单，当前目录可能更偏文档、交付物或资料目录。".into());
+    }
+    if !document_files.is_empty() {
+        notes.push("目录中存在文档类文件，适合先做项目扫描和问答，再拆成正式任务。".into());
+    }
+    if !workspace_root.join(".git").exists() {
+        notes.push("当前主目录没有发现 .git，后续代码改动前需要确认真实仓库边界。".into());
+    }
+
+    ProjectScanSummary {
+        project_id,
+        workspace_id: workspace.id,
+        workspace_label: workspace.label.clone(),
+        workspace_path: workspace.path.clone(),
+        scanned_at: timestamp_string(),
+        stack_summary: detection.summary(),
+        detected_stacks: detection.stacks.iter().map(|stack| stack.to_string()).collect(),
+        top_level_entries,
+        key_files,
+        document_files,
+        notes,
+    }
+}
+
+fn collect_top_level_entries(base: &Path, limit: usize) -> Vec<String> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut items = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if path.is_dir() {
+                Some(format!("{name}/"))
+            } else {
+                Some(name)
+            }
+        })
+        .collect::<Vec<_>>();
+    items.sort();
+    items.into_iter().take(limit).collect()
+}
+
+fn is_key_project_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if [
+        "Cargo.toml",
+        "package.json",
+        "pnpm-workspace.yaml",
+        "pyproject.toml",
+        "requirements.txt",
+        "README.md",
+        "AGENTS.md",
+        "deploy.md",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "tauri.conf.json",
+    ]
+    .contains(&file_name)
+    {
+        return true;
+    }
+
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "md" | "toml" | "json" | "yaml" | "yml")
+    )
+}
+
+fn is_document_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("md" | "txt" | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx")
+    )
+}
+
+fn compose_project_session_prompt(
+    project: &Project,
+    latest_scan: Option<&ProjectScanSummary>,
+    user_prompt: &str,
+) -> String {
+    let workspace_list = project
+        .workspace_roots
+        .iter()
+        .map(|workspace| {
+            format!(
+                "- {}: {}（{}）",
+                workspace.label,
+                workspace.path,
+                if workspace.writable { "可写" } else { "只读" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let scan_summary = latest_scan
+        .map(|scan| {
+            format!(
+                "最近扫描摘要：{}\n顶层目录：{}\n关键文件：{}\n文档文件：{}\n提示：{}",
+                scan.stack_summary,
+                if scan.top_level_entries.is_empty() {
+                    "无".into()
+                } else {
+                    scan.top_level_entries.join("、")
+                },
+                if scan.key_files.is_empty() {
+                    "无".into()
+                } else {
+                    scan.key_files.join("、")
+                },
+                if scan.document_files.is_empty() {
+                    "无".into()
+                } else {
+                    scan.document_files.join("、")
+                },
+                if scan.notes.is_empty() {
+                    "无".into()
+                } else {
+                    scan.notes.join("；")
+                }
+            )
+        })
+        .unwrap_or_else(|| "最近还没有项目扫描摘要；如果需要判断目录结构、文档和构建入口，请先建议用户执行项目扫描。".into());
+
+    format!(
+        "你正在进行 Spotlight 的项目级问答会话，而不是直接执行一个任务。\n\
+项目名称：{}\n\
+项目说明：{}\n\
+可见工作目录：\n{}\n\
+{}\n\
+\n\
+当前用户问题：{}\n\
+\n\
+回答要求：\n\
+1. 优先用中文回答。\n\
+2. 先基于目录结构、代码和文档做判断，不要臆造未读取到的内容。\n\
+3. 如果信息不足，要明确指出缺口，并给出下一步建议。\n\
+4. 如果适合拆成任务，请顺手给出建议任务标题和说明。\n\
+5. 若涉及实际改动，先说明影响范围和风险，再给方案。",
+        project.name, project.description, workspace_list, scan_summary, user_prompt
+    )
+}
+
+fn project_session_developer_instructions() -> String {
+    [
+        "你是 Spotlight 的项目协作 Agent。",
+        "当前会话的目标是帮助用户理解项目目录、文档、代码结构和下一步改动方向。",
+        "默认优先做分析、解释、风险提示和任务拆解，而不是直接执行破坏性修改。",
+        "当需要代码改动时，要先说清楚影响范围、依赖条件和建议步骤。",
+        "回答尽量用中文，结构清晰，可读性高。",
+    ]
+    .join(" ")
+}
+
+fn build_stub_project_session_reply(
+    project: &Project,
+    latest_scan: Option<&ProjectScanSummary>,
+    prompt: &str,
+) -> String {
+    let scan_line = latest_scan
+        .map(|scan| format!("最近扫描结果：{}。", scan.stack_summary))
+        .unwrap_or_else(|| "当前还没有扫描摘要，建议先对项目目录做一次扫描。".into());
+
+    format!(
+        "这是项目会话的本地 Stub 回复。\n\
+项目：{}\n\
+{}\n\
+你刚刚的问题：{}\n\
+\n\
+建议下一步：\n\
+1. 先确认项目目录和关键 workspace 是否已经接入。\n\
+2. 如果需要判断代码入口、文档分布或构建方式，先执行项目扫描。\n\
+3. 如果已经足够明确，就把结论继续追问，或拆成正式任务推进。",
+        project.name, scan_line, prompt
+    )
+}
+
+async fn complete_stub_project_session(
+    state: &AppState,
+    session_id: Uuid,
+    project: &Project,
+    latest_scan: Option<&ProjectScanSummary>,
+    prompt: &str,
+) -> AppResult<()> {
+    let reply = build_stub_project_session_reply(project, latest_scan, prompt);
+    let mut guard = state.inner.lock().await;
+    let Some(project_session) = find_project_session_mut(&mut guard, session_id) else {
+        return Err((StatusCode::NOT_FOUND, "未找到项目会话".into()));
+    };
+    project_session.status = "completed".into();
+    project_session.thread_id.get_or_insert_with(|| "stub-project-thread".into());
+    project_session.active_turn_id = None;
+    project_session.messages.push(ProjectSessionMessage {
+        role: "assistant".into(),
+        content: reply.clone(),
+        at: timestamp_string(),
+    });
+    project_session
+        .log
+        .push(new_runtime_entry("assistant", reply));
+    drop(guard);
+    persist_state(state).await
+}
+
+async fn mark_project_session_failed(state: &AppState, session_id: Uuid, message: &str) {
+    let mut guard = state.inner.lock().await;
+    if let Some(project_session) = find_project_session_mut(&mut guard, session_id) {
+        project_session.status = "failed".into();
+        project_session.active_turn_id = None;
+        project_session.last_error = Some(message.to_string());
+        project_session
+            .log
+            .push(new_runtime_entry("project.session.error", message.to_string()));
+    }
+}
+
+async fn project_session_event_loop(
+    state: AppState,
+    session_id: Uuid,
+    mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+) {
+    let mut assistant_buffer = String::new();
+
+    while let Some(event) = event_rx.recv().await {
+        let mut remove_runtime = false;
+        {
+            let mut guard = state.inner.lock().await;
+            let Some(project_session) = find_project_session_mut(&mut guard, session_id) else {
+                break;
+            };
+
+            match event {
+                RuntimeEvent::ThreadStarted { thread_id } => {
+                    project_session.thread_id = Some(thread_id.clone());
+                    project_session.log.push(new_runtime_entry(
+                        "project.session.thread_started",
+                        format!("项目会话线程已启动：{thread_id}"),
+                    ));
+                }
+                RuntimeEvent::TurnStarted { turn_id } => {
+                    assistant_buffer.clear();
+                    project_session.active_turn_id = Some(turn_id.clone());
+                    project_session.status = "running".into();
+                    project_session.log.push(new_runtime_entry(
+                        "project.session.turn_started",
+                        format!("项目会话轮次已启动：{turn_id}"),
+                    ));
+                }
+                RuntimeEvent::AgentDelta { delta } => {
+                    assistant_buffer.push_str(&delta);
+                    push_runtime_delta(&mut project_session.log, "assistant", &delta);
+                }
+                RuntimeEvent::CommandDelta { delta } => {
+                    push_runtime_delta(&mut project_session.log, "command", &delta);
+                }
+                RuntimeEvent::PlanDelta { delta } => {
+                    push_runtime_delta(&mut project_session.log, "plan", &delta);
+                }
+                RuntimeEvent::TurnCompleted { status, .. } => {
+                    project_session.active_turn_id = None;
+                    project_session.status = if status == "completed" {
+                        "completed".into()
+                    } else if status == "interrupted" {
+                        "paused".into()
+                    } else {
+                        "failed".into()
+                    };
+                    if !assistant_buffer.trim().is_empty() {
+                        project_session.messages.push(ProjectSessionMessage {
+                            role: "assistant".into(),
+                            content: assistant_buffer.trim().to_string(),
+                            at: timestamp_string(),
+                        });
+                    }
+                    assistant_buffer.clear();
+                    if project_session.status == "failed" {
+                        project_session.last_error =
+                            Some(format!("项目会话以异常状态结束：{status}"));
+                    }
+                    project_session.log.push(new_runtime_entry(
+                        "project.session.turn_completed",
+                        format!("项目会话轮次结束：{status}"),
+                    ));
+                }
+                RuntimeEvent::Error { message } => {
+                    project_session.active_turn_id = None;
+                    project_session.status = "failed".into();
+                    project_session.last_error = Some(message.clone());
+                    if !assistant_buffer.trim().is_empty() {
+                        project_session.messages.push(ProjectSessionMessage {
+                            role: "assistant".into(),
+                            content: assistant_buffer.trim().to_string(),
+                            at: timestamp_string(),
+                        });
+                    }
+                    assistant_buffer.clear();
+                    project_session
+                        .log
+                        .push(new_runtime_entry("project.session.error", message));
+                }
+                RuntimeEvent::Stderr { message } => {
+                    push_runtime_delta(&mut project_session.log, "stderr", &message);
+                }
+                RuntimeEvent::Exited { message } => {
+                    remove_runtime = true;
+                    if project_session.status == "running" {
+                        project_session.status = "failed".into();
+                        project_session.last_error = Some(message.clone());
+                    }
+                    project_session
+                        .log
+                        .push(new_runtime_entry("project.session.exited", message));
+                }
+            }
+        }
+
+        let _ = persist_state(&state).await;
+
+        if remove_runtime {
+            state.runtime_sessions.lock().await.remove(&session_id);
+            break;
+        }
+    }
 }
 
 fn resolve_project_for_new_task(
@@ -1014,6 +1878,14 @@ fn find_project(state: &BoardState, project_id: Uuid) -> AppResult<&Project> {
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到项目".into()))
 }
 
+fn find_project_mut(state: &mut BoardState, project_id: Uuid) -> AppResult<&mut Project> {
+    state
+        .projects
+        .iter_mut()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到项目".into()))
+}
+
 fn ensure_project_exists(state: &BoardState, project_id: Uuid) -> AppResult<()> {
     find_project(state, project_id).map(|_| ())
 }
@@ -1024,6 +1896,16 @@ fn find_task_mut(state: &mut BoardState, task_id: Uuid) -> AppResult<&mut Task> 
         .iter_mut()
         .find(|task| task.id == task_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))
+}
+
+fn find_project_session_mut(
+    state: &mut BoardState,
+    session_id: Uuid,
+) -> Option<&mut ProjectSession> {
+    state
+        .project_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
 }
 
 fn primary_workspace_path(project: &Project) -> AppResult<PathBuf> {
@@ -2165,14 +3047,16 @@ fn timestamp_compact() -> String {
 mod tests {
     use super::{
         build_app, detect_project_stack, finalize_git_task_branch_in_repo,
-        prepare_git_task_branch_in_repo, sanitize_credential_hint, RuntimeMode,
+        prepare_git_task_branch_in_repo, sanitize_credential_hint, ProjectContextSnapshot,
+        RuntimeMode,
     };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
     use platform_core::{
-        AgentInvocationRequest, AgentResumeRequest, BoardSnapshot, CreateTaskRequest, Task,
+        AgentInvocationRequest, AgentResumeRequest, BoardSnapshot, CreateTaskRequest, Project,
+        Task,
     };
     use std::{
         fs,
@@ -2200,6 +3084,13 @@ mod tests {
     }
 
     async fn read_task(response: axum::response::Response) -> Task {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn read_json<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2451,6 +3342,155 @@ mod tests {
 
         let task = read_task(response).await;
         assert_eq!(task.creator_user_id, Some(creator_id));
+    }
+
+    #[tokio::test]
+    async fn register_workspace_updates_project_primary_directory() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let workspace_root = unique_temp_path("spotlight-project-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let payload = serde_json::json!({
+            "label": "backend",
+            "path": workspace_root.to_string_lossy(),
+            "isPrimaryDefault": true,
+            "isWritable": true
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/workspaces"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let updated_project: Project = read_json(response).await;
+        assert_eq!(updated_project.workspace_roots.first().unwrap().label, "backend");
+        assert!(
+            updated_project.workspace_roots.first().unwrap().path.contains("spotlight-project-workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_endpoint_returns_workspace_summary() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let workspace_root = unique_temp_path("spotlight-scan-workspace");
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(workspace_root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(workspace_root.join("README.md"), "# demo\n").unwrap();
+        fs::write(workspace_root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let register_payload = serde_json::json!({
+            "label": "demo-root",
+            "path": workspace_root.to_string_lossy(),
+            "isPrimaryDefault": true,
+            "isWritable": true
+        });
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/workspaces"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/scan"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let context: ProjectContextSnapshot = read_json(response).await;
+        let scan = context.latest_scan.expect("expected latest scan summary");
+        assert!(scan.detected_stacks.iter().any(|stack| stack == "Rust"));
+        assert!(scan.key_files.iter().any(|path| path.ends_with("Cargo.toml")));
+    }
+
+    #[tokio::test]
+    async fn project_session_stub_flow_records_messages() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/sessions"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "项目问答",
+                            "prompt": "这个项目现在最缺哪一块最小可用能力？"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let context: ProjectContextSnapshot = read_json(response).await;
+        let session = context.sessions.first().expect("expected project session");
+        assert_eq!(session.status, "completed");
+        assert_eq!(session.messages.first().unwrap().role, "user");
+        assert_eq!(session.messages.last().unwrap().role, "assistant");
+        assert!(!session.log.is_empty());
     }
 
     #[tokio::test]
