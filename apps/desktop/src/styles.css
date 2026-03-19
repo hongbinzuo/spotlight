@@ -1,0 +1,257 @@
+:root {
+  --bg: #efe5d2;
+  --panel: rgba(255, 248, 237, 0.86);
+  --panel-strong: #fffaf2;
+  --border: #d7c5a5;
+  --text: #2d2417;
+  --muted: #7b6d5e;
+  --accent: #b96926;
+  --accent-2: #205a44;
+  --danger: #9a4138;
+  --shadow: 0 24px 56px rgba(55, 35, 12, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(185, 105, 38, 0.22), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(32, 90, 68, 0.12), transparent 22%),
+    linear-gradient(180deg, #f5eddf, #ecdfca 46%, #e7d8c2 100%);
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 16px;
+  padding: 18px;
+  min-height: 100vh;
+}
+
+.sidebar,
+.workspace {
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+
+.sidebar {
+  padding: 18px;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.workspace {
+  padding: 18px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+}
+
+.brand h1,
+.workspace-head h2,
+.panel h2 {
+  margin: 0;
+}
+
+.brand h1 {
+  font-size: 28px;
+  margin-bottom: 6px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.muted {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  background: var(--panel-strong);
+  border-radius: 18px;
+  padding: 14px;
+}
+
+.panel h2 {
+  margin-bottom: 10px;
+  font-size: 15px;
+}
+
+.status-card {
+  border-radius: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  background: #fffaf3;
+}
+
+.status-card strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.status-card p {
+  margin: 0;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.status-ready {
+  border-color: rgba(32, 90, 68, 0.22);
+  background: rgba(32, 90, 68, 0.1);
+}
+
+.status-busy {
+  border-color: rgba(185, 105, 38, 0.22);
+  background: rgba(185, 105, 38, 0.1);
+}
+
+.status-error {
+  border-color: rgba(154, 65, 56, 0.22);
+  background: rgba(154, 65, 56, 0.08);
+}
+
+.action-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.inline-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+button {
+  font: inherit;
+  border-radius: 999px;
+  border: 0;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button.primary {
+  background: var(--accent);
+  color: white;
+}
+
+button.secondary {
+  background: #f2e7d3;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+button.small {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.info-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.kv {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(0, 0, 0, 0.08);
+}
+
+.kv:last-child {
+  border-bottom: 0;
+}
+
+.mono-value {
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 13px;
+}
+
+.workspace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workspace-badge {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #f2e7d3;
+  border: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.workspace-frame {
+  position: relative;
+  overflow: hidden;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: #fff9ef;
+  min-height: 0;
+}
+
+.workspace-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(244, 235, 220, 0.96));
+  z-index: 1;
+}
+
+.workspace-placeholder strong {
+  font-size: 20px;
+}
+
+.workspace-placeholder p {
+  margin: 0;
+  max-width: 520px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+iframe {
+  width: 100%;
+  height: 100%;
+  min-height: calc(100vh - 110px);
+  border: 0;
+  background: white;
+}
+
+@media (max-width: 980px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  iframe {
+    min-height: 70vh;
+  }
+}
