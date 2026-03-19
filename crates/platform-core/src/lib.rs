@@ -45,6 +45,8 @@ pub struct Task {
     pub creator_user_id: Option<Uuid>,
     #[serde(default)]
     pub assignee_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_task_id: Option<Uuid>,
     pub claimed_by: Option<Uuid>,
     pub activities: Vec<TaskActivity>,
     pub runtime: Option<TaskRuntime>,
@@ -113,12 +115,31 @@ pub struct Agent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingQuestion {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub source_task_id: Uuid,
+    pub source_task_title: String,
+    pub question: String,
+    #[serde(default)]
+    pub context: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub answered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardSnapshot {
     pub current_user: Option<User>,
     pub users: Vec<User>,
     pub projects: Vec<Project>,
     pub tasks: Vec<Task>,
     pub agents: Vec<Agent>,
+    #[serde(default)]
+    pub pending_questions: Vec<PendingQuestion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +312,7 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
         status: TaskStatus::Open,
         creator_user_id: None,
         assignee_user_id: None,
+        source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.seeded",
@@ -318,11 +340,11 @@ fn normalize_seed_title(input: &str) -> String {
 }
 
 fn now_string() -> String {
-    let seconds = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    seconds.to_string()
+    nanos.to_string()
 }
 
 #[cfg(test)]

@@ -19,8 +19,8 @@ use axum::{
 use platform_core::{
     merge_unique_tasks, new_activity, new_runtime_entry, seed_tasks_from_agents_markdown,
     seed_tasks_from_docs, Agent, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
-    CreateTaskRequest, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus, User,
-    WorkspaceRoot,
+    CreateTaskRequest, PendingQuestion, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus,
+    User, WorkspaceRoot,
 };
 use runtime::{CodexRuntimeSession, RuntimeEvent};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,7 @@ struct BoardState {
     projects: Vec<Project>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
+    pending_questions: Vec<PendingQuestion>,
     project_scans: HashMap<Uuid, ProjectScanSummary>,
     project_sessions: Vec<ProjectSession>,
 }
@@ -128,6 +129,8 @@ struct PersistedState {
     tasks: Vec<Task>,
     agents: Vec<Agent>,
     #[serde(default)]
+    pending_questions: Vec<PendingQuestion>,
+    #[serde(default)]
     project_scans: HashMap<Uuid, ProjectScanSummary>,
     #[serde(default)]
     project_sessions: Vec<ProjectSession>,
@@ -142,6 +145,11 @@ struct LoginRequest {
 struct AuthSnapshot {
     current_user: Option<User>,
     users: Vec<User>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PullNextResponse {
+    task: Option<Task>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +180,50 @@ struct ContinueProjectSessionRequest {
     prompt: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AnswerPendingQuestionRequest {
+    answer: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCompletionReport {
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    questions: Vec<TaskCompletionQuestion>,
+    #[serde(default)]
+    follow_ups: Vec<TaskCompletionFollowUp>,
+    #[serde(default)]
+    risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TaskCompletionQuestion {
+    Text(String),
+    Detailed {
+        question: String,
+        #[serde(default)]
+        context: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TaskCompletionFollowUp {
+    #[serde(default)]
+    kind: Option<String>,
+    title: String,
+    description: String,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    can_auto_create_task: Option<bool>,
+    #[serde(default)]
+    can_auto_apply: Option<bool>,
+}
+
 #[derive(Clone, Copy)]
 enum RuntimeMode {
     RealCodex,
@@ -200,6 +252,10 @@ fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
         .route("/api/me", get(get_me))
         .route("/api/auth/login", post(login))
         .route("/api/board", get(get_board))
+        .route(
+            "/api/questions/{question_id}/answer",
+            post(answer_pending_question),
+        )
         .route(
             "/api/projects/{project_id}/context",
             get(get_project_context),
@@ -239,6 +295,7 @@ fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
             "/api/agents/{agent_id}/auto-mode/toggle",
             post(toggle_agent_auto_mode),
         )
+        .route("/api/agents/{agent_id}/pull-next", post(pull_next_task))
         .route("/api/tasks/{task_id}/claim/{agent_id}", post(claim_task))
         .route("/api/tasks/{task_id}/start/{agent_id}", post(start_task))
         .route("/api/tasks/{task_id}/pause", post(pause_task))
@@ -256,6 +313,7 @@ fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState
             projects: persisted.projects,
             tasks: persisted.tasks,
             agents: persisted.agents,
+            pending_questions: persisted.pending_questions,
             project_scans: persisted.project_scans,
             project_sessions: persisted.project_sessions,
         })),
@@ -350,16 +408,12 @@ fn state_store_path(workspace_root: &Path) -> PathBuf {
     #[cfg(test)]
     {
         let _ = workspace_root;
-        return std::env::temp_dir().join(format!(
-            "spotlight-server-state-{}.json",
-            Uuid::new_v4()
-        ));
+        return std::env::temp_dir()
+            .join(format!("spotlight-server-state-{}.json", Uuid::new_v4()));
     }
 
     #[cfg(not(test))]
-    workspace_root
-        .join(".spotlight")
-        .join("server-state.json")
+    workspace_root.join(".spotlight").join("server-state.json")
 }
 
 fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> PersistedState {
@@ -386,6 +440,7 @@ fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> Persist
         projects,
         tasks,
         agents: default_agents(&users),
+        pending_questions: Vec::new(),
         project_scans: HashMap::new(),
         project_sessions: Vec::new(),
     };
@@ -395,8 +450,7 @@ fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> Persist
 
 fn persist_state_to_path(store_path: &Path, state: &PersistedState) -> Result<(), String> {
     if let Some(parent) = store_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("创建状态目录失败：{error}"))?;
+        std::fs::create_dir_all(parent).map_err(|error| format!("创建状态目录失败：{error}"))?;
     }
     let content = serde_json::to_string_pretty(state)
         .map_err(|error| format!("序列化服务端状态失败：{error}"))?;
@@ -441,12 +495,15 @@ async fn login(
 
     let cookie_value = build_auth_cookie(&user.id);
     let response = (
-        [(header::SET_COOKIE, HeaderValue::from_str(&cookie_value).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("设置登录 Cookie 失败：{error}"),
-            )
-        })?)],
+        [(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie_value).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("设置登录 Cookie 失败：{error}"),
+                )
+            })?,
+        )],
         Json(AuthSnapshot {
             current_user: Some(user),
             users,
@@ -462,6 +519,35 @@ async fn get_board(State(state): State<AppState>, headers: HeaderMap) -> Json<Bo
         &guard,
         resolve_current_user(&guard, &headers),
     ))
+}
+
+async fn answer_pending_question(
+    AxumPath(question_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    Json(request): Json<AnswerPendingQuestionRequest>,
+) -> AppResult<Json<BoardSnapshot>> {
+    let answer = request.answer.trim();
+    if answer.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "回答内容不能为空".into()));
+    }
+
+    let mut guard = state.inner.lock().await;
+    let question = find_pending_question_mut(&mut guard, question_id)?;
+    question.status = "answered".into();
+    question.answer = Some(answer.to_string());
+    question.answered_at = Some(timestamp_string());
+    let source_task_id = question.source_task_id;
+    let question_text = question.question.clone();
+    if let Ok(task) = find_task_mut(&mut guard, source_task_id) {
+        task.activities.push(new_activity(
+            "task.question_answered",
+            format!("已统一记录问题回答：{}\n回答：{}", question_text, answer),
+        ));
+    }
+    let snapshot = snapshot_from_state(&guard);
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
 }
 
 async fn get_project_context(
@@ -631,7 +717,10 @@ async fn start_project_session(
                 thread_id: None,
                 active_turn_id: None,
                 messages: vec![user_message],
-                log: vec![new_runtime_entry("project.session.user", prompt.to_string())],
+                log: vec![new_runtime_entry(
+                    "project.session.user",
+                    prompt.to_string(),
+                )],
                 last_error: None,
             },
         );
@@ -640,8 +729,14 @@ async fn start_project_session(
 
     match state.runtime_mode {
         RuntimeMode::Stub => {
-            complete_stub_project_session(&state, session_id, &project, latest_scan.as_ref(), prompt)
-                .await?;
+            complete_stub_project_session(
+                &state,
+                session_id,
+                &project,
+                latest_scan.as_ref(),
+                prompt,
+            )
+            .await?;
             let guard = state.inner.lock().await;
             return Ok(Json(project_context_snapshot(&guard, project_id)?));
         }
@@ -727,7 +822,10 @@ async fn continue_project_session(
             let project_session = find_project_session_mut(&mut guard, session_id)
                 .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到项目会话".into()))?;
             if project_session.active_turn_id.is_some() {
-                return Err((StatusCode::CONFLICT, "当前项目会话仍在运行，请稍后再试".into()));
+                return Err((
+                    StatusCode::CONFLICT,
+                    "当前项目会话仍在运行，请稍后再试".into(),
+                ));
             }
             project_session.status = "running".into();
             project_session.last_error = None;
@@ -736,10 +834,14 @@ async fn continue_project_session(
                 content: prompt.to_string(),
                 at: timestamp_string(),
             });
-            project_session
-                .log
-                .push(new_runtime_entry("project.session.user", prompt.to_string()));
-            (project_session.project_id, project_session.thread_id.clone())
+            project_session.log.push(new_runtime_entry(
+                "project.session.user",
+                prompt.to_string(),
+            ));
+            (
+                project_session.project_id,
+                project_session.thread_id.clone(),
+            )
         };
 
         let project = find_project(&guard, project_id)?.clone();
@@ -747,16 +849,11 @@ async fn continue_project_session(
         let workspace_root = project
             .primary_workspace()
             .map(|workspace| PathBuf::from(&workspace.path));
-        (
-            project_id,
-            project,
-            latest_scan,
-            thread_id,
-            workspace_root,
-        )
+        (project_id, project, latest_scan, thread_id, workspace_root)
     };
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) && workspace_root.is_none() {
-        mark_project_session_failed(&state, session_id, "项目会话需要先为当前项目配置主工作目录").await;
+        mark_project_session_failed(&state, session_id, "项目会话需要先为当前项目配置主工作目录")
+            .await;
         persist_state(&state).await?;
         return Err((
             StatusCode::BAD_REQUEST,
@@ -764,7 +861,12 @@ async fn continue_project_session(
         ));
     }
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) && thread_id.is_none() {
-        mark_project_session_failed(&state, session_id, "当前项目会话缺少 thread_id，请新建一个项目会话").await;
+        mark_project_session_failed(
+            &state,
+            session_id,
+            "当前项目会话缺少 thread_id，请新建一个项目会话",
+        )
+        .await;
         persist_state(&state).await?;
         return Err((
             StatusCode::CONFLICT,
@@ -775,8 +877,14 @@ async fn continue_project_session(
 
     match state.runtime_mode {
         RuntimeMode::Stub => {
-            complete_stub_project_session(&state, session_id, &project, latest_scan.as_ref(), prompt)
-                .await?;
+            complete_stub_project_session(
+                &state,
+                session_id,
+                &project,
+                latest_scan.as_ref(),
+                prompt,
+            )
+            .await?;
             let guard = state.inner.lock().await;
             return Ok(Json(project_context_snapshot(&guard, project_id)?));
         }
@@ -856,6 +964,7 @@ async fn create_task(
         status: TaskStatus::Open,
         creator_user_id: current_user.as_ref().map(|user| user.id),
         assignee_user_id: None,
+        source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.created",
@@ -989,6 +1098,17 @@ async fn toggle_agent_auto_mode(
     Ok(Json(snapshot))
 }
 
+async fn pull_next_task(
+    AxumPath(agent_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PullNextResponse>> {
+    let mut guard = state.inner.lock().await;
+    let task = auto_claim_next_task(&mut guard, agent_id)?;
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(PullNextResponse { task }))
+}
+
 async fn claim_task(
     AxumPath((task_id, agent_id)): AxumPath<(Uuid, Uuid)>,
     State(state): State<AppState>,
@@ -1034,7 +1154,7 @@ async fn start_task(
         let git_prepare = prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await?;
         git_auto_merge_enabled = git_prepare.auto_merge_enabled;
         for (kind, message) in git_prepare.activities {
-                    record_task_activity(&state, task_id, kind, message).await;
+            record_task_activity(&state, task_id, kind, message).await;
         }
         apply_git_snapshot(&context.workspace_root, task_id, &state).await;
     }
@@ -1198,6 +1318,7 @@ async fn resume_task(
                     .push(new_runtime_entry("assistant", "Stub 会话已完成任务"));
                 runtime.active_turn_id = None;
             }
+            process_task_completion_outputs(&mut guard, task_id);
             reset_agent_if_needed(&mut guard, task_id, "最近一次任务已完成");
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
@@ -1272,6 +1393,7 @@ async fn runtime_event_loop(
         let mut reset_action: Option<&'static str> = None;
         let mut remove_runtime = false;
         let mut should_finalize_git_merge = false;
+        let mut should_process_completion_outputs = false;
         let task_is_running;
 
         {
@@ -1321,6 +1443,7 @@ async fn runtime_event_loop(
                             task.status = TaskStatus::Done;
                             reset_action = Some("最近一次任务已完成");
                             should_finalize_git_merge = runtime.git_auto_merge_enabled;
+                            should_process_completion_outputs = true;
                         }
                         "interrupted" => {
                             task.status = TaskStatus::Paused;
@@ -1367,6 +1490,10 @@ async fn runtime_event_loop(
             reset_agent_if_needed(&mut guard, task_id, action);
         }
 
+        if should_process_completion_outputs {
+            process_task_completion_outputs(&mut guard, task_id);
+        }
+
         if task_is_running {
             if let Some(agent) = guard.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.status = "运行中".into();
@@ -1411,6 +1538,7 @@ fn snapshot_from_state_with_user(state: &BoardState, current_user: Option<User>)
         projects: state.projects.clone(),
         tasks: state.tasks.clone(),
         agents: state.agents.clone(),
+        pending_questions: state.pending_questions.clone(),
     }
 }
 
@@ -1447,6 +1575,7 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
                 projects: guard.projects.clone(),
                 tasks: guard.tasks.clone(),
                 agents: guard.agents.clone(),
+                pending_questions: guard.pending_questions.clone(),
                 project_scans: guard.project_scans.clone(),
                 project_sessions: guard.project_sessions.clone(),
             },
@@ -1509,16 +1638,14 @@ fn build_project_scan_summary(
     let key_files = files
         .iter()
         .filter_map(|path| {
-            is_key_project_file(path)
-                .then(|| display_relative_path(workspace_root, path))
+            is_key_project_file(path).then(|| display_relative_path(workspace_root, path))
         })
         .take(12)
         .collect::<Vec<_>>();
     let document_files = files
         .iter()
         .filter_map(|path| {
-            is_document_file(path)
-                .then(|| display_relative_path(workspace_root, path))
+            is_document_file(path).then(|| display_relative_path(workspace_root, path))
         })
         .take(12)
         .collect::<Vec<_>>();
@@ -1544,7 +1671,11 @@ fn build_project_scan_summary(
         workspace_path: workspace.path.clone(),
         scanned_at: timestamp_string(),
         stack_summary: detection.summary(),
-        detected_stacks: detection.stacks.iter().map(|stack| stack.to_string()).collect(),
+        detected_stacks: detection
+            .stacks
+            .iter()
+            .map(|stack| stack.to_string())
+            .collect(),
         top_level_entries,
         key_files,
         document_files,
@@ -1623,7 +1754,11 @@ fn compose_project_session_prompt(
                 "- {}: {}（{}）",
                 workspace.label,
                 workspace.path,
-                if workspace.writable { "可写" } else { "只读" }
+                if workspace.writable {
+                    "可写"
+                } else {
+                    "只读"
+                }
             )
         })
         .collect::<Vec<_>>()
@@ -1724,7 +1859,9 @@ async fn complete_stub_project_session(
         return Err((StatusCode::NOT_FOUND, "未找到项目会话".into()));
     };
     project_session.status = "completed".into();
-    project_session.thread_id.get_or_insert_with(|| "stub-project-thread".into());
+    project_session
+        .thread_id
+        .get_or_insert_with(|| "stub-project-thread".into());
     project_session.active_turn_id = None;
     project_session.messages.push(ProjectSessionMessage {
         role: "assistant".into(),
@@ -1744,9 +1881,10 @@ async fn mark_project_session_failed(state: &AppState, session_id: Uuid, message
         project_session.status = "failed".into();
         project_session.active_turn_id = None;
         project_session.last_error = Some(message.to_string());
-        project_session
-            .log
-            .push(new_runtime_entry("project.session.error", message.to_string()));
+        project_session.log.push(new_runtime_entry(
+            "project.session.error",
+            message.to_string(),
+        ));
     }
 }
 
@@ -1859,6 +1997,284 @@ async fn project_session_event_loop(
     }
 }
 
+fn process_task_completion_outputs(state: &mut BoardState, task_id: Uuid) -> bool {
+    let Some(source_task) = state.tasks.iter().find(|task| task.id == task_id).cloned() else {
+        return false;
+    };
+    let Some(runtime) = source_task.runtime.as_ref() else {
+        return false;
+    };
+    let Some(report) = extract_task_completion_report(&runtime.log) else {
+        return false;
+    };
+
+    let mut auto_created_task_count = 0;
+    let mut pending_question_count = 0;
+    let mut risk_count = 0;
+
+    for follow_up in &report.follow_ups {
+        if !should_auto_create_follow_up_task(follow_up) {
+            continue;
+        }
+
+        let title = follow_up.title.trim();
+        let description = follow_up.description.trim();
+        if title.is_empty() || description.is_empty() {
+            continue;
+        }
+
+        let already_exists = state.tasks.iter().any(|task| {
+            task.project_id == source_task.project_id
+                && task.source_task_id == Some(source_task.id)
+                && task.title == title
+        });
+        if already_exists {
+            continue;
+        }
+
+        state.tasks.insert(
+            0,
+            Task {
+                id: Uuid::new_v4(),
+                project_id: source_task.project_id,
+                title: title.to_string(),
+                description: compose_follow_up_task_description(&source_task, follow_up),
+                status: TaskStatus::Open,
+                creator_user_id: source_task.creator_user_id,
+                assignee_user_id: None,
+                source_task_id: Some(source_task.id),
+                claimed_by: None,
+                activities: vec![new_activity(
+                    "task.auto_created_from_completion",
+                    format!("该任务由“{}”完成后的结构化建议自动生成", source_task.title),
+                )],
+                runtime: None,
+            },
+        );
+        auto_created_task_count += 1;
+    }
+
+    for question in &report.questions {
+        let Some((question_text, context)) = normalize_completion_question(question) else {
+            continue;
+        };
+        let already_exists = state.pending_questions.iter().any(|item| {
+            item.source_task_id == source_task.id
+                && item.question == question_text
+                && item.status != "answered"
+        });
+        if already_exists {
+            continue;
+        }
+
+        state.pending_questions.push(PendingQuestion {
+            id: Uuid::new_v4(),
+            project_id: source_task.project_id,
+            source_task_id: source_task.id,
+            source_task_title: source_task.title.clone(),
+            question: question_text,
+            context,
+            status: "open".into(),
+            answer: None,
+            created_at: timestamp_string(),
+            answered_at: None,
+        });
+        pending_question_count += 1;
+    }
+
+    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
+        if let Some(summary) = report
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            task.activities.push(new_activity(
+                "task.completion_summary",
+                format!("任务完成总结：{summary}"),
+            ));
+        }
+        if auto_created_task_count > 0 {
+            task.activities.push(new_activity(
+                "task.follow_ups_created",
+                format!(
+                    "已根据 Agent 建议自动创建 {} 个后续任务",
+                    auto_created_task_count
+                ),
+            ));
+        }
+        if pending_question_count > 0 {
+            task.activities.push(new_activity(
+                "task.questions_captured",
+                format!("已统一收口 {} 个待回答问题", pending_question_count),
+            ));
+        }
+        if !report.risks.is_empty() {
+            for risk in report
+                .risks
+                .iter()
+                .map(|risk| risk.trim())
+                .filter(|risk| !risk.is_empty())
+            {
+                task.activities.push(new_activity(
+                    "task.completion_risk",
+                    format!("完成后风险提示：{risk}"),
+                ));
+                risk_count += 1;
+            }
+        }
+    }
+
+    let _ = risk_count;
+    true
+}
+
+fn extract_task_completion_report(log: &[RuntimeLogEntry]) -> Option<TaskCompletionReport> {
+    for entry in log.iter().rev() {
+        if entry.kind != "assistant" {
+            continue;
+        }
+        if let Some(report) = parse_task_completion_report_text(&entry.message) {
+            let has_content = report
+                .result
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+                || report
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some()
+                || !report.questions.is_empty()
+                || !report.follow_ups.is_empty()
+                || !report.risks.is_empty();
+            if has_content {
+                return Some(report);
+            }
+        }
+    }
+    None
+}
+
+fn parse_task_completion_report_text(text: &str) -> Option<TaskCompletionReport> {
+    for candidate in completion_json_candidates(text) {
+        if let Ok(report) = serde_json::from_str::<TaskCompletionReport>(&candidate) {
+            return Some(report);
+        }
+    }
+    None
+}
+
+fn completion_json_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for segment in text.rsplit("```") {
+        let trimmed = segment.trim();
+        let candidate = if let Some(rest) = trimmed.strip_prefix("json") {
+            rest.trim()
+        } else {
+            trimmed
+        };
+        if candidate.starts_with('{') && candidate.ends_with('}') && !candidate.is_empty() {
+            let owned = candidate.to_string();
+            if !candidates.contains(&owned) {
+                candidates.push(owned);
+            }
+        }
+    }
+
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+        if start < end {
+            let candidate = text[start..=end].trim().to_string();
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn normalize_completion_question(
+    question: &TaskCompletionQuestion,
+) -> Option<(String, Option<String>)> {
+    match question {
+        TaskCompletionQuestion::Text(question) => {
+            let trimmed = question.trim();
+            (!trimmed.is_empty()).then(|| (trimmed.to_string(), None))
+        }
+        TaskCompletionQuestion::Detailed { question, context } => {
+            let trimmed = question.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some((
+                    trimmed.to_string(),
+                    context
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned),
+                ))
+            }
+        }
+    }
+}
+
+fn should_auto_create_follow_up_task(follow_up: &TaskCompletionFollowUp) -> bool {
+    if follow_up.can_auto_apply == Some(true) {
+        return false;
+    }
+    if let Some(can_auto_create_task) = follow_up.can_auto_create_task {
+        return can_auto_create_task;
+    }
+
+    matches!(
+        follow_up.kind.as_deref().map(str::trim).map(str::to_ascii_lowercase),
+        Some(kind)
+            if matches!(
+                kind.as_str(),
+                "doc_update"
+                    | "documentation"
+                    | "docs"
+                    | "test_gap"
+                    | "test"
+                    | "cleanup"
+                    | "refactor_followup"
+                    | "follow_up_task"
+            )
+    )
+}
+
+fn compose_follow_up_task_description(
+    source_task: &Task,
+    follow_up: &TaskCompletionFollowUp,
+) -> String {
+    let kind = follow_up
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("follow_up_task");
+    let priority = follow_up
+        .priority
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未标注");
+
+    format!(
+        "该任务由已完成任务“{}”自动派生。\n\
+来源任务 ID：{}\n\
+建议类型：{}\n\
+建议优先级：{}\n\
+\n\
+建议说明：\n{}",
+        source_task.title, source_task.id, kind, priority, follow_up.description
+    )
+}
+
 fn resolve_project_for_new_task(
     state: &BoardState,
     project_id: Option<Uuid>,
@@ -1908,6 +2324,17 @@ fn find_project_session_mut(
         .project_sessions
         .iter_mut()
         .find(|session| session.id == session_id)
+}
+
+fn find_pending_question_mut(
+    state: &mut BoardState,
+    question_id: Uuid,
+) -> AppResult<&mut PendingQuestion> {
+    state
+        .pending_questions
+        .iter_mut()
+        .find(|question| question.id == question_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到待回答问题".into()))
 }
 
 fn primary_workspace_path(project: &Project) -> AppResult<PathBuf> {
@@ -1986,7 +2413,8 @@ fn compose_task_prompt(task: &Task, project: &Project, prompt_override: Option<S
 2. 不要假设当前目录一定是代码仓库；它可能为空，也可能只有 Word、PDF、表格、图片或其他资料。\n\
 3. 如果遇到 Office 或二进制文件，不要臆造内容，可以基于文件名、目录结构、相邻文本和可读元数据给出判断。\n\
 4. 项目外目录允许读取，但不要做破坏性修改。\n\
-5. 输出时尽量用中文，结论、风险和建议都要清楚可读。",
+5. 输出时尽量用中文，结论、风险和建议都要清楚可读。\n\
+6. 任务结束时，请在最后附加一个 ```json 代码块，字段至少包含 result、summary、questions、follow_ups、risks；如果没有内容也要给空数组。",
         project.name, project.description, workspace_list, task.title, task.description
     );
 
@@ -2062,6 +2490,7 @@ fn build_local_build_restart_task(project: &Project) -> Task {
         status: TaskStatus::Open,
         creator_user_id: None,
         assignee_user_id: None,
+        source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.local_build_restart_created",
@@ -2156,6 +2585,7 @@ fn build_cloud_install_restart_task(
         status: TaskStatus::Open,
         creator_user_id: None,
         assignee_user_id: None,
+        source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.cloud_install_restart_created",
@@ -2363,6 +2793,7 @@ fn build_exploration_task(project: &Project) -> Task {
         status: TaskStatus::Open,
         creator_user_id: None,
         assignee_user_id: None,
+        source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.explore_created",
@@ -2466,6 +2897,8 @@ fn task_developer_instructions() -> String {
         "如果用户暂停后补充提示词，要在同一线程里继续推进，不要丢失上下文。",
         "平台会在任务启动前自动从主分支切出任务分支，并在任务完成后尝试按门禁规则合并回主分支。",
         "除非任务明确要求，不要自行执行危险 Git 历史改写，也不要跳过测试就声称可以合并。",
+        "任务完成时，请在回复末尾附加一个可机读的 JSON 代码块，例如包含 result、summary、questions、follow_ups、risks。",
+        "questions 用于放仍需用户回答的澄清问题；follow_ups 用于放建议自动生成的后续任务，字段建议包含 kind、title、description、priority、can_auto_create_task、can_auto_apply。",
     ]
     .join(" ")
 }
@@ -2555,7 +2988,13 @@ async fn detect_primary_remote(workspace_root: &Path) -> Option<String> {
 
     git_stdout_trimmed(workspace_root, &["remote"])
         .await
-        .and_then(|stdout| stdout.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_string))
+        .and_then(|stdout| {
+            stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_string)
+        })
 }
 
 async fn detect_base_branch(workspace_root: &Path, remote_name: Option<&str>) -> String {
@@ -2618,7 +3057,8 @@ async fn prepare_git_task_branch_in_repo(
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message.clone()))?
     {
         let _message =
-            "任务启动前检测到 Git 工作区存在未提交改动，已阻止自动切换主分支并创建任务分支。".to_string();
+            "任务启动前检测到 Git 工作区存在未提交改动，已阻止自动切换主分支并创建任务分支。"
+                .to_string();
         activities.push((
             "git.branch_prepare_skipped".into(),
             "任务启动前检测到 Git 工作区存在未提交改动，本次跳过自动切换主分支、任务分支创建和后续自动合并；任务仍会继续执行。".into(),
@@ -2659,8 +3099,7 @@ async fn prepare_git_task_branch_in_repo(
         }
     }
 
-    let checkout_base =
-        git_command_output(workspace_root, &["checkout", &plan.base_branch]).await;
+    let checkout_base = git_command_output(workspace_root, &["checkout", &plan.base_branch]).await;
     match checkout_base {
         Ok(output) if output.status.success() => activities.push((
             "git.base_checked_out".into(),
@@ -2708,7 +3147,10 @@ async fn prepare_git_task_branch_in_repo(
         } else {
             activities.push((
                 "git.base_update_skipped".into(),
-                format!("远端 {remote} 上未找到 {}/{}，跳过主分支快进。", remote, plan.base_branch),
+                format!(
+                    "远端 {remote} 上未找到 {}/{}，跳过主分支快进。",
+                    remote, plan.base_branch
+                ),
             ));
         }
     }
@@ -2756,6 +3198,71 @@ async fn prepare_git_task_branch_in_repo(
         activities,
         auto_merge_enabled: true,
     })
+}
+
+fn auto_claim_next_task(state: &mut BoardState, agent_id: Uuid) -> AppResult<Option<Task>> {
+    let (agent_name, owner_user_id, auto_mode_enabled, agent_busy) = state
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .map(|agent| {
+            (
+                agent.name.clone(),
+                agent.owner_user_id,
+                agent.auto_mode,
+                agent.current_task_id.is_some(),
+            )
+        })
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到 Agent".into()))?;
+
+    if !auto_mode_enabled || agent_busy {
+        return Ok(None);
+    }
+
+    let assigned_index = owner_user_id.and_then(|user_id| {
+        select_oldest_task_index(&state.tasks, |task| {
+            matches!(task.status, TaskStatus::Open)
+                && task.claimed_by.is_none()
+                && task.assignee_user_id == Some(user_id)
+        })
+    });
+
+    let task_index = assigned_index.or_else(|| {
+        select_oldest_task_index(&state.tasks, |task| {
+            matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none()
+        })
+    });
+
+    let Some(task_index) = task_index else {
+        return Ok(None);
+    };
+
+    let task = &mut state.tasks[task_index];
+    task.claimed_by = Some(agent_id);
+    task.assignee_user_id = task.assignee_user_id.or(owner_user_id);
+    task.status = TaskStatus::Claimed;
+    task.activities.push(new_activity(
+        "task.auto_claimed",
+        format!("任务已由 {} 自动认领", agent_name),
+    ));
+
+    Ok(Some(task.clone()))
+}
+
+fn select_oldest_task_index(tasks: &[Task], predicate: impl Fn(&Task) -> bool) -> Option<usize> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| predicate(task))
+        .min_by_key(|(index, task)| (task_created_order(task), *index))
+        .map(|(index, _)| index)
+}
+
+fn task_created_order(task: &Task) -> u128 {
+    task.activities
+        .first()
+        .and_then(|activity| activity.at.parse::<u128>().ok())
+        .unwrap_or(u128::MAX)
 }
 
 async fn finalize_git_task_branch_in_repo(
@@ -2826,7 +3333,10 @@ async fn finalize_git_task_branch_in_repo(
                 Ok(output) => {
                     activities.push((
                         "git.merge_blocked".into(),
-                        format!("自动提交前执行 git add -A 失败：{}", git_stderr_message(&output)),
+                        format!(
+                            "自动提交前执行 git add -A 失败：{}",
+                            git_stderr_message(&output)
+                        ),
                     ));
                     return activities;
                 }
@@ -2851,11 +3361,8 @@ async fn finalize_git_task_branch_in_repo(
 
             if needs_commit {
                 let commit_message = format!("chore(task): 完成任务 {task_id}");
-                match git_command_output(
-                    workspace_root,
-                    &["commit", "-m", commit_message.as_str()],
-                )
-                .await
+                match git_command_output(workspace_root, &["commit", "-m", commit_message.as_str()])
+                    .await
                 {
                     Ok(output) if output.status.success() => activities.push((
                         "git.task_branch_committed".into(),
@@ -2898,7 +3405,10 @@ async fn finalize_git_task_branch_in_repo(
             Ok(output) => {
                 activities.push((
                     "git.merge_blocked".into(),
-                    format!("自动合并前获取远端 {remote} 失败：{}", git_stderr_message(&output)),
+                    format!(
+                        "自动合并前获取远端 {remote} 失败：{}",
+                        git_stderr_message(&output)
+                    ),
                 ));
                 return activities;
             }
@@ -2950,12 +3460,14 @@ async fn finalize_git_task_branch_in_repo(
                             git_stderr_message(&output)
                         ),
                     ));
-                    let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
+                    let _ =
+                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
                     return activities;
                 }
                 Err(error) => {
                     activities.push(("git.merge_blocked".into(), error));
-                    let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
+                    let _ =
+                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
                     return activities;
                 }
             }
@@ -2965,7 +3477,13 @@ async fn finalize_git_task_branch_in_repo(
     let merge_message = format!("merge task branch {} for {}", plan.task_branch, task_id);
     match git_command_output(
         workspace_root,
-        &["merge", "--no-ff", "-m", merge_message.as_str(), &plan.task_branch],
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            merge_message.as_str(),
+            &plan.task_branch,
+        ],
     )
     .await
     {
@@ -3040,9 +3558,9 @@ async fn apply_git_snapshot(workspace_root: &Path, task_id: Uuid, state: &AppSta
             "创建预执行 tag 失败：branch={branch}，HEAD={head}，dirty={dirty}，{}",
             String::from_utf8_lossy(&output.stderr).trim()
         ),
-        Err(error) => format!(
-            "创建预执行 tag 失败：branch={branch}，HEAD={head}，dirty={dirty}，{error}"
-        ),
+        Err(error) => {
+            format!("创建预执行 tag 失败：branch={branch}，HEAD={head}，dirty={dirty}，{error}")
+        }
     };
 
     let mut guard = state.inner.lock().await;
@@ -3063,8 +3581,9 @@ fn timestamp_compact() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_app, detect_project_stack, finalize_git_task_branch_in_repo,
-        prepare_git_task_branch_in_repo, sanitize_credential_hint, ProjectContextSnapshot,
+        auto_claim_next_task, build_app, default_agents, default_projects, default_users,
+        detect_project_stack, finalize_git_task_branch_in_repo, prepare_git_task_branch_in_repo,
+        sanitize_credential_hint, BoardState, ProjectContextSnapshot, PullNextResponse,
         RuntimeMode,
     };
     use axum::{
@@ -3072,10 +3591,11 @@ mod tests {
         http::{Request, StatusCode},
     };
     use platform_core::{
-        AgentInvocationRequest, AgentResumeRequest, BoardSnapshot, CreateTaskRequest, Project,
-        Task,
+        new_runtime_entry, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
+        CreateTaskRequest, Project, Task, TaskActivity, TaskStatus,
     };
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
         process::Command as StdCommand,
@@ -3148,8 +3668,19 @@ mod tests {
         let local = root.join("local");
 
         fs::create_dir_all(&root).unwrap();
-        ensure_git_ok(&root, &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()]);
-        ensure_git_ok(&root, &["clone", remote.to_str().unwrap(), local.to_str().unwrap()]);
+        ensure_git_ok(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        ensure_git_ok(
+            &root,
+            &["clone", remote.to_str().unwrap(), local.to_str().unwrap()],
+        );
         ensure_git_ok(&local, &["config", "user.name", "Spotlight Test"]);
         ensure_git_ok(&local, &["config", "user.email", "spotlight@example.com"]);
 
@@ -3401,10 +3932,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let updated_project: Project = read_json(response).await;
-        assert_eq!(updated_project.workspace_roots.first().unwrap().label, "backend");
-        assert!(
-            updated_project.workspace_roots.first().unwrap().path.contains("spotlight-project-workspace")
+        assert_eq!(
+            updated_project.workspace_roots.first().unwrap().label,
+            "backend"
         );
+        assert!(updated_project
+            .workspace_roots
+            .first()
+            .unwrap()
+            .path
+            .contains("spotlight-project-workspace"));
     }
 
     #[tokio::test]
@@ -3425,7 +3962,11 @@ mod tests {
 
         let workspace_root = unique_temp_path("spotlight-scan-workspace");
         fs::create_dir_all(workspace_root.join("src")).unwrap();
-        fs::write(workspace_root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
         fs::write(workspace_root.join("README.md"), "# demo\n").unwrap();
         fs::write(workspace_root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
 
@@ -3463,7 +4004,10 @@ mod tests {
         let context: ProjectContextSnapshot = read_json(response).await;
         let scan = context.latest_scan.expect("expected latest scan summary");
         assert!(scan.detected_stacks.iter().any(|stack| stack == "Rust"));
-        assert!(scan.key_files.iter().any(|path| path.ends_with("Cargo.toml")));
+        assert!(scan
+            .key_files
+            .iter()
+            .any(|path| path.ends_with("Cargo.toml")));
     }
 
     #[tokio::test]
@@ -3672,6 +4216,149 @@ mod tests {
         assert_ne!(updated_agent.auto_mode, agent.auto_mode);
     }
 
+    #[test]
+    fn auto_claim_next_task_picks_oldest_open_task_and_skips_done_items() {
+        let workspace_root = unique_temp_path("spotlight-auto-claim");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let agents = default_agents(&users);
+        let agent = agents.first().unwrap().clone();
+        let project_id = projects.first().unwrap().id;
+
+        let newest_open = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "较新的待处理任务".into(),
+            description: "newer open".into(),
+            status: TaskStatus::Open,
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "new".into(),
+                at: "300".into(),
+            }],
+            runtime: None,
+        };
+        let oldest_open = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "较早的待处理任务".into(),
+            description: "older open".into(),
+            status: TaskStatus::Open,
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "old".into(),
+                at: "200".into(),
+            }],
+            runtime: None,
+        };
+        let oldest_done = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "最早但已完成的任务".into(),
+            description: "done".into(),
+            status: TaskStatus::Done,
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "done".into(),
+                at: "100".into(),
+            }],
+            runtime: None,
+        };
+
+        let mut state = BoardState {
+            users,
+            projects,
+            tasks: vec![newest_open.clone(), oldest_open.clone(), oldest_done],
+            agents,
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+        };
+
+        let claimed = auto_claim_next_task(&mut state, agent.id)
+            .unwrap()
+            .expect("should auto claim oldest open task");
+
+        assert_eq!(claimed.id, oldest_open.id);
+        let updated = state
+            .tasks
+            .iter()
+            .find(|task| task.id == oldest_open.id)
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Claimed);
+        assert_eq!(updated.claimed_by, Some(agent.id));
+    }
+
+    #[tokio::test]
+    async fn pull_next_route_returns_a_claimed_task() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+        let agent = snapshot.agents.first().unwrap().clone();
+
+        for title in ["第一条待处理任务", "第二条待处理任务"] {
+            let payload = serde_json::to_vec(&CreateTaskRequest {
+                project_id: Some(project_id),
+                title: title.into(),
+                description: format!("为 {title} 生成测试数据"),
+            })
+            .unwrap();
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/tasks")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{}/pull-next", agent.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let allocation: PullNextResponse = read_json(response).await;
+        let task = allocation.task.expect("should allocate one pending task");
+        assert_eq!(task.status, TaskStatus::Claimed);
+        assert_eq!(task.claimed_by, Some(agent.id));
+    }
+
     #[tokio::test]
     async fn claim_start_pause_resume_flow_works_in_stub_mode() {
         let app = test_app();
@@ -3876,10 +4563,7 @@ mod tests {
             .iter()
             .any(|(kind, _)| kind == "git.merge_completed"));
 
-        let merged_branches = ensure_git_ok(
-            &workspace_root,
-            &["branch", "--merged", "main"],
-        );
+        let merged_branches = ensure_git_ok(&workspace_root, &["branch", "--merged", "main"]);
         assert!(merged_branches.contains(&format!("task/{task_id}")));
 
         let _ = fs::remove_dir_all(
@@ -3913,5 +4597,98 @@ mod tests {
                 .parent()
                 .expect("local clone should have parent directory"),
         );
+    }
+
+    #[test]
+    fn extract_task_completion_report_reads_json_code_block() {
+        let log = vec![new_runtime_entry(
+            "assistant",
+            "任务已完成。\n```json\n{\n  \"result\": \"done\",\n  \"summary\": \"已完成目录扫描\",\n  \"questions\": [\"是否继续补充文档？\"],\n  \"follow_ups\": [\n    {\n      \"kind\": \"doc_update\",\n      \"title\": \"补充目录扫描使用文档\",\n      \"description\": \"补充项目目录接入和扫描说明\",\n      \"priority\": \"P2\",\n      \"can_auto_create_task\": true,\n      \"can_auto_apply\": false\n    }\n  ],\n  \"risks\": [\"文档入口仍需统一\"]\n}\n```",
+        )];
+
+        let report =
+            super::extract_task_completion_report(&log).expect("expected completion report");
+        assert_eq!(report.summary.as_deref(), Some("已完成目录扫描"));
+        assert_eq!(report.questions.len(), 1);
+        assert_eq!(report.follow_ups.len(), 1);
+        assert_eq!(report.risks.len(), 1);
+    }
+
+    #[test]
+    fn process_task_completion_outputs_creates_tasks_and_pending_questions() {
+        let users = default_users();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("failed to resolve workspace root")
+            .to_path_buf();
+        let projects = default_projects(&workspace_root);
+        let creator_user_id = users.first().map(|user| user.id);
+        let source_task = Task {
+            id: Uuid::new_v4(),
+            project_id: projects.first().unwrap().id,
+            title: "实现项目目录接入".into(),
+            description: "source".into(),
+            status: TaskStatus::Done,
+            creator_user_id,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.done".into(),
+                message: "done".into(),
+                at: "1".into(),
+            }],
+            runtime: Some(platform_core::TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: vec![new_runtime_entry(
+                    "assistant",
+                    "```json\n{\n  \"result\": \"done\",\n  \"summary\": \"功能完成，但还需要补测试和补一条澄清问题。\",\n  \"questions\": [\n    {\n      \"question\": \"是否要把目录选择器做成原生文件夹选择窗口？\",\n      \"context\": \"当前只支持手工输入绝对路径\"\n    }\n  ],\n  \"follow_ups\": [\n    {\n      \"kind\": \"test_gap\",\n      \"title\": \"补目录接入回归测试\",\n      \"description\": \"覆盖目录不存在和目录切换场景\",\n      \"priority\": \"P1\",\n      \"can_auto_create_task\": true,\n      \"can_auto_apply\": false\n    }\n  ],\n  \"risks\": [\"目录录入仍依赖手输路径\"]\n}\n```",
+                )],
+                last_error: None,
+            }),
+        };
+
+        let mut state = BoardState {
+            users: users.clone(),
+            projects,
+            tasks: vec![source_task.clone()],
+            agents: default_agents(&users),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+        };
+
+        assert!(super::process_task_completion_outputs(
+            &mut state,
+            source_task.id
+        ));
+        assert!(state.tasks.iter().any(|task| {
+            task.source_task_id == Some(source_task.id) && task.title == "补目录接入回归测试"
+        }));
+        assert!(state
+            .pending_questions
+            .iter()
+            .any(|question| question.source_task_id == source_task.id));
+        let source = state
+            .tasks
+            .iter()
+            .find(|task| task.id == source_task.id)
+            .unwrap();
+        assert!(source
+            .activities
+            .iter()
+            .any(|item| item.kind == "task.follow_ups_created"));
+        assert!(source
+            .activities
+            .iter()
+            .any(|item| item.kind == "task.questions_captured"));
+        assert!(source
+            .activities
+            .iter()
+            .any(|item| item.kind == "task.completion_summary"));
     }
 }

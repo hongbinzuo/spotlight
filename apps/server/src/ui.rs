@@ -359,7 +359,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     </section>
   </main>
   <script>
-    let board = { current_user: null, users: [], projects: [], tasks: [], agents: [] };
+    let board = { current_user: null, users: [], projects: [], tasks: [], agents: [], pending_questions: [] };
     let projectContext = { project_id: null, primary_workspace: null, latest_scan: null, sessions: [] };
     let selectedProjectId = null;
     let selectedTaskId = null;
@@ -386,6 +386,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function selectedProjectSession() {
       return projectContext.sessions.find(session => session.id === selectedProjectSessionId) || null;
+    }
+
+    function pendingQuestionsForCurrentProject() {
+      return (board.pending_questions || []).filter(question =>
+        question.project_id === selectedProjectId && question.status !== "answered"
+      );
     }
 
     function currentUser() {
@@ -441,6 +447,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     async function loadBoard() {
       try {
         board = await request("/api/board");
+        const autoDispatched = await runAutoModeQueue();
+        if (autoDispatched) {
+          board = await request("/api/board");
+        }
         if (!selectedProjectId || !board.projects.some(project => project.id === selectedProjectId)) {
           selectedProjectId = board.projects.find(project => !project.is_spotlight_self)?.id || board.projects[0]?.id || null;
         }
@@ -457,6 +467,35 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         console.error(error);
         setNotice("error", error.message || "加载看板失败");
       }
+    }
+
+    async function runAutoModeQueue() {
+      let changed = false;
+      const eligibleAgents = board.agents.filter(agent => agent.auto_mode && !agent.current_task_id);
+
+      for (const agent of eligibleAgents) {
+        try {
+          const allocation = await request(`/api/agents/${agent.id}/pull-next`, { method: "POST" });
+          if (!allocation?.task) {
+            continue;
+          }
+
+          await request(`/api/tasks/${allocation.task.id}/start/${agent.id}`, {
+            method: "POST",
+            body: JSON.stringify({
+              agent_name_hint: agent.name,
+              prompt: null
+            })
+          });
+          changed = true;
+        } catch (error) {
+          console.error(error);
+          setNotice("error", error.message || "自动认领任务失败");
+          break;
+        }
+      }
+
+      return changed;
     }
 
     async function loadProjectContext(projectId) {
@@ -592,6 +631,25 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         render();
       } catch (error) {
         setNotice("error", error.message || "继续项目问答失败");
+      }
+    }
+
+    async function answerPendingQuestion(questionId) {
+      const question = (board.pending_questions || []).find(item => item.id === questionId);
+      if (!question) return;
+      const answer = window.prompt(`请统一记录对这个问题的回答：\n\n${question.question}`);
+      if (!answer || !answer.trim()) {
+        return;
+      }
+      try {
+        board = await request(`/api/questions/${questionId}/answer`, {
+          method: "POST",
+          body: JSON.stringify({ answer: answer.trim() })
+        });
+        clearNotice();
+        render();
+      } catch (error) {
+        setNotice("error", error.message || "记录问题回答失败");
       }
     }
 
@@ -872,6 +930,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
       const scan = projectContext.latest_scan;
       const workspace = projectContext.primary_workspace;
+      const pendingQuestions = pendingQuestionsForCurrentProject();
       const scanBlock = scan ? `
         <div class="meta">
           <span class="pill">最近扫描 ${escapeHtml(formatUnixTime(scan.scanned_at))}</span>
@@ -885,6 +944,28 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="muted" style="margin-top:4px;">文档文件：${escapeHtml(scan.document_files.join("、") || "未识别")}</div>
         <div class="muted" style="margin-top:4px;">提示：${escapeHtml(scan.notes.join("；") || "暂无")}</div>
       ` : `<div class="muted">还没有项目扫描摘要。接入目录后可以直接扫描，用于后续项目问答和任务拆解。</div>`;
+
+      const questionsBlock = pendingQuestions.length ? `
+        <div class="detail-card" style="margin-top:12px; padding:12px;">
+          <div class="section-head">
+            <h4>待回答问题</h4>
+            <span class="pill">${pendingQuestions.length} 条</span>
+          </div>
+          ${pendingQuestions.map(question => `
+            <article class="message" style="margin-bottom:8px;">
+              <div class="message-meta">
+                <strong>${escapeHtml(question.source_task_title)}</strong>
+                <span>${escapeHtml(formatUnixTime(question.created_at))}</span>
+              </div>
+              <div class="description">${escapeHtml(question.question)}</div>
+              ${question.context ? `<div class="muted" style="margin-top:6px;">上下文：${escapeHtml(question.context)}</div>` : ``}
+              <div class="inline-actions" style="margin-top:8px;">
+                <button class="secondary" onclick="answerPendingQuestion('${question.id}')">记录回答</button>
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      ` : `<div class="muted" style="margin-top:12px;">当前项目还没有待回答问题。</div>`;
 
       root.innerHTML = `
         <div class="muted" style="margin-bottom:8px;">
@@ -907,6 +988,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           </div>
         </div>
         ${scanBlock}
+        ${questionsBlock}
       `;
     }
 
@@ -1013,17 +1095,20 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function renderSummary() {
       const tasks = tasksForCurrentProject();
+      const pendingQuestions = pendingQuestionsForCurrentProject();
       const counts = {
         total: tasks.length,
         open: tasks.filter(task => task.status === "OPEN").length,
         active: tasks.filter(task => ["CLAIMED", "RUNNING", "PAUSED"].includes(task.status)).length,
-        done: tasks.filter(task => task.status === "DONE").length
+        done: tasks.filter(task => task.status === "DONE").length,
+        questions: pendingQuestions.length
       };
       document.getElementById("summary").innerHTML = `
         <div class="summary-box"><strong>${counts.total}</strong><span>任务总数</span></div>
         <div class="summary-box"><strong>${counts.open}</strong><span>待处理</span></div>
         <div class="summary-box"><strong>${counts.active}</strong><span>处理中</span></div>
         <div class="summary-box"><strong>${counts.done}</strong><span>已完成</span></div>
+        <div class="summary-box"><strong>${counts.questions}</strong><span>待回答问题</span></div>
       `;
     }
 
@@ -1203,6 +1288,8 @@ mod tests {
         assert!(INDEX_HTML.contains("scanCurrentProject()"));
         assert!(INDEX_HTML.contains("startProjectSession()"));
         assert!(INDEX_HTML.contains("continueProjectSession()"));
+        assert!(INDEX_HTML.contains("answerPendingQuestion("));
+        assert!(INDEX_HTML.contains("待回答问题"));
         assert!(INDEX_HTML.contains("setNotice("));
     }
 }
