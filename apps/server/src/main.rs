@@ -116,6 +116,11 @@ struct GitTaskBranchPlan {
     remote_name: Option<String>,
 }
 
+struct GitPrepareResult {
+    activities: Vec<(String, String)>,
+    auto_merge_enabled: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState {
     users: Vec<User>,
@@ -1024,19 +1029,12 @@ async fn start_task(
 ) -> AppResult<Json<BoardSnapshot>> {
     let context = resolve_task_execution_context(&state, task_id, request.prompt.clone()).await?;
     let _ = std::fs::create_dir_all(&context.workspace_root);
+    let mut git_auto_merge_enabled = false;
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
-        let git_activities = prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await;
-        match git_activities {
-            Ok(activities) => {
-                for (kind, message) in activities {
+        let git_prepare = prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await?;
+        git_auto_merge_enabled = git_prepare.auto_merge_enabled;
+        for (kind, message) in git_prepare.activities {
                     record_task_activity(&state, task_id, kind, message).await;
-                }
-            }
-            Err(error) => {
-                record_task_activity(&state, task_id, "git.branch_prepare_failed", error.1.clone())
-                    .await;
-                return Err(error);
-            }
         }
         apply_git_snapshot(&context.workspace_root, task_id, &state).await;
     }
@@ -1052,6 +1050,7 @@ async fn start_task(
                 &context.prompt,
                 Some("stub-thread".into()),
                 Some("stub-turn".into()),
+                false,
             )?;
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
@@ -1078,6 +1077,7 @@ async fn start_task(
                     &context.prompt,
                     Some(thread_id),
                     Some(turn_id),
+                    git_auto_merge_enabled,
                 )?;
             }
             state.runtime_sessions.lock().await.insert(task_id, session);
@@ -1186,6 +1186,7 @@ async fn resume_task(
                     provider: "stub-codex".into(),
                     thread_id: Some("stub-thread".into()),
                     active_turn_id: Some("stub-turn-2".into()),
+                    git_auto_merge_enabled: false,
                     log: Vec::new(),
                     last_error: None,
                 });
@@ -1279,6 +1280,7 @@ async fn runtime_event_loop(
                 provider: "codex".into(),
                 thread_id: None,
                 active_turn_id: None,
+                git_auto_merge_enabled: false,
                 log: Vec::new(),
                 last_error: None,
             });
@@ -1318,7 +1320,7 @@ async fn runtime_event_loop(
                         "completed" => {
                             task.status = TaskStatus::Done;
                             reset_action = Some("最近一次任务已完成");
-                            should_finalize_git_merge = true;
+                            should_finalize_git_merge = runtime.git_auto_merge_enabled;
                         }
                         "interrupted" => {
                             task.status = TaskStatus::Paused;
@@ -2378,6 +2380,7 @@ fn mark_task_running(
     prompt: &str,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    git_auto_merge_enabled: bool,
 ) -> AppResult<()> {
     let task_title = {
         let task = find_task_mut(state, task_id)?;
@@ -2400,11 +2403,13 @@ fn mark_task_running(
             provider: "codex".into(),
             thread_id: None,
             active_turn_id: None,
+            git_auto_merge_enabled: false,
             log: Vec::new(),
             last_error: None,
         });
         runtime.thread_id = thread_id;
         runtime.active_turn_id = turn_id;
+        runtime.git_auto_merge_enabled = git_auto_merge_enabled;
         runtime
             .log
             .push(new_runtime_entry("user", prompt.to_string()));
@@ -2594,7 +2599,7 @@ async fn detect_git_task_branch_plan(workspace_root: &Path, task_id: Uuid) -> Gi
 async fn prepare_git_task_branch_in_repo(
     workspace_root: &Path,
     task_id: Uuid,
-) -> AppResult<Vec<(String, String)>> {
+) -> AppResult<GitPrepareResult> {
     let mut activities = Vec::new();
 
     if !is_git_repo(workspace_root).await {
@@ -2602,17 +2607,26 @@ async fn prepare_git_task_branch_in_repo(
             "git.branch_prepare_skipped".into(),
             "当前工作目录不是 Git 仓库，跳过任务分支预处理。".into(),
         ));
-        return Ok(activities);
+        return Ok(GitPrepareResult {
+            activities,
+            auto_merge_enabled: false,
+        });
     }
 
     if git_worktree_dirty(workspace_root)
         .await
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message.clone()))?
     {
-        let message =
+        let _message =
             "任务启动前检测到 Git 工作区存在未提交改动，已阻止自动切换主分支并创建任务分支。".to_string();
-        activities.push(("git.branch_prepare_failed".into(), message.clone()));
-        return Err((StatusCode::CONFLICT, message));
+        activities.push((
+            "git.branch_prepare_skipped".into(),
+            "任务启动前检测到 Git 工作区存在未提交改动，本次跳过自动切换主分支、任务分支创建和后续自动合并；任务仍会继续执行。".into(),
+        ));
+        return Ok(GitPrepareResult {
+            activities,
+            auto_merge_enabled: false,
+        });
     }
 
     let plan = detect_git_task_branch_plan(workspace_root, task_id).await;
@@ -2738,7 +2752,10 @@ async fn prepare_git_task_branch_in_repo(
         }
     }
 
-    Ok(activities)
+    Ok(GitPrepareResult {
+        activities,
+        auto_merge_enabled: true,
+    })
 }
 
 async fn finalize_git_task_branch_in_repo(
@@ -3822,9 +3839,10 @@ mod tests {
         let workspace_root = init_git_test_workspace();
         let task_id = Uuid::from_u128(42);
 
-        let activities = prepare_git_task_branch_in_repo(&workspace_root, task_id)
+        let prepare = prepare_git_task_branch_in_repo(&workspace_root, task_id)
             .await
             .unwrap();
+        let activities = prepare.activities;
 
         let current_branch = ensure_git_ok(&workspace_root, &["branch", "--show-current"]);
         assert_eq!(current_branch, format!("task/{task_id}"));
@@ -3863,6 +3881,32 @@ mod tests {
             &["branch", "--merged", "main"],
         );
         assert!(merged_branches.contains(&format!("task/{task_id}")));
+
+        let _ = fs::remove_dir_all(
+            workspace_root
+                .parent()
+                .expect("local clone should have parent directory"),
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_git_task_branch_skips_auto_branching_when_worktree_is_dirty() {
+        let workspace_root = init_git_test_workspace();
+        let task_id = Uuid::from_u128(126);
+
+        fs::write(workspace_root.join("dirty.txt"), "local change\n").unwrap();
+
+        let prepare = prepare_git_task_branch_in_repo(&workspace_root, task_id)
+            .await
+            .unwrap();
+
+        let current_branch = ensure_git_ok(&workspace_root, &["branch", "--show-current"]);
+        assert_eq!(current_branch, "main");
+        assert!(!prepare.auto_merge_enabled);
+        assert!(prepare
+            .activities
+            .iter()
+            .any(|(kind, _)| kind == "git.branch_prepare_skipped"));
 
         let _ = fs::remove_dir_all(
             workspace_root

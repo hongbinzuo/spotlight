@@ -86,6 +86,8 @@ pub struct TaskRuntime {
     pub provider: String,
     pub thread_id: Option<String>,
     pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub git_auto_merge_enabled: bool,
     pub log: Vec<RuntimeLogEntry>,
     pub last_error: Option<String>,
 }

@@ -114,6 +114,22 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .project-card { margin-bottom: 12px; }
     .project-card h3, .detail-card h3, .detail-card h4 { margin: 0 0 8px; }
+    .notice-banner {
+      margin-top: 12px;
+      border-radius: 14px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      background: #fff7ec;
+      color: var(--text);
+    }
+    .notice-banner.error {
+      background: #fff0eb;
+      border-color: #d07c32;
+    }
+    .notice-banner.warn {
+      background: #fff6df;
+      border-color: #d8b485;
+    }
     .section-head {
       display: flex;
       align-items: center;
@@ -261,6 +277,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
       </div>
     </div>
+    <div id="noticeBanner" class="notice-banner" style="display:none;"></div>
   </header>
   <main>
     <section class="panel">
@@ -348,6 +365,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let selectedTaskId = null;
     let selectedAgentIdState = null;
     let selectedProjectSessionId = null;
+    let noticeState = { kind: "", message: "" };
     const workspaceDraft = { label: "", path: "", writable: true, isPrimaryDefault: true };
     const projectSessionDraft = { title: "", prompt: "" };
 
@@ -437,6 +455,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         render();
       } catch (error) {
         console.error(error);
+        setNotice("error", error.message || "加载看板失败");
       }
     }
 
@@ -456,72 +475,124 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         console.error(error);
         projectContext = { project_id: projectId, primary_workspace: null, latest_scan: null, sessions: [] };
         selectedProjectSessionId = null;
+        setNotice("error", error.message || "加载项目上下文失败");
       }
+    }
+
+    function setNotice(kind, message) {
+      noticeState = {
+        kind: kind || "warn",
+        message: String(message || "").trim()
+      };
+      renderNotice();
+    }
+
+    function clearNotice() {
+      noticeState = { kind: "", message: "" };
+      renderNotice();
+    }
+
+    function renderNotice() {
+      const root = document.getElementById("noticeBanner");
+      if (!root) return;
+      if (!noticeState.message) {
+        root.style.display = "none";
+        root.className = "notice-banner";
+        root.textContent = "";
+        return;
+      }
+      root.style.display = "block";
+      root.className = `notice-banner ${noticeState.kind || "warn"}`;
+      root.textContent = noticeState.message;
     }
 
     async function loginSelectedUser() {
       const select = document.getElementById("userSelect");
       const username = select?.value;
       if (!username) return;
-      await request("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ username })
-      });
-      await loadBoard();
+      try {
+        await request("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ username })
+        });
+        await loadBoard();
+      } catch (error) {
+        setNotice("error", error.message || "切换用户失败");
+      }
     }
 
     async function registerWorkspaceRoot() {
       if (!selectedProjectId) return;
       const path = projectPathDraftValue();
       if (!path) return;
-      await request(`/api/projects/${selectedProjectId}/workspaces`, {
-        method: "POST",
-        body: JSON.stringify({
-          label: workspaceDraft.label,
-          path,
-          isPrimaryDefault: workspaceDraft.isPrimaryDefault,
-          isWritable: workspaceDraft.writable
-        })
-      });
-      workspaceDraft.label = "";
-      await loadBoard();
+      try {
+        await request(`/api/projects/${selectedProjectId}/workspaces`, {
+          method: "POST",
+          body: JSON.stringify({
+            label: workspaceDraft.label,
+            path,
+            isPrimaryDefault: workspaceDraft.isPrimaryDefault,
+            isWritable: workspaceDraft.writable
+          })
+        });
+        workspaceDraft.label = "";
+        clearNotice();
+        await loadBoard();
+      } catch (error) {
+        setNotice("error", error.message || "接入目录失败");
+      }
     }
 
     async function scanCurrentProject() {
       if (!selectedProjectId) return;
-      await request(`/api/projects/${selectedProjectId}/scan`, { method: "POST" });
-      await loadProjectContext(selectedProjectId);
-      render();
+      try {
+        await request(`/api/projects/${selectedProjectId}/scan`, { method: "POST" });
+        clearNotice();
+        await loadProjectContext(selectedProjectId);
+        render();
+      } catch (error) {
+        setNotice("error", error.message || "扫描项目失败");
+      }
     }
 
     async function startProjectSession() {
       if (!selectedProjectId) return;
       const prompt = projectSessionDraft.prompt.trim();
       if (!prompt) return;
-      await request(`/api/projects/${selectedProjectId}/sessions`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: projectSessionDraft.title.trim() || null,
-          prompt
-        })
-      });
-      projectSessionDraft.prompt = "";
-      projectSessionDraft.title = "";
-      await loadProjectContext(selectedProjectId);
-      render();
+      try {
+        await request(`/api/projects/${selectedProjectId}/sessions`, {
+          method: "POST",
+          body: JSON.stringify({
+            title: projectSessionDraft.title.trim() || null,
+            prompt
+          })
+        });
+        projectSessionDraft.prompt = "";
+        projectSessionDraft.title = "";
+        clearNotice();
+        await loadProjectContext(selectedProjectId);
+        render();
+      } catch (error) {
+        setNotice("error", error.message || "发起项目问答失败");
+      }
     }
 
     async function continueProjectSession() {
       const session = selectedProjectSession();
       const prompt = projectSessionDraft.prompt.trim();
       if (!session || !prompt) return;
-      await request(`/api/project-sessions/${session.id}/turns`, {
-        method: "POST",
-        body: JSON.stringify({ prompt })
-      });
-      projectSessionDraft.prompt = "";
-      await loadProjectContext(selectedProjectId);
-      render();
+      try {
+        await request(`/api/project-sessions/${session.id}/turns`, {
+          method: "POST",
+          body: JSON.stringify({ prompt })
+        });
+        projectSessionDraft.prompt = "";
+        clearNotice();
+        await loadProjectContext(selectedProjectId);
+        render();
+      } catch (error) {
+        setNotice("error", error.message || "继续项目问答失败");
+      }
     }
 
     async function createTask() {
@@ -642,14 +713,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     async function startSelected() {
       if (!selectedTaskId) return;
       const prompt = document.getElementById("promptBox").value.trim();
-      await request(`/api/tasks/${selectedTaskId}/start/${selectedAgentId()}`, {
-        method: "POST",
-        body: JSON.stringify({
-          agent_name_hint: selectedAgentName(),
-          prompt: prompt || null
-        })
-      });
-      await loadBoard();
+      try {
+        await request(`/api/tasks/${selectedTaskId}/start/${selectedAgentId()}`, {
+          method: "POST",
+          body: JSON.stringify({
+            agent_name_hint: selectedAgentName(),
+            prompt: prompt || null
+          })
+        });
+        clearNotice();
+        await loadBoard();
+      } catch (error) {
+        setNotice("error", error.message || "启动任务失败");
+      }
     }
 
     async function pauseSelected() {
@@ -1043,6 +1119,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function render() {
+      renderNotice();
       renderHeaderAuth();
       renderProjectContextCard();
       renderProjectSessionCard();
@@ -1121,9 +1198,11 @@ mod tests {
     fn project_context_and_session_panels_are_present() {
         assert!(INDEX_HTML.contains("id=\"projectContextCard\""));
         assert!(INDEX_HTML.contains("id=\"projectSessionCard\""));
+        assert!(INDEX_HTML.contains("id=\"noticeBanner\""));
         assert!(INDEX_HTML.contains("registerWorkspaceRoot()"));
         assert!(INDEX_HTML.contains("scanCurrentProject()"));
         assert!(INDEX_HTML.contains("startProjectSession()"));
         assert!(INDEX_HTML.contains("continueProjectSession()"));
+        assert!(INDEX_HTML.contains("setNotice("));
     }
 }
