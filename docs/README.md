@@ -1,47 +1,53 @@
-# Multi-Agent Collaboration Desktop
+# Spotlight 文档索引
 
-This folder contains the product and technical design documents for a cross-platform desktop app that combines a shared task queue with a Zed-style Agent workspace backed by local Codex CLI sessions over ACP.
+本目录存放 Spotlight 的产品、架构、数据模型、交互和版本切片文档。
 
-## Document Index
+## 文档索引
 
 - `product-constraints-v1.md`
-  - Product goals, actors, permissions, task lifecycle, and MVP boundaries.
+  - 产品目标、角色权限、任务生命周期与 MVP 边界。
 - `state-machine.md`
-  - Canonical task, run, approval, acceptance, and rollback state models.
+  - 任务、运行、审批、验收、回滚等核心状态模型。
 - `system-architecture.md`
-  - End-to-end architecture for Tauri desktop, Rust services, ACP integration, and central sync service.
+  - Tauri 桌面端、Rust 服务、ACP 集成和中心服务的端到端架构。
 - `data-model.md`
-  - Core entities, relational schema, indexes, and audit/event storage.
+  - 核心实体、关系模型、索引与审计事件存储建议。
 - `data-model-v2.md`
-  - Platform-oriented data model that reduces hardcoded enums and adds workflow, runtime, tenant, and artifact abstractions.
+  - 面向平台演进的数据模型，减少硬编码枚举并补充 workflow、runtime、tenant、artifact 抽象。
 - `api-design.md`
-  - Service APIs, WebSocket events, and local desktop-to-core interfaces.
+  - 服务 API、WebSocket 事件以及本地桌面到核心服务接口。
 - `ui-information-architecture.md`
-  - Desktop page layout, major views, interaction flows, and Zed-inspired Agent panel behavior.
+  - 桌面端页面结构、主要视图、交互流和 Agent 面板设计。
+- `agent-autonomy-and-decision-rules.md`
+  - Agent 自治、决策边界、等待队列、请示条件、记忆沉淀与反馈闭环规则。
 - `acceptance-and-artifacts.md`
-  - Output package, acceptance contract, and what a completed task must hand back for review.
+  - 任务输出包、验收契约以及任务完成后必须提交的审查材料。
 - `provider-abstraction.md`
-  - How to support multiple local model CLIs such as Codex, Claude, Kimi, and MiniMax without changing the product model.
+  - 如何支持 Codex、Claude、Kimi、MiniMax 等不同本地模型 CLI / Runtime。
 - `runtime-protocol-decision.md`
-  - Why Spotlight should use the native Codex app-server runtime first, while reserving standard ACP for future interoperability.
+  - 为什么优先接入原生 Codex app-server runtime，同时为标准 ACP 兼容保留扩展点。
 - `extensibility-and-compatibility.md`
-  - Remaining hardcoded areas, long-term extension points, and compatibility principles for a category-defining product.
+  - 剩余硬编码区域、长期扩展点和兼容性原则。
 - `platform-abstractions-v1.md`
-  - Stable long-term kernel abstractions for workflow, runtime, provider, policy, snapshot, artifacts, and events.
+  - workflow、runtime、provider、policy、snapshot、artifact、event 等稳定抽象。
 - `billing-and-deployment-model.md`
-  - SaaS, managed private deployment, self-hosted, and recommended subscription plus usage-based charging strategy.
+  - SaaS、托管私有化、自建部署，以及订阅与用量计费建议。
 - `mobile-companion-strategy.md`
-  - Mobile app scope for project/task visibility and Agent status monitoring, with optional lightweight approval and interruption actions.
+  - 移动伴侣的项目/任务可见性、Agent 状态监控与轻量审批范围。
 - `admin-and-ops-console.md`
-  - Back-office control plane for project settings, people and role management, monitoring, risk operations, and platform maintenance.
+  - 后台控制面、项目配置、人员角色、监控、风险操作和平台维护能力。
+- `admin-and-ops-slices-0.1.5.md`
+  - `0.1.5` 后台与运维控制台的任务切片、边界、测试要求与实施顺序。
 - `ai-management-and-insight-engine.md`
-  - Multi-model AI control plane for management analysis, forecasting, summaries, and low-token project intelligence.
+  - 多模型 AI 控制面，用于管理分析、预测、总结和低 Token 项目洞察。
+- `ai-insight-slices-0.1.7.md`
+  - `0.1.7` AI 洞察与管理能力的版本切片、场景边界、测试要求与实施顺序。
 - `security-and-audit.md`
-  - Workspace boundaries, dangerous action policy, git tag policy, rollback policy, and audit requirements.
+  - 工作区边界、危险操作策略、Git 标签、回滚策略和审计要求。
 - `delivery-plan.md`
-  - MVP slices, milestones, and implementation order.
+  - MVP 切片、里程碑与建议实施顺序。
 
-## Recommended Reading Order
+## 建议阅读顺序
 
 1. `product-constraints-v1.md`
 2. `state-machine.md`
@@ -51,13 +57,16 @@ This folder contains the product and technical design documents for a cross-plat
 6. `platform-abstractions-v1.md`
 7. `api-design.md`
 8. `ui-information-architecture.md`
-9. `acceptance-and-artifacts.md`
-10. `provider-abstraction.md`
-11. `runtime-protocol-decision.md`
-12. `extensibility-and-compatibility.md`
-13. `billing-and-deployment-model.md`
-14. `mobile-companion-strategy.md`
-15. `admin-and-ops-console.md`
-16. `ai-management-and-insight-engine.md`
-17. `security-and-audit.md`
-18. `delivery-plan.md`
+9. `agent-autonomy-and-decision-rules.md`
+10. `acceptance-and-artifacts.md`
+11. `provider-abstraction.md`
+12. `runtime-protocol-decision.md`
+13. `extensibility-and-compatibility.md`
+14. `billing-and-deployment-model.md`
+15. `mobile-companion-strategy.md`
+16. `admin-and-ops-console.md`
+17. `admin-and-ops-slices-0.1.5.md`
+18. `ai-management-and-insight-engine.md`
+19. `ai-insight-slices-0.1.7.md`
+20. `security-and-audit.md`
+21. `delivery-plan.md`

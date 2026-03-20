@@ -18,6 +18,12 @@ Base prefix:
 
 - `/api/v1`
 
+当前 `0.1.0` 服务端落地说明：
+
+- 统一入口页面继续挂在 `/`
+- JSON API 主前缀为 `/api/v1`
+- 为兼容已有页面脚本与测试，`/api` 保留同构兼容路由
+
 Provider note:
 
 - APIs should treat Agent runtime as provider-neutral even though Codex is the first implementation
@@ -28,6 +34,12 @@ Provider note:
 ### `GET /projects`
 
 Returns projects visible to the current user.
+
+当前 `0.1.0` 实现说明：
+
+- 先返回服务端内存态里的项目列表
+- 当前字段为最小骨架：`id`、`name`、`description`、`workspace_roots`、`is_spotlight_self`
+- 项目可见性与能力摘要留到后台能力版本再补齐
 
 Response fields:
 
@@ -84,6 +96,12 @@ Supports filters:
 - `mine`
 - `pendingAcceptance`
 - `manualReview`
+
+当前 `0.1.0` 实现说明：
+
+- 已提供项目级任务看板读取接口
+- 当前先支持 `status` 查询参数
+- 其余筛选项作为 `0.1.1` 看板增强范围继续补齐
 
 ### `POST /projects/{projectId}/tasks`
 
@@ -148,6 +166,15 @@ Request:
 
 Cancels an unstarted or manually halted task.
 
+### `GET /agents`
+
+Returns the minimal Agent list required by the right-side Agent panel.
+
+当前 `0.1.0` 实现说明：
+
+- 返回 `id`、`owner_user_id`、`name`、`provider`、`status`、`auto_mode`、`current_task_id`、`last_action`
+- 能力协商、Provider 归一化能力与心跳扩展继续沿用下方协调接口推进
+
 ## 5. Agent Coordination APIs
 
 ### `POST /agents/{agentId}/auto-mode`
@@ -202,7 +229,15 @@ Atomically allocates the next eligible task for the Agent.
 Selection rules:
 
 - assigned tasks for that Agent first
-- then oldest public queue task in the project
+- then oldest eligible queued task visible to that Agent
+- completed tasks must be skipped
+
+Current `0.1.0` implementation notes:
+
+- only `open` tasks are eligible for automatic allocation
+- allocation order is based on task creation/activity timestamp from oldest to newest
+- allocated tasks transition to `CLAIMED` immediately in the server state
+- the current minimal response only returns the allocated task, without a separate `runConfig` payload
 
 Response:
 
@@ -212,13 +247,7 @@ Response:
     "id": "task-uuid",
     "title": "Implement task queue UI",
     "description": "Build the left-side task list and integrate claim/approve actions.",
-    "status": "auto_claimed"
-  },
-  "runConfig": {
-    "primaryWorkspaceId": "workspace-uuid",
-    "attachedWorkspaceIds": ["workspace-2"],
-    "retryBudget": 3,
-    "acceptanceOwnerUserId": "user-uuid"
+    "status": "CLAIMED"
   }
 }
 ```
@@ -348,7 +377,7 @@ Minimal useful operations:
 - register a project workspace root from a local absolute path
 - scan the current primary workspace and persist a lightweight project summary
 - create a project-scoped conversation that is not yet bound to a formal task
-- continue a previously opened project-scoped conversation inside the same local runtime process
+- continue a previously opened project-scoped conversation; if the in-memory runtime process is gone, reconnect the persisted provider thread and resume execution
 
 This bootstrap surface is intentionally local-first:
 

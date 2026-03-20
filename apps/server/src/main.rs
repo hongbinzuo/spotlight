@@ -2,7 +2,7 @@ mod runtime;
 mod ui;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Json as ExtractJson, Path as AxumPath, State},
+    extract::{Json as ExtractJson, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -19,18 +19,21 @@ use axum::{
 use platform_core::{
     merge_unique_tasks, new_activity, new_runtime_entry, seed_tasks_from_agents_markdown,
     seed_tasks_from_docs, Agent, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
-    CreateTaskRequest, PendingQuestion, Project, RuntimeLogEntry, Task, TaskRuntime, TaskStatus,
-    User, WorkspaceRoot,
+    CreateTaskRequest, PendingQuestion, Project, RuntimeLogEntry, Task, TaskPriority, TaskRuntime,
+    TaskStatus, User, WorkspaceRoot,
 };
 use runtime::{CodexRuntimeSession, RuntimeEvent};
 use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
     sync::{mpsc, Mutex},
+    time::{sleep, Duration},
 };
 use uuid::Uuid;
 
 type AppResult<T> = Result<T, (StatusCode, String)>;
+const AUTO_MAINTENANCE_INTERVAL_SECS: u64 = 5;
+const TASK_STALE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Clone)]
 struct AppState {
@@ -49,12 +52,19 @@ struct BoardState {
     pending_questions: Vec<PendingQuestion>,
     project_scans: HashMap<Uuid, ProjectScanSummary>,
     project_sessions: Vec<ProjectSession>,
+    project_chat_messages: Vec<ProjectChatMessage>,
 }
 
 #[derive(Clone)]
 struct TaskExecutionContext {
     workspace_root: PathBuf,
     prompt: String,
+}
+
+struct ResolvedRuntimeSession {
+    session: Arc<CodexRuntimeSession>,
+    thread_id: String,
+    event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +107,16 @@ struct ProjectSessionMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectChatMessage {
+    id: Uuid,
+    project_id: Uuid,
+    user_id: Option<Uuid>,
+    user_display_name: String,
+    content: String,
+    at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectSession {
     id: Uuid,
     project_id: Uuid,
@@ -134,11 +154,18 @@ struct PersistedState {
     project_scans: HashMap<Uuid, ProjectScanSummary>,
     #[serde(default)]
     project_sessions: Vec<ProjectSession>,
+    #[serde(default)]
+    project_chat_messages: Vec<ProjectChatMessage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginRequest {
     username: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListProjectTasksQuery {
+    status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +185,8 @@ struct ProjectContextSnapshot {
     primary_workspace: Option<WorkspaceRoot>,
     latest_scan: Option<ProjectScanSummary>,
     sessions: Vec<ProjectSession>,
+    #[serde(default)]
+    chat_messages: Vec<ProjectChatMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +212,17 @@ struct ContinueProjectSessionRequest {
 #[derive(Debug, Deserialize)]
 struct AnswerPendingQuestionRequest {
     answer: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CancelTaskRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectChatRequest {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,60 +287,76 @@ async fn main() {
 }
 
 fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
+    let state = default_state(runtime_mode, workspace_root);
+    start_background_automation(state.clone());
+
+    let api = build_api_router();
+
     Router::new()
         .route("/", get(index))
-        .route("/api/me", get(get_me))
-        .route("/api/auth/login", post(login))
-        .route("/api/board", get(get_board))
+        .nest("/api", api.clone())
+        .nest("/api/v1", api)
+        .with_state(state)
+}
+
+fn build_api_router() -> Router<AppState> {
+    Router::new()
+        .route("/me", get(get_me))
+        .route("/auth/login", post(login))
+        .route("/board", get(get_board))
+        .route("/projects", get(list_projects))
+        .route("/projects/{project_id}/tasks", get(list_project_tasks))
+        .route("/agents", get(list_agents))
         .route(
-            "/api/questions/{question_id}/answer",
+            "/questions/{question_id}/answer",
             post(answer_pending_question),
         )
+        .route("/projects/{project_id}/context", get(get_project_context))
         .route(
-            "/api/projects/{project_id}/context",
-            get(get_project_context),
+            "/projects/{project_id}/chat",
+            post(post_project_chat_message),
         )
         .route(
-            "/api/projects/{project_id}/workspaces",
+            "/projects/{project_id}/workspaces",
             post(register_project_workspace),
         )
-        .route("/api/projects/{project_id}/scan", post(scan_project))
+        .route("/projects/{project_id}/scan", post(scan_project))
         .route(
-            "/api/projects/{project_id}/sessions",
+            "/projects/{project_id}/sessions",
             post(start_project_session),
         )
         .route(
-            "/api/project-sessions/{session_id}/turns",
+            "/project-sessions/{session_id}/turns",
             post(continue_project_session),
         )
-        .route("/api/tasks", post(create_task))
+        .route("/tasks", post(create_task))
         .route(
-            "/api/projects/{project_id}/tasks/bootstrap",
+            "/projects/{project_id}/tasks/bootstrap",
             post(bootstrap_tasks),
         )
         .route(
-            "/api/projects/{project_id}/tasks/seed-docs",
+            "/projects/{project_id}/tasks/seed-docs",
             post(seed_doc_tasks),
         )
         .route(
-            "/api/projects/{project_id}/tasks/local-build-restart",
+            "/projects/{project_id}/tasks/local-build-restart",
             post(create_local_build_restart_task),
         )
         .route(
-            "/api/projects/{project_id}/tasks/cloud-install-restart",
+            "/projects/{project_id}/tasks/cloud-install-restart",
             post(create_cloud_install_restart_task),
         )
-        .route("/api/projects/{project_id}/explore", post(explore_project))
+        .route("/projects/{project_id}/explore", post(explore_project))
         .route(
-            "/api/agents/{agent_id}/auto-mode/toggle",
+            "/agents/{agent_id}/auto-mode/toggle",
             post(toggle_agent_auto_mode),
         )
-        .route("/api/agents/{agent_id}/pull-next", post(pull_next_task))
-        .route("/api/tasks/{task_id}/claim/{agent_id}", post(claim_task))
-        .route("/api/tasks/{task_id}/start/{agent_id}", post(start_task))
-        .route("/api/tasks/{task_id}/pause", post(pause_task))
-        .route("/api/tasks/{task_id}/resume/{agent_id}", post(resume_task))
-        .with_state(default_state(runtime_mode, workspace_root))
+        .route("/agents/{agent_id}/pull-next", post(pull_next_task))
+        .route("/tasks/{task_id}/claim/{agent_id}", post(claim_task))
+        .route("/tasks/{task_id}/start/{agent_id}", post(start_task))
+        .route("/tasks/{task_id}/pause", post(pause_task))
+        .route("/tasks/{task_id}/cancel", post(cancel_task))
+        .route("/tasks/{task_id}/resume/{agent_id}", post(resume_task))
 }
 
 fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState {
@@ -316,11 +372,659 @@ fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState
             pending_questions: persisted.pending_questions,
             project_scans: persisted.project_scans,
             project_sessions: persisted.project_sessions,
+            project_chat_messages: persisted.project_chat_messages,
         })),
         runtime_mode,
         runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
         store_path,
     }
+}
+
+fn start_background_automation(state: AppState) {
+    if !matches!(state.runtime_mode, RuntimeMode::RealCodex) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            if let Err((_, message)) = run_automation_cycle_once(&state).await {
+                eprintln!("background automation cycle failed: {message}");
+            }
+            sleep(Duration::from_secs(AUTO_MAINTENANCE_INTERVAL_SECS)).await;
+        }
+    });
+}
+
+async fn run_automation_cycle_once(state: &AppState) -> AppResult<()> {
+    let mut sessions_to_stop = recover_stale_runtime_tasks(state).await?;
+    let parallel_sessions_to_stop = recover_parallel_active_tasks(state).await?;
+    sessions_to_stop.extend(parallel_sessions_to_stop);
+    stop_runtime_sessions(state, &sessions_to_stop).await;
+    drive_auto_mode_agents(state).await;
+    Ok(())
+}
+
+async fn recover_stale_runtime_tasks(state: &AppState) -> AppResult<Vec<Uuid>> {
+    let active_runtime_task_ids = {
+        let sessions = state.runtime_sessions.lock().await;
+        sessions.keys().copied().collect::<HashSet<_>>()
+    };
+    let now_nanos = current_time_nanos();
+
+    let sessions_to_stop = {
+        let mut guard = state.inner.lock().await;
+        reconcile_watchdog_state(&mut guard, &active_runtime_task_ids, now_nanos)
+    };
+
+    if !sessions_to_stop.is_empty() {
+        persist_state(state).await?;
+    }
+
+    Ok(sessions_to_stop)
+}
+
+async fn recover_parallel_active_tasks(state: &AppState) -> AppResult<Vec<Uuid>> {
+    let sessions_to_stop = {
+        let mut guard = state.inner.lock().await;
+        reconcile_parallel_active_tasks(&mut guard)
+    };
+
+    if !sessions_to_stop.is_empty() {
+        persist_state(state).await?;
+    }
+
+    Ok(sessions_to_stop)
+}
+
+async fn stop_runtime_sessions(state: &AppState, task_ids: &[Uuid]) {
+    for task_id in task_ids {
+        let session = {
+            let mut sessions = state.runtime_sessions.lock().await;
+            sessions.remove(task_id)
+        };
+        if let Some(session) = session {
+            session.shutdown().await;
+        }
+    }
+}
+
+async fn drive_auto_mode_agents(state: &AppState) {
+    let has_active_task = {
+        let guard = state.inner.lock().await;
+        active_task_conflict(&guard.tasks, None).is_some()
+    };
+    if has_active_task {
+        return;
+    }
+
+    let auto_agents = {
+        let guard = state.inner.lock().await;
+        guard
+            .agents
+            .iter()
+            .filter(|agent| agent.auto_mode && agent.current_task_id.is_none())
+            .map(|agent| (agent.id, agent.name.clone(), agent.owner_user_id))
+            .collect::<Vec<_>>()
+    };
+
+    for (agent_id, agent_name, owner_user_id) in auto_agents {
+        if let Some(task_id) = {
+            let guard = state.inner.lock().await;
+            select_next_auto_resume_task_id(&guard.tasks, agent_id)
+        } {
+            if let Err((_, message)) = auto_resume_task(state, task_id, agent_id, &agent_name).await
+            {
+                let _ = reopen_task_for_auto_retry(state, task_id, agent_id, &message).await;
+            }
+            return;
+        }
+
+        let claimed_task = {
+            let mut guard = state.inner.lock().await;
+            let claimed = auto_claim_next_task(&mut guard, agent_id).ok().flatten();
+            claimed
+        };
+        if claimed_task.is_some() {
+            let _ = persist_state(state).await;
+        }
+
+        if let Some(task) = claimed_task {
+            if let Err((_, message)) = auto_start_task(state, task.id, agent_id, &agent_name).await
+            {
+                let _ = reopen_task_for_auto_retry(state, task.id, agent_id, &message).await;
+            }
+            return;
+        } else {
+            let _ = owner_user_id;
+        }
+    }
+}
+
+fn reconcile_watchdog_state(
+    state: &mut BoardState,
+    active_runtime_task_ids: &HashSet<Uuid>,
+    now_nanos: u128,
+) -> Vec<Uuid> {
+    let mut sessions_to_stop = Vec::new();
+
+    for task in &mut state.tasks {
+        let has_session = active_runtime_task_ids.contains(&task.id);
+        let Some(reason) = stale_task_recovery_reason(task, has_session, now_nanos) else {
+            continue;
+        };
+
+        if let Some(runtime) = task.runtime.as_mut() {
+            runtime.active_turn_id = None;
+            runtime.last_error = Some(reason.clone());
+            runtime.log.push(new_runtime_entry(
+                "watchdog",
+                format!("检测到运行卡住，已自动回收：{reason}"),
+            ));
+        }
+
+        task.status = TaskStatus::Open;
+        task.claimed_by = None;
+
+        task.activities.push(new_activity(
+            "task.watchdog_recovered",
+            format!("系统检测到任务长时间无进展，已自动回收：{reason}"),
+        ));
+
+        if has_session {
+            sessions_to_stop.push(task.id);
+        }
+    }
+
+    for agent in &mut state.agents {
+        let should_release = agent.current_task_id.is_some_and(|task_id| {
+            state
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| {
+                    !matches!(task.status, TaskStatus::Running | TaskStatus::Claimed)
+                        || task.claimed_by != Some(agent.id)
+                })
+                .unwrap_or(true)
+        });
+
+        if should_release {
+            agent.current_task_id = None;
+            agent.status = "空闲".into();
+            agent.last_action = "已自动释放失效占用，等待继续执行".into();
+        }
+    }
+
+    sessions_to_stop.sort_unstable();
+    sessions_to_stop.dedup();
+    sessions_to_stop
+}
+
+fn active_task_keep_order(task: &Task, index: usize) -> (u8, u8, u128, u128, usize) {
+    let status_order = match task.status {
+        TaskStatus::Running => 0,
+        TaskStatus::Claimed => 1,
+        _ => 2,
+    };
+    let last_touch_order = u128::MAX - task_last_touch_nanos(task).unwrap_or_default();
+    (
+        status_order,
+        task_priority_order(task.priority),
+        last_touch_order,
+        task_created_order(task),
+        index,
+    )
+}
+
+fn reconcile_parallel_active_tasks(state: &mut BoardState) -> Vec<Uuid> {
+    let active_task_ids = state
+        .tasks
+        .iter()
+        .filter(|task| task_is_serialized_active(task))
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    if active_task_ids.len() <= 1 {
+        return Vec::new();
+    }
+
+    let Some(keep_task_id) = state
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task_is_serialized_active(task))
+        .min_by_key(|(index, task)| active_task_keep_order(task, *index))
+        .map(|(_, task)| task.id)
+    else {
+        return Vec::new();
+    };
+
+    let keep_task_title = state
+        .tasks
+        .iter()
+        .find(|task| task.id == keep_task_id)
+        .map(|task| task.title.clone())
+        .unwrap_or_else(|| "当前保留任务".into());
+
+    let mut requeued_titles = Vec::new();
+    let mut sessions_to_stop = Vec::new();
+    for task_id in active_task_ids {
+        if task_id == keep_task_id {
+            continue;
+        }
+
+        let task_title = {
+            let task = find_task_mut(state, task_id).expect("parallel active task should exist");
+            let task_title = task.title.clone();
+            task.status = TaskStatus::Open;
+            task.claimed_by = None;
+            if let Some(runtime) = task.runtime.as_mut() {
+                runtime.active_turn_id = None;
+                runtime.log.push(new_runtime_entry(
+                    "system",
+                    format!(
+                        "系统检测到同时存在多个进行中任务，已自动回收到等待队列；当前保留执行的是《{}》。",
+                        keep_task_title
+                    ),
+                ));
+            }
+            task.activities.push(new_activity(
+                "task.parallel_requeued",
+                format!(
+                    "系统检测到同时存在多个进行中任务，为保证串行执行，已将该任务回收到等待队列；当前保留执行的是《{}》。",
+                    keep_task_title
+                ),
+            ));
+            task_title
+        };
+
+        requeued_titles.push(task_title);
+        reset_agent_if_needed(state, task_id, "检测到并行执行，已回收到等待队列");
+        sessions_to_stop.push(task_id);
+    }
+
+    if !requeued_titles.is_empty() {
+        let keep_task = find_task_mut(state, keep_task_id).expect("keep task should exist");
+        keep_task.activities.push(new_activity(
+            "task.parallel_serialized",
+            format!(
+                "系统检测到此前存在并行执行，已保留当前任务继续推进；回收到等待队列的任务：{}",
+                requeued_titles.join("、")
+            ),
+        ));
+    }
+
+    sessions_to_stop.sort_unstable();
+    sessions_to_stop.dedup();
+    sessions_to_stop
+}
+
+fn stale_task_recovery_reason(task: &Task, has_session: bool, now_nanos: u128) -> Option<String> {
+    match task.status {
+        TaskStatus::Running => {
+            let runtime = task.runtime.as_ref()?;
+            if runtime.active_turn_id.is_none() {
+                return Some("运行中任务缺少活动 turn".into());
+            }
+            if !has_session {
+                return Some("本地运行会话已丢失，无法继续流式执行".into());
+            }
+            let last_touch = task_last_touch_nanos(task)?;
+            if now_nanos.saturating_sub(last_touch) > stale_timeout_nanos() {
+                return Some(format!(
+                    "超过 {} 秒没有新的日志或事件输出",
+                    TASK_STALE_TIMEOUT_SECS
+                ));
+            }
+            None
+        }
+        TaskStatus::Claimed => {
+            let last_touch = task_last_touch_nanos(task)?;
+            (now_nanos.saturating_sub(last_touch) > stale_timeout_nanos()).then_some(format!(
+                "任务被认领后超过 {} 秒仍未启动",
+                TASK_STALE_TIMEOUT_SECS
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn select_next_auto_resume_task_id(tasks: &[Task], agent_id: Uuid) -> Option<Uuid> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| {
+            matches!(task.status, TaskStatus::Paused)
+                && task.claimed_by == Some(agent_id)
+                && task
+                    .activities
+                    .last()
+                    .is_some_and(|activity| activity.kind == "task.watchdog_recovered")
+                && task
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.thread_id.as_ref())
+                    .is_some()
+        })
+        .min_by_key(|(index, task)| {
+            (
+                task_priority_order(task.priority),
+                task_created_order(task),
+                *index,
+            )
+        })
+        .map(|(_, task)| task.id)
+}
+
+async fn auto_start_task(
+    state: &AppState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    agent_name: &str,
+) -> AppResult<()> {
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+            return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
+        }
+        let task = find_task_mut(&mut guard, task_id)?;
+        if matches!(task.status, TaskStatus::Canceled) {
+            return Err((StatusCode::CONFLICT, "已撤销任务不能自动启动".into()));
+        }
+    }
+
+    let context = resolve_task_execution_context(state, task_id, None).await?;
+    let _ = std::fs::create_dir_all(&context.workspace_root);
+    let mut git_auto_merge_enabled = false;
+    if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
+        let git_prepare = prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await?;
+        git_auto_merge_enabled = git_prepare.auto_merge_enabled;
+        for (kind, message) in git_prepare.activities {
+            record_task_activity(state, task_id, kind, message).await;
+        }
+        apply_git_snapshot(&context.workspace_root, task_id, state).await;
+    }
+
+    match state.runtime_mode {
+        RuntimeMode::Stub => {
+            let mut guard = state.inner.lock().await;
+            mark_task_running(
+                &mut guard,
+                task_id,
+                agent_id,
+                agent_name,
+                &context.prompt,
+                Some("stub-thread".into()),
+                Some("stub-turn".into()),
+                false,
+            )?;
+            if let Ok(task) = find_task_mut(&mut guard, task_id) {
+                task.activities.push(new_activity(
+                    "task.auto_started",
+                    "系统检测到空闲 Agent，已自动开始执行该任务",
+                ));
+            }
+            drop(guard);
+            persist_state(state).await?;
+            Ok(())
+        }
+        RuntimeMode::RealCodex => {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let session =
+                CodexRuntimeSession::spawn(context.workspace_root.clone(), event_tx).await?;
+            let thread_id = session
+                .start_thread(&context.workspace_root, &task_developer_instructions())
+                .await?;
+            let turn_id = session
+                .start_turn(&context.workspace_root, &thread_id, &context.prompt)
+                .await?;
+            {
+                let mut guard = state.inner.lock().await;
+                mark_task_running(
+                    &mut guard,
+                    task_id,
+                    agent_id,
+                    agent_name,
+                    &context.prompt,
+                    Some(thread_id),
+                    Some(turn_id),
+                    git_auto_merge_enabled,
+                )?;
+                if let Ok(task) = find_task_mut(&mut guard, task_id) {
+                    task.activities.push(new_activity(
+                        "task.auto_started",
+                        "系统检测到空闲 Agent，已自动开始执行该任务",
+                    ));
+                }
+            }
+            state.runtime_sessions.lock().await.insert(task_id, session);
+            tokio::spawn(runtime_event_loop(
+                state.clone(),
+                task_id,
+                agent_id,
+                event_rx,
+            ));
+            persist_state(state).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn auto_resume_task(
+    state: &AppState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    agent_name: &str,
+) -> AppResult<()> {
+    let workspace_root = resolve_workspace_for_task(state, task_id).await?;
+    let prompt = auto_resume_prompt(state, task_id).await?;
+    let (thread_id, git_auto_merge_enabled) = {
+        let mut guard = state.inner.lock().await;
+        let task = find_task_mut(&mut guard, task_id)?;
+        if matches!(task.status, TaskStatus::Canceled) {
+            return Err((StatusCode::CONFLICT, "已撤销任务不能自动恢复".into()));
+        }
+        let runtime = task
+            .runtime
+            .as_ref()
+            .ok_or_else(|| (StatusCode::CONFLICT, "缺少可恢复的运行时上下文".into()))?;
+        (
+            runtime
+                .thread_id
+                .clone()
+                .ok_or_else(|| (StatusCode::CONFLICT, "缺少 thread_id，无法自动恢复".into()))?,
+            runtime.git_auto_merge_enabled,
+        )
+    };
+
+    match state.runtime_mode {
+        RuntimeMode::Stub => {
+            let mut guard = state.inner.lock().await;
+            let task = find_task_mut(&mut guard, task_id)?;
+            task.status = TaskStatus::Done;
+            task.claimed_by = Some(agent_id);
+            task.activities.push(new_activity(
+                "task.auto_resumed",
+                "系统检测到上次运行中断，已自动恢复并完成该任务",
+            ));
+            let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
+                provider: "stub-codex".into(),
+                thread_id: Some("stub-thread".into()),
+                active_turn_id: Some("stub-turn-auto-resume".into()),
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            });
+            runtime.last_error = None;
+            runtime.log.push(new_runtime_entry("user", prompt));
+            runtime
+                .log
+                .push(new_runtime_entry("assistant", "Stub 自动恢复后已完成任务"));
+            runtime.active_turn_id = None;
+            process_task_completion_outputs(&mut guard, task_id);
+            reset_agent_if_needed(&mut guard, task_id, "最近一次任务已自动恢复完成");
+            drop(guard);
+            persist_state(state).await?;
+            Ok(())
+        }
+        RuntimeMode::RealCodex => {
+            let resolved_session = resolve_task_runtime_session(
+                state,
+                task_id,
+                agent_id,
+                workspace_root.clone(),
+                &thread_id,
+            )
+            .await?;
+
+            let turn_id = match resolved_session
+                .session
+                .start_turn(&workspace_root, &resolved_session.thread_id, &prompt)
+                .await
+            {
+                Ok(turn_id) => turn_id,
+                Err(error) => {
+                    if resolved_session.event_rx.is_some() {
+                        resolved_session.session.shutdown().await;
+                    }
+                    return Err(error);
+                }
+            };
+
+            register_task_runtime_session(
+                state,
+                task_id,
+                agent_id,
+                resolved_session.session.clone(),
+                resolved_session.event_rx,
+            )
+            .await;
+
+            {
+                let mut guard = state.inner.lock().await;
+                let task = find_task_mut(&mut guard, task_id)?;
+                task.status = TaskStatus::Running;
+                task.claimed_by = Some(agent_id);
+                task.activities.push(new_activity(
+                    "task.auto_resumed",
+                    "系统检测到上次运行中断，已自动恢复该任务",
+                ));
+                let runtime = task
+                    .runtime
+                    .as_mut()
+                    .ok_or_else(|| (StatusCode::CONFLICT, "缺少可恢复的运行时上下文".into()))?;
+                runtime.thread_id = Some(resolved_session.thread_id);
+                runtime.active_turn_id = Some(turn_id);
+                runtime.git_auto_merge_enabled = git_auto_merge_enabled;
+                runtime.last_error = None;
+                runtime.log.push(new_runtime_entry("user", prompt));
+                let task_title = task.title.clone();
+                assign_agent_running(
+                    &mut guard,
+                    agent_id,
+                    task_id,
+                    format!("正在自动恢复任务：{task_title}"),
+                );
+            }
+
+            persist_state(state).await?;
+            let _ = agent_name;
+            Ok(())
+        }
+    }
+}
+
+async fn reopen_task_for_auto_retry(
+    state: &AppState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    reason: &str,
+) -> AppResult<()> {
+    let mut guard = state.inner.lock().await;
+    let task = find_task_mut(&mut guard, task_id)?;
+    task.status = TaskStatus::Open;
+    task.claimed_by = None;
+    task.activities.push(new_activity(
+        "task.auto_retry_queued",
+        format!("自动恢复失败，已重新放回等待队列：{reason}"),
+    ));
+    if let Some(runtime) = task.runtime.as_mut() {
+        runtime.active_turn_id = None;
+        runtime.last_error = Some(reason.to_string());
+        runtime.log.push(new_runtime_entry(
+            "watchdog",
+            format!("自动恢复失败，已重新排队等待继续执行：{reason}"),
+        ));
+    }
+    reset_agent_if_needed(&mut guard, task_id, "自动恢复失败，已重新排队");
+    drop(guard);
+    let _ = agent_id;
+    persist_state(state).await
+}
+
+async fn auto_resume_prompt(state: &AppState, task_id: Uuid) -> AppResult<String> {
+    let guard = state.inner.lock().await;
+    let task = guard
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
+    Ok(format!(
+        "系统自动恢复：任务《{}》在本地运行中断或长时间无输出后被自动接管。请先快速回顾当前进展和工作区，再继续推进；如果现场已经变化，请直接基于现状收敛并继续完成。",
+        task.title
+    ))
+}
+
+fn current_time_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn stale_timeout_nanos() -> u128 {
+    TASK_STALE_TIMEOUT_SECS as u128 * 1_000_000_000
+}
+
+fn task_last_touch_nanos(task: &Task) -> Option<u128> {
+    task.runtime
+        .as_ref()
+        .and_then(|runtime| runtime.log.last())
+        .and_then(|entry| entry.at.parse::<u128>().ok())
+        .or_else(|| {
+            task.activities
+                .last()
+                .and_then(|activity| activity.at.parse::<u128>().ok())
+        })
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "待处理",
+        TaskStatus::Claimed => "已认领",
+        TaskStatus::Running => "运行中",
+        TaskStatus::Paused => "已暂停",
+        TaskStatus::Done => "已完成",
+        TaskStatus::Failed => "失败",
+        TaskStatus::Canceled => "已撤销",
+    }
+}
+
+fn task_is_serialized_active(task: &Task) -> bool {
+    matches!(task.status, TaskStatus::Claimed | TaskStatus::Running)
+}
+
+fn active_task_conflict(tasks: &[Task], exclude_task_id: Option<Uuid>) -> Option<&Task> {
+    tasks.iter().find(|task| {
+        task_is_serialized_active(task) && exclude_task_id.is_none_or(|task_id| task.id != task_id)
+    })
+}
+
+fn active_task_conflict_message(task: &Task) -> String {
+    format!(
+        "当前已有任务《{}》处于{}，系统当前只允许一个任务同时执行",
+        task.title,
+        task_status_label(task.status)
+    )
 }
 
 fn default_projects(workspace_root: &Path) -> Vec<Project> {
@@ -443,6 +1147,7 @@ fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> Persist
         pending_questions: Vec::new(),
         project_scans: HashMap::new(),
         project_sessions: Vec::new(),
+        project_chat_messages: Vec::new(),
     };
     let _ = persist_state_to_path(store_path, &state);
     state
@@ -521,6 +1226,55 @@ async fn get_board(State(state): State<AppState>, headers: HeaderMap) -> Json<Bo
     ))
 }
 
+async fn list_projects(State(state): State<AppState>) -> Json<Vec<Project>> {
+    let guard = state.inner.lock().await;
+    Json(guard.projects.clone())
+}
+
+async fn list_project_tasks(
+    AxumPath(project_id): AxumPath<Uuid>,
+    Query(query): Query<ListProjectTasksQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<Task>>> {
+    let guard = state.inner.lock().await;
+    ensure_project_exists(&guard, project_id)?;
+    let status_filter = query.status.as_deref().map(parse_task_status).transpose()?;
+
+    let tasks = guard
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.project_id == project_id
+                && status_filter
+                    .map(|expected_status| task.status == expected_status)
+                    .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    Ok(Json(tasks))
+}
+
+async fn list_agents(State(state): State<AppState>) -> Json<Vec<Agent>> {
+    let guard = state.inner.lock().await;
+    Json(guard.agents.clone())
+}
+
+fn parse_task_status(raw: &str) -> AppResult<TaskStatus> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "OPEN" => Ok(TaskStatus::Open),
+        "CLAIMED" => Ok(TaskStatus::Claimed),
+        "RUNNING" => Ok(TaskStatus::Running),
+        "PAUSED" => Ok(TaskStatus::Paused),
+        "DONE" => Ok(TaskStatus::Done),
+        "FAILED" => Ok(TaskStatus::Failed),
+        "CANCELED" => Ok(TaskStatus::Canceled),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("不支持的任务状态筛选：{raw}"),
+        )),
+    }
+}
+
 async fn answer_pending_question(
     AxumPath(question_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -556,6 +1310,40 @@ async fn get_project_context(
 ) -> AppResult<Json<ProjectContextSnapshot>> {
     let guard = state.inner.lock().await;
     let snapshot = project_context_snapshot(&guard, project_id)?;
+    Ok(Json(snapshot))
+}
+
+async fn post_project_chat_message(
+    AxumPath(project_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProjectChatRequest>,
+) -> AppResult<Json<ProjectContextSnapshot>> {
+    let message = request.message.trim();
+    if message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "消息内容不能为空".into()));
+    }
+
+    let mut guard = state.inner.lock().await;
+    find_project(&guard, project_id)?;
+    let current_user = resolve_current_user(&guard, &headers);
+    let display_name = current_user
+        .as_ref()
+        .map(|user| user.display_name.clone())
+        .unwrap_or_else(|| "未知用户".into());
+
+    guard.project_chat_messages.push(ProjectChatMessage {
+        id: Uuid::new_v4(),
+        project_id,
+        user_id: current_user.as_ref().map(|user| user.id),
+        user_display_name: display_name,
+        content: message.to_string(),
+        at: timestamp_string(),
+    });
+
+    let snapshot = project_context_snapshot(&guard, project_id)?;
+    drop(guard);
+    persist_state(&state).await?;
     Ok(Json(snapshot))
 }
 
@@ -905,34 +1693,42 @@ async fn continue_project_session(
     })?;
     let composed_prompt = compose_project_session_prompt(&project, latest_scan.as_ref(), prompt);
 
-    let session = state
-        .runtime_sessions
-        .lock()
-        .await
-        .get(&session_id)
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                "当前服务进程内没有找到可恢复的项目会话，请新建一个项目会话".into(),
-            )
-        })?;
+    let resolved_session =
+        resolve_project_runtime_session(&state, session_id, workspace_root.clone(), &thread_id)
+            .await?;
 
-    let turn_id = match session
-        .start_turn(&workspace_root, &thread_id, &composed_prompt)
+    let turn_id = match resolved_session
+        .session
+        .start_turn(
+            &workspace_root,
+            &resolved_session.thread_id,
+            &composed_prompt,
+        )
         .await
     {
         Ok(turn_id) => turn_id,
         Err(error) => {
+            if resolved_session.event_rx.is_some() {
+                resolved_session.session.shutdown().await;
+            }
             mark_project_session_failed(&state, session_id, &error.1).await;
             persist_state(&state).await?;
             return Err(error);
         }
     };
 
+    register_project_runtime_session(
+        &state,
+        session_id,
+        resolved_session.session.clone(),
+        resolved_session.event_rx,
+    )
+    .await;
+
     {
         let mut guard = state.inner.lock().await;
         if let Some(project_session) = find_project_session_mut(&mut guard, session_id) {
+            project_session.thread_id = Some(resolved_session.thread_id);
             project_session.active_turn_id = Some(turn_id);
         }
     }
@@ -962,6 +1758,8 @@ async fn create_task(
         title: title.to_string(),
         description: description.to_string(),
         status: TaskStatus::Open,
+        priority: request.priority,
+        labels: request.labels,
         creator_user_id: current_user.as_ref().map(|user| user.id),
         assignee_user_id: None,
         source_task_id: None,
@@ -1114,6 +1912,9 @@ async fn claim_task(
     State(state): State<AppState>,
 ) -> AppResult<Json<BoardSnapshot>> {
     let mut guard = state.inner.lock().await;
+    if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+        return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
+    }
     let (agent_name, owner_user_id) = guard
         .agents
         .iter()
@@ -1126,7 +1927,10 @@ async fn claim_task(
             return Err((StatusCode::CONFLICT, "任务已被其他 Agent 认领".into()));
         }
     }
-    if matches!(task.status, TaskStatus::Running | TaskStatus::Done) {
+    if matches!(
+        task.status,
+        TaskStatus::Running | TaskStatus::Done | TaskStatus::Canceled
+    ) {
         return Err((StatusCode::CONFLICT, "当前任务状态不允许重新认领".into()));
     }
     task.claimed_by = Some(agent_id);
@@ -1147,6 +1951,17 @@ async fn start_task(
     State(state): State<AppState>,
     Json(request): Json<AgentInvocationRequest>,
 ) -> AppResult<Json<BoardSnapshot>> {
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+            return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
+        }
+        let task = find_task_mut(&mut guard, task_id)?;
+        if matches!(task.status, TaskStatus::Canceled) {
+            return Err((StatusCode::CONFLICT, "已撤销的任务不能启动".into()));
+        }
+    }
+
     let context = resolve_task_execution_context(&state, task_id, request.prompt.clone()).await?;
     let _ = std::fs::create_dir_all(&context.workspace_root);
     let mut git_auto_merge_enabled = false;
@@ -1282,6 +2097,62 @@ async fn pause_task(
     Ok(Json(snapshot))
 }
 
+async fn cancel_task(
+    AxumPath(task_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CancelTaskRequest>,
+) -> AppResult<Json<BoardSnapshot>> {
+    {
+        let mut guard = state.inner.lock().await;
+        let current_user = resolve_current_user(&guard, &headers);
+        let current_user_label = current_user
+            .as_ref()
+            .map(|user| user.display_name.clone())
+            .unwrap_or_else(|| "未知用户".into());
+        let reason = request
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("用户确认当前任务不再继续");
+
+        let task = find_task_mut(&mut guard, task_id)?;
+        if matches!(
+            task.status,
+            TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+        ) {
+            return Err((StatusCode::CONFLICT, "当前任务已结束，不能重复撤销".into()));
+        }
+        if matches!(task.status, TaskStatus::Running) {
+            return Err((
+                StatusCode::CONFLICT,
+                "运行中的任务请先暂停，再撤销为不做状态".into(),
+            ));
+        }
+
+        task.status = TaskStatus::Canceled;
+        task.claimed_by = None;
+        if let Some(runtime) = task.runtime.as_mut() {
+            runtime.active_turn_id = None;
+            runtime
+                .log
+                .push(new_runtime_entry("system", format!("任务已撤销: {reason}")));
+        }
+        task.activities.push(new_activity(
+            "task.canceled",
+            format!("任务已撤销。操作人: {current_user_label}；原因: {reason}"),
+        ));
+        reset_agent_if_needed(&mut guard, task_id, "最近一次任务已撤销");
+    }
+
+    let guard = state.inner.lock().await;
+    let snapshot = snapshot_from_state_with_user(&guard, resolve_current_user(&guard, &headers));
+    drop(guard);
+    persist_state(&state).await?;
+    Ok(Json(snapshot))
+}
+
 async fn resume_task(
     AxumPath((task_id, agent_id)): AxumPath<(Uuid, Uuid)>,
     State(state): State<AppState>,
@@ -1289,6 +2160,17 @@ async fn resume_task(
 ) -> AppResult<Json<BoardSnapshot>> {
     if request.prompt.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "恢复时必须补充提示词".into()));
+    }
+
+    {
+        let mut guard = state.inner.lock().await;
+        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+            return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
+        }
+        let task = find_task_mut(&mut guard, task_id)?;
+        if matches!(task.status, TaskStatus::Canceled) {
+            return Err((StatusCode::CONFLICT, "已撤销的任务不能恢复执行".into()));
+        }
     }
 
     match state.runtime_mode {
@@ -1356,26 +2238,168 @@ async fn resume_task(
         assign_agent_running(&mut guard, agent_id, task_id, "继续执行当前任务".into());
     }
 
-    let sessions = state.runtime_sessions.lock().await;
-    let session = sessions
-        .get(&task_id)
-        .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到运行时会话".into()))?;
-    drop(sessions);
+    let resolved_session = resolve_task_runtime_session(
+        &state,
+        task_id,
+        agent_id,
+        workspace_root.clone(),
+        &thread_id,
+    )
+    .await?;
 
-    let turn_id = session
-        .start_turn(&workspace_root, &thread_id, request.prompt.trim())
-        .await?;
+    let turn_id = match resolved_session
+        .session
+        .start_turn(
+            &workspace_root,
+            &resolved_session.thread_id,
+            request.prompt.trim(),
+        )
+        .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            if resolved_session.event_rx.is_some() {
+                resolved_session.session.shutdown().await;
+            }
+            return Err(error);
+        }
+    };
+
+    register_task_runtime_session(
+        &state,
+        task_id,
+        agent_id,
+        resolved_session.session.clone(),
+        resolved_session.event_rx,
+    )
+    .await;
 
     let mut guard = state.inner.lock().await;
     let task = find_task_mut(&mut guard, task_id)?;
     if let Some(runtime) = task.runtime.as_mut() {
+        runtime.thread_id = Some(resolved_session.thread_id);
         runtime.active_turn_id = Some(turn_id);
     }
     let snapshot = snapshot_from_state(&guard);
     drop(guard);
     persist_state(&state).await?;
     Ok(Json(snapshot))
+}
+
+async fn resolve_task_runtime_session(
+    state: &AppState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    workspace_root: PathBuf,
+    thread_id: &str,
+) -> AppResult<ResolvedRuntimeSession> {
+    let existing_session = {
+        let sessions = state.runtime_sessions.lock().await;
+        sessions.get(&task_id).cloned()
+    };
+
+    if let Some(session) = existing_session {
+        return Ok(ResolvedRuntimeSession {
+            session,
+            thread_id: thread_id.to_string(),
+            event_rx: None,
+        });
+    }
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let session = CodexRuntimeSession::spawn(workspace_root, event_tx).await?;
+    let resumed_thread_id = match session.resume_thread(thread_id).await {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            session.shutdown().await;
+            return Err(error);
+        }
+    };
+
+    let _ = agent_id;
+    Ok(ResolvedRuntimeSession {
+        session,
+        thread_id: resumed_thread_id,
+        event_rx: Some(event_rx),
+    })
+}
+
+async fn register_task_runtime_session(
+    state: &AppState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    session: Arc<CodexRuntimeSession>,
+    event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+) {
+    let Some(event_rx) = event_rx else {
+        return;
+    };
+
+    state.runtime_sessions.lock().await.insert(task_id, session);
+    tokio::spawn(runtime_event_loop(
+        state.clone(),
+        task_id,
+        agent_id,
+        event_rx,
+    ));
+}
+
+async fn resolve_project_runtime_session(
+    state: &AppState,
+    session_id: Uuid,
+    workspace_root: PathBuf,
+    thread_id: &str,
+) -> AppResult<ResolvedRuntimeSession> {
+    let existing_session = {
+        let sessions = state.runtime_sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+
+    if let Some(session) = existing_session {
+        return Ok(ResolvedRuntimeSession {
+            session,
+            thread_id: thread_id.to_string(),
+            event_rx: None,
+        });
+    }
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let session = CodexRuntimeSession::spawn(workspace_root, event_tx).await?;
+    let resumed_thread_id = match session.resume_thread(thread_id).await {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            session.shutdown().await;
+            return Err(error);
+        }
+    };
+
+    Ok(ResolvedRuntimeSession {
+        session,
+        thread_id: resumed_thread_id,
+        event_rx: Some(event_rx),
+    })
+}
+
+async fn register_project_runtime_session(
+    state: &AppState,
+    session_id: Uuid,
+    session: Arc<CodexRuntimeSession>,
+    event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+) {
+    let Some(event_rx) = event_rx else {
+        return;
+    };
+
+    state
+        .runtime_sessions
+        .lock()
+        .await
+        .insert(session_id, session);
+    tokio::spawn(project_session_event_loop(
+        state.clone(),
+        session_id,
+        event_rx,
+    ));
 }
 
 async fn runtime_event_loop(
@@ -1578,6 +2602,7 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
                 pending_questions: guard.pending_questions.clone(),
                 project_scans: guard.project_scans.clone(),
                 project_sessions: guard.project_sessions.clone(),
+                project_chat_messages: guard.project_chat_messages.clone(),
             },
             state.store_path.clone(),
         )
@@ -1598,12 +2623,19 @@ fn project_context_snapshot(
         .filter(|session| session.project_id == project_id)
         .cloned()
         .collect::<Vec<_>>();
+    let chat_messages = state
+        .project_chat_messages
+        .iter()
+        .filter(|message| message.project_id == project_id)
+        .cloned()
+        .collect::<Vec<_>>();
 
     Ok(ProjectContextSnapshot {
         project_id,
         primary_workspace: project.primary_workspace().cloned(),
         latest_scan: state.project_scans.get(&project_id).cloned(),
         sessions,
+        chat_messages,
     })
 }
 
@@ -2040,6 +3072,8 @@ fn process_task_completion_outputs(state: &mut BoardState, task_id: Uuid) -> boo
                 title: title.to_string(),
                 description: compose_follow_up_task_description(&source_task, follow_up),
                 status: TaskStatus::Open,
+                priority: parse_follow_up_priority(follow_up.priority.as_deref()),
+                labels: Vec::new(),
                 creator_user_id: source_task.creator_user_id,
                 assignee_user_id: None,
                 source_task_id: Some(source_task.id),
@@ -2247,6 +3281,21 @@ fn should_auto_create_follow_up_task(follow_up: &TaskCompletionFollowUp) -> bool
     )
 }
 
+fn parse_follow_up_priority(priority: Option<&str>) -> Option<TaskPriority> {
+    let priority = priority?.trim();
+    if priority.is_empty() {
+        return None;
+    }
+
+    let priority = priority.to_ascii_uppercase();
+    match priority.as_str() {
+        "P0" | "P1" | "HIGH" | "URGENT" | "CRITICAL" => Some(TaskPriority::High),
+        "P2" | "MEDIUM" | "NORMAL" => Some(TaskPriority::Medium),
+        "P3" | "LOW" | "MINOR" => Some(TaskPriority::Low),
+        _ => None,
+    }
+}
+
 fn compose_follow_up_task_description(
     source_task: &Task,
     follow_up: &TaskCompletionFollowUp,
@@ -2374,14 +3423,235 @@ async fn resolve_task_execution_context(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
     let project = find_project(&guard, task.project_id)?.clone();
     let workspace_root = primary_workspace_path(&project)?;
-    let prompt = compose_task_prompt(&task, &project, prompt_override);
+    let latest_scan = guard.project_scans.get(&task.project_id).cloned();
+    let recent_project_chat =
+        recent_project_chat_messages(&guard.project_chat_messages, task.project_id, 8);
+    let prompt = compose_task_prompt(
+        &task,
+        &project,
+        latest_scan.as_ref(),
+        &recent_project_chat,
+        prompt_override,
+    );
     Ok(TaskExecutionContext {
         workspace_root,
         prompt,
     })
 }
 
-fn compose_task_prompt(task: &Task, project: &Project, prompt_override: Option<String>) -> String {
+fn prompt_timestamp_key(value: &str) -> u128 {
+    value.parse::<u128>().unwrap_or_default()
+}
+
+fn prompt_preview(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "无".into();
+    }
+
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn prompt_section_or_default(lines: Vec<String>, empty_message: &str) -> String {
+    if lines.is_empty() {
+        empty_message.into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn project_scan_summary_for_prompt(latest_scan: Option<&ProjectScanSummary>) -> String {
+    latest_scan
+        .map(|scan| {
+            format!(
+                "工作区：{}（{}）\n技术栈摘要：{}\n顶层目录：{}\n关键文件：{}\n文档文件：{}\n提示：{}",
+                scan.workspace_label,
+                scan.workspace_path,
+                scan.stack_summary,
+                if scan.top_level_entries.is_empty() {
+                    "无".into()
+                } else {
+                    scan.top_level_entries.join("、")
+                },
+                if scan.key_files.is_empty() {
+                    "无".into()
+                } else {
+                    scan.key_files.join("、")
+                },
+                if scan.document_files.is_empty() {
+                    "无".into()
+                } else {
+                    scan.document_files.join("、")
+                },
+                if scan.notes.is_empty() {
+                    "无".into()
+                } else {
+                    scan.notes.join("；")
+                }
+            )
+        })
+        .unwrap_or_else(|| {
+            "最近还没有项目扫描摘要；执行前要先结合目录实际情况判断，不要把旧认知当成当前事实。"
+                .into()
+        })
+}
+
+fn recent_task_activity_lines(task: &Task, limit: usize) -> Vec<String> {
+    let mut activities = task.activities.iter().collect::<Vec<_>>();
+    activities.sort_by_key(|activity| prompt_timestamp_key(&activity.at));
+    let skip = activities.len().saturating_sub(limit);
+    activities
+        .into_iter()
+        .skip(skip)
+        .map(|activity| {
+            format!(
+                "- [{}] {}：{}",
+                activity.at,
+                activity.kind,
+                prompt_preview(&activity.message, 120)
+            )
+        })
+        .collect()
+}
+
+fn recent_task_runtime_lines(task: &Task, limit: usize) -> Vec<String> {
+    let Some(runtime) = task.runtime.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut entries = runtime.log.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| prompt_timestamp_key(&entry.at));
+    let skip = entries.len().saturating_sub(limit);
+    entries
+        .into_iter()
+        .skip(skip)
+        .map(|entry| {
+            format!(
+                "- [{}] {}：{}",
+                entry.at,
+                entry.kind,
+                prompt_preview(&entry.message, 120)
+            )
+        })
+        .collect()
+}
+
+fn recent_project_chat_messages(
+    messages: &[ProjectChatMessage],
+    project_id: Uuid,
+    limit: usize,
+) -> Vec<ProjectChatMessage> {
+    let mut relevant = messages
+        .iter()
+        .filter(|message| message.project_id == project_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|message| prompt_timestamp_key(&message.at));
+    let skip = relevant.len().saturating_sub(limit);
+    relevant.into_iter().skip(skip).collect()
+}
+
+fn recent_project_chat_lines(messages: &[ProjectChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| {
+            format!(
+                "- [{}] {}：{}",
+                message.at,
+                message.user_display_name,
+                prompt_preview(&message.content, 120)
+            )
+        })
+        .collect()
+}
+
+fn contains_scope_change_signal(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    [
+        "取消",
+        "撤销",
+        "不做",
+        "先不做",
+        "去掉",
+        "移除",
+        "删除",
+        "关闭",
+        "废弃",
+        "放弃",
+        "不用做",
+        "不要做",
+        "不需要",
+        "终止",
+        "搁置",
+        "撤回",
+        "去除",
+        "cancel",
+        "drop",
+        "remove",
+        "skip",
+        "disable",
+    ]
+    .iter()
+    .any(|keyword| lowered.contains(keyword))
+}
+
+fn recent_scope_signal_lines(
+    task: &Task,
+    project_chat_messages: &[ProjectChatMessage],
+) -> Vec<String> {
+    let mut signals = task
+        .activities
+        .iter()
+        .filter(|activity| {
+            activity.kind == "task.canceled" || contains_scope_change_signal(&activity.message)
+        })
+        .map(|activity| {
+            (
+                prompt_timestamp_key(&activity.at),
+                format!(
+                    "- [任务活动 {}] {}：{}",
+                    activity.at,
+                    activity.kind,
+                    prompt_preview(&activity.message, 120)
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    signals.extend(project_chat_messages.iter().filter_map(|message| {
+        contains_scope_change_signal(&message.content).then(|| {
+            (
+                prompt_timestamp_key(&message.at),
+                format!(
+                    "- [项目聊天室 {}] {}：{}",
+                    message.at,
+                    message.user_display_name,
+                    prompt_preview(&message.content, 120)
+                ),
+            )
+        })
+    }));
+    signals.sort_by_key(|(at, _)| *at);
+    let skip = signals.len().saturating_sub(6);
+    signals
+        .into_iter()
+        .skip(skip)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+fn compose_task_prompt(
+    task: &Task,
+    project: &Project,
+    latest_scan: Option<&ProjectScanSummary>,
+    project_chat_messages: &[ProjectChatMessage],
+    prompt_override: Option<String>,
+) -> String {
     let workspace_list = project
         .workspace_roots
         .iter()
@@ -2399,6 +3669,26 @@ fn compose_task_prompt(task: &Task, project: &Project, prompt_override: Option<S
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let scan_summary = project_scan_summary_for_prompt(latest_scan);
+    let recent_activity_summary = prompt_section_or_default(
+        recent_task_activity_lines(task, 8),
+        "最近还没有任务活动记录。",
+    );
+    let recent_runtime_summary =
+        prompt_section_or_default(recent_task_runtime_lines(task, 6), "最近还没有运行输出。");
+    let recent_chat_summary = prompt_section_or_default(
+        recent_project_chat_lines(project_chat_messages),
+        "最近还没有项目聊天室消息。",
+    );
+    let scope_signal_lines = recent_scope_signal_lines(task, project_chat_messages);
+    let scope_signal_summary = if scope_signal_lines.is_empty() {
+        "最近未检测到明确的撤销/不做信号；但执行前仍要核对最新活动、运行输出和项目聊天，不要机械照搬旧描述。".into()
+    } else {
+        format!(
+            "最近检测到以下范围收缩或取消信号，请优先遵守这些更近的明确决策，不要继续实现对应子需求：\n{}",
+            scope_signal_lines.join("\n")
+        )
+    };
 
     let mut prompt = format!(
         "你正在执行 Spotlight 项目任务。\n\
@@ -2408,14 +3698,36 @@ fn compose_task_prompt(task: &Task, project: &Project, prompt_override: Option<S
 任务标题：{}\n\
 任务描述：{}\n\
 \n\
+最近扫描摘要：\n{}\n\
+\n\
+最近任务活动：\n{}\n\
+\n\
+最近运行输出：\n{}\n\
+\n\
+最近项目聊天室：\n{}\n\
+\n\
+范围提醒：\n{}\n\
+\n\
 执行要求：\n\
 1. 先分析再行动，给出清晰的执行步骤。\n\
 2. 不要假设当前目录一定是代码仓库；它可能为空，也可能只有 Word、PDF、表格、图片或其他资料。\n\
 3. 如果遇到 Office 或二进制文件，不要臆造内容，可以基于文件名、目录结构、相邻文本和可读元数据给出判断。\n\
-4. 项目外目录允许读取，但不要做破坏性修改。\n\
-5. 输出时尽量用中文，结论、风险和建议都要清楚可读。\n\
-6. 任务结束时，请在最后附加一个 ```json 代码块，字段至少包含 result、summary、questions、follow_ups、risks；如果没有内容也要给空数组。",
-        project.name, project.description, workspace_list, task.title, task.description
+4. 修改前要先核对上面的最近活动、最近运行输出和项目聊天室，避免重复劳动或继续做过期需求。\n\
+5. 如果最近活动、运行输出或项目聊天表明某个子需求已撤销、先不做、去掉或删除，必须将其视为当前范围外，并在结论里说明你如何收敛范围。\n\
+6. 如果任务标题或旧描述与最近明确决策冲突，以时间更近、表达更明确的决策为准；必要时先做最小安全收口，再提出后续任务。\n\
+7. 项目外目录允许读取，但不要做破坏性修改。\n\
+8. 输出时尽量用中文，结论、风险和建议都要清楚可读。\n\
+9. 任务结束时，请在最后附加一个 ```json 代码块，字段至少包含 result、summary、questions、follow_ups、risks；如果没有内容也要给空数组。",
+        project.name,
+        project.description,
+        workspace_list,
+        task.title,
+        task.description,
+        scan_summary,
+        recent_activity_summary,
+        recent_runtime_summary,
+        recent_chat_summary,
+        scope_signal_summary
     );
 
     if let Some(extra_prompt) = prompt_override {
@@ -2488,6 +3800,8 @@ fn build_local_build_restart_task(project: &Project) -> Task {
             stack_detection.summary(),
         ),
         status: TaskStatus::Open,
+        priority: None,
+        labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
         source_task_id: None,
@@ -2583,6 +3897,8 @@ fn build_cloud_install_restart_task(
             stack_detection.summary(),
         ),
         status: TaskStatus::Open,
+        priority: None,
+        labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
         source_task_id: None,
@@ -2791,6 +4107,8 @@ fn build_exploration_task(project: &Project) -> Task {
             workspace_list
         ),
         status: TaskStatus::Open,
+        priority: None,
+        labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
         source_task_id: None,
@@ -2820,7 +4138,10 @@ fn mark_task_running(
                 return Err((StatusCode::CONFLICT, "任务已被其他 Agent 认领".into()));
             }
         }
-        if matches!(task.status, TaskStatus::Running | TaskStatus::Done) {
+        if matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::Done | TaskStatus::Canceled
+        ) {
             return Err((StatusCode::CONFLICT, "当前任务状态不允许启动".into()));
         }
 
@@ -2895,6 +4216,7 @@ fn task_developer_instructions() -> String {
         "你需要在当前工作目录内完成软件任务，并保持结果可回顾。",
         "优先输出清晰的计划、执行过程、命令结果、风险判断和最终结论。",
         "如果用户暂停后补充提示词，要在同一线程里继续推进，不要丢失上下文。",
+        "执行前必须综合最近任务活动、最近运行输出、项目聊天室和目录扫描摘要；如果出现撤销、不做、去掉、删除、放弃等新决策，要按最新决策收缩范围，不要继续实现已取消子需求。",
         "平台会在任务启动前自动从主分支切出任务分支，并在任务完成后尝试按门禁规则合并回主分支。",
         "除非任务明确要求，不要自行执行危险 Git 历史改写，也不要跳过测试就声称可以合并。",
         "任务完成时，请在回复末尾附加一个可机读的 JSON 代码块，例如包含 result、summary、questions、follow_ups、risks。",
@@ -3219,21 +4541,11 @@ fn auto_claim_next_task(state: &mut BoardState, agent_id: Uuid) -> AppResult<Opt
         return Ok(None);
     }
 
-    let assigned_index = owner_user_id.and_then(|user_id| {
-        select_oldest_task_index(&state.tasks, |task| {
-            matches!(task.status, TaskStatus::Open)
-                && task.claimed_by.is_none()
-                && task.assignee_user_id == Some(user_id)
-        })
-    });
+    if active_task_conflict(&state.tasks, None).is_some() {
+        return Ok(None);
+    }
 
-    let task_index = assigned_index.or_else(|| {
-        select_oldest_task_index(&state.tasks, |task| {
-            matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none()
-        })
-    });
-
-    let Some(task_index) = task_index else {
+    let Some(task_index) = select_next_auto_claim_task_index(&state.tasks, owner_user_id) else {
         return Ok(None);
     };
 
@@ -3246,16 +4558,62 @@ fn auto_claim_next_task(state: &mut BoardState, agent_id: Uuid) -> AppResult<Opt
         format!("任务已由 {} 自动认领", agent_name),
     ));
 
+    task.activities.push(new_activity(
+        "task.auto_claim_reason",
+        auto_claim_selection_reason(task, owner_user_id),
+    ));
+
     Ok(Some(task.clone()))
 }
 
-fn select_oldest_task_index(tasks: &[Task], predicate: impl Fn(&Task) -> bool) -> Option<usize> {
+fn select_next_auto_claim_task_index(tasks: &[Task], owner_user_id: Option<Uuid>) -> Option<usize> {
     tasks
         .iter()
         .enumerate()
-        .filter(|(_, task)| predicate(task))
-        .min_by_key(|(index, task)| (task_created_order(task), *index))
+        .filter(|(_, task)| matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none())
+        .filter(|(_, task)| {
+            task.assignee_user_id.is_none() || task.assignee_user_id == owner_user_id
+        })
+        .min_by_key(|(index, task)| {
+            (
+                task_priority_order(task.priority),
+                task_assignment_order(task, owner_user_id),
+                task_created_order(task),
+                *index,
+            )
+        })
         .map(|(index, _)| index)
+}
+
+fn task_priority_order(priority: Option<TaskPriority>) -> u8 {
+    match priority {
+        Some(TaskPriority::High) => 0,
+        Some(TaskPriority::Medium) => 1,
+        Some(TaskPriority::Low) => 2,
+        None => 3,
+    }
+}
+
+fn task_assignment_order(task: &Task, owner_user_id: Option<Uuid>) -> u8 {
+    match owner_user_id {
+        Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => 0,
+        _ => 1,
+    }
+}
+
+fn auto_claim_selection_reason(task: &Task, owner_user_id: Option<Uuid>) -> String {
+    let queue_scope = match owner_user_id {
+        Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => "本人待办队列",
+        _ => "共享待办队列",
+    };
+    let priority_basis = match task.priority {
+        Some(TaskPriority::High) => "高优先级",
+        Some(TaskPriority::Medium) => "中优先级",
+        Some(TaskPriority::Low) => "低优先级",
+        None => "时间顺序",
+    };
+
+    format!("选择依据：{} / {}", queue_scope, priority_basis)
 }
 
 fn task_created_order(task: &Task) -> u128 {
@@ -3581,26 +4939,34 @@ fn timestamp_compact() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_claim_next_task, build_app, default_agents, default_projects, default_users,
-        detect_project_stack, finalize_git_task_branch_in_repo, prepare_git_task_branch_in_repo,
-        sanitize_credential_hint, BoardState, ProjectContextSnapshot, PullNextResponse,
-        RuntimeMode,
+        auto_claim_next_task, build_api_router, build_app, default_agents, default_projects,
+        default_state, default_users, detect_project_stack, finalize_git_task_branch_in_repo,
+        prepare_git_task_branch_in_repo, reconcile_watchdog_state, run_automation_cycle_once,
+        sanitize_credential_hint, select_next_auto_resume_task_id, AppState, BoardState,
+        ProjectChatMessage, ProjectContextSnapshot, ProjectScanSummary, PullNextResponse,
+        RuntimeMode, TASK_STALE_TIMEOUT_SECS,
     };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
+        Router,
     };
     use platform_core::{
         new_runtime_entry, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
-        CreateTaskRequest, Project, Task, TaskActivity, TaskStatus,
+        CreateTaskRequest, Project, RuntimeLogEntry, Task, TaskActivity, TaskPriority, TaskStatus,
+        WorkspaceRoot,
     };
+    use serde_json::Value;
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
         process::Command as StdCommand,
+        sync::OnceLock,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tokio::time::{sleep, Duration};
     use tower::util::ServiceExt;
     use uuid::Uuid;
 
@@ -3611,6 +4977,25 @@ mod tests {
             .expect("failed to resolve workspace root")
             .to_path_buf();
         build_app(RuntimeMode::Stub, workspace_root)
+    }
+
+    async fn test_app_with_state(
+        runtime_mode: RuntimeMode,
+        workspace_root: PathBuf,
+    ) -> (Router, AppState) {
+        let state = default_state(runtime_mode, workspace_root);
+        {
+            let mut guard = state.inner.lock().await;
+            for agent in &mut guard.agents {
+                agent.auto_mode = false;
+            }
+        }
+        let api = build_api_router();
+        let app = Router::new()
+            .nest("/api", api.clone())
+            .nest("/api/v1", api)
+            .with_state(state.clone());
+        (app, state)
     }
 
     async fn read_snapshot(response: axum::response::Response) -> BoardSnapshot {
@@ -3632,6 +5017,158 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn read_text(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn codex_stub_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct TestCodexStubEnvironment {
+        root: PathBuf,
+        log_path: PathBuf,
+        original_path: Option<OsString>,
+        original_log_path: Option<OsString>,
+    }
+
+    impl TestCodexStubEnvironment {
+        fn install() -> Self {
+            let root = unique_temp_path("spotlight-codex-stub");
+            fs::create_dir_all(&root).unwrap();
+
+            let log_path = root.join("requests.jsonl");
+            let command_path = root.join("codex.cmd");
+            let script_path = root.join("codex-app-server-stub.js");
+
+            fs::write(
+                &command_path,
+                "@echo off\r\nnode \"%~dp0codex-app-server-stub.js\" %*\r\n",
+            )
+            .unwrap();
+            fs::write(
+                &script_path,
+                r#"const fs = require('fs');
+
+const logPath = process.env.SPOTLIGHT_CODEX_STUB_LOG;
+let turnCounter = 0;
+let buffer = '';
+
+function send(payload) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+}
+
+function handleRequest(request) {
+  switch (request.method) {
+    case 'initialize':
+      send({ id: request.id, result: {} });
+      break;
+    case 'thread/start': {
+      const threadId = 'stub-thread-1';
+      send({ method: 'thread/started', params: { thread: { id: threadId } } });
+      send({ id: request.id, result: { thread: { id: threadId } } });
+      break;
+    }
+    case 'thread/resume': {
+      const threadId = request.params?.threadId || 'stub-thread-resumed';
+      send({ method: 'thread/started', params: { thread: { id: threadId } } });
+      send({ id: request.id, result: { thread: { id: threadId } } });
+      break;
+    }
+    case 'turn/start': {
+      turnCounter += 1;
+      const turnId = `stub-turn-${turnCounter}`;
+      send({ method: 'turn/started', params: { turn: { id: turnId } } });
+      send({ id: request.id, result: { turn: { id: turnId } } });
+      break;
+    }
+    case 'turn/interrupt': {
+      const turnId = request.params?.turnId || 'stub-turn-unknown';
+      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'interrupted' } } });
+      send({ id: request.id, result: {} });
+      break;
+    }
+    default:
+      send({ id: request.id, error: { message: `unsupported method: ${request.method}` } });
+      break;
+  }
+}
+
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  let newlineIndex = buffer.indexOf('\n');
+  while (newlineIndex >= 0) {
+    const line = buffer.slice(0, newlineIndex).trim();
+    buffer = buffer.slice(newlineIndex + 1);
+    newlineIndex = buffer.indexOf('\n');
+
+    if (!line) {
+      continue;
+    }
+
+    fs.appendFileSync(logPath, `${line}\n`);
+    handleRequest(JSON.parse(line));
+  }
+});
+"#,
+            )
+            .unwrap();
+
+            let original_path = std::env::var_os("PATH");
+            let original_log_path = std::env::var_os("SPOTLIGHT_CODEX_STUB_LOG");
+            let mut updated_path = OsString::from(root.as_os_str());
+            if let Some(path) = original_path.as_ref() {
+                updated_path.push(";");
+                updated_path.push(path);
+            }
+
+            std::env::set_var("PATH", updated_path);
+            std::env::set_var("SPOTLIGHT_CODEX_STUB_LOG", &log_path);
+
+            Self {
+                root,
+                log_path,
+                original_path,
+                original_log_path,
+            }
+        }
+
+        fn read_requests(&self) -> Vec<Value> {
+            if !self.log_path.exists() {
+                return Vec::new();
+            }
+
+            fs::read_to_string(&self.log_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        }
+    }
+
+    impl Drop for TestCodexStubEnvironment {
+        fn drop(&mut self) {
+            if let Some(path) = self.original_path.as_ref() {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+
+            if let Some(log_path) = self.original_log_path.as_ref() {
+                std::env::set_var("SPOTLIGHT_CODEX_STUB_LOG", log_path);
+            } else {
+                std::env::remove_var("SPOTLIGHT_CODEX_STUB_LOG");
+            }
+
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -3713,6 +5250,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_route_serves_unified_entry_page() {
+        let app = test_app();
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let html = read_text(response).await;
+
+        assert!(content_type.starts_with("text/html"));
+        assert!(html.contains("当前项目"));
+        assert!(html.contains("任务看板"));
+        assert!(html.contains("Agent 面板"));
+        assert!(html.contains("const API_PREFIX = \"/api/v1\""));
+    }
+
+    #[tokio::test]
+    async fn versioned_projects_route_returns_visible_projects() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let projects: Vec<Project> = read_json(response).await;
+        assert!(projects.len() >= 2);
+        assert!(projects.iter().any(|project| project.is_spotlight_self));
+    }
+
+    #[tokio::test]
+    async fn versioned_project_tasks_route_can_filter_by_status() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects[0].id;
+        let expected_open_count = snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.project_id == project_id && task.status == TaskStatus::Open)
+            .count();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/tasks?status=OPEN"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tasks: Vec<Task> = read_json(response).await;
+        assert_eq!(tasks.len(), expected_open_count);
+        assert!(tasks
+            .iter()
+            .all(|task| task.project_id == project_id && task.status == TaskStatus::Open));
+    }
+
+    #[tokio::test]
+    async fn versioned_agents_route_returns_agent_panel_snapshot() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let agents: Vec<platform_core::Agent> = read_json(response).await;
+        assert!(!agents.is_empty());
+        assert!(agents.iter().all(|agent| !agent.name.trim().is_empty()));
+    }
+
+    #[tokio::test]
     async fn bootstrap_endpoint_reads_agents_plan_for_spotlight_project() {
         let app = test_app();
         let board_response = app
@@ -3774,6 +5412,8 @@ mod tests {
             project_id: Some(project_id),
             title: "补充回归测试".into(),
             description: "把暂停恢复和长会话状态流转补到测试里。".into(),
+            priority: None,
+            labels: Vec::new(),
         })
         .unwrap();
 
@@ -3852,7 +5492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn created_task_records_creator_user() {
+    async fn created_task_records_creator_user_and_metadata() {
         let app = test_app();
         let board_response = app
             .clone()
@@ -3872,6 +5512,8 @@ mod tests {
             project_id: Some(project_id),
             title: "记录创建者".into(),
             description: "验证新建任务会记录当前用户".into(),
+            priority: Some(TaskPriority::High),
+            labels: vec!["backend".into(), "queue".into()],
         })
         .unwrap();
 
@@ -3890,6 +5532,8 @@ mod tests {
 
         let task = read_task(response).await;
         assert_eq!(task.creator_user_id, Some(creator_id));
+        assert_eq!(task.priority, Some(TaskPriority::High));
+        assert_eq!(task.labels, vec!["backend", "queue"]);
     }
 
     #[tokio::test]
@@ -4052,6 +5696,67 @@ mod tests {
         assert_eq!(session.messages.first().unwrap().role, "user");
         assert_eq!(session.messages.last().unwrap().role, "assistant");
         assert!(!session.log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_chat_message_roundtrip_updates_project_context() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/chat"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "message": "请把当前最小可用能力缺口梳理成队列"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let context: ProjectContextSnapshot = read_json(response).await;
+        let message = context
+            .chat_messages
+            .last()
+            .expect("expected persisted project chat message");
+        assert_eq!(message.project_id, project_id);
+        assert_eq!(message.content, "请把当前最小可用能力缺口梳理成队列");
+
+        let context_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/projects/{project_id}/context"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(context_response.status(), StatusCode::OK);
+
+        let refreshed_context: ProjectContextSnapshot = read_json(context_response).await;
+        assert!(refreshed_context
+            .chat_messages
+            .iter()
+            .any(|item| item.content == "请把当前最小可用能力缺口梳理成队列"));
     }
 
     #[tokio::test]
@@ -4231,6 +5936,8 @@ mod tests {
             title: "较新的待处理任务".into(),
             description: "newer open".into(),
             status: TaskStatus::Open,
+            priority: None,
+            labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
             source_task_id: None,
@@ -4248,6 +5955,8 @@ mod tests {
             title: "较早的待处理任务".into(),
             description: "older open".into(),
             status: TaskStatus::Open,
+            priority: None,
+            labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
             source_task_id: None,
@@ -4265,6 +5974,8 @@ mod tests {
             title: "最早但已完成的任务".into(),
             description: "done".into(),
             status: TaskStatus::Done,
+            priority: None,
+            labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
             source_task_id: None,
@@ -4285,6 +5996,7 @@ mod tests {
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
         };
 
         let claimed = auto_claim_next_task(&mut state, agent.id)
@@ -4299,6 +6011,313 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, TaskStatus::Claimed);
         assert_eq!(updated.claimed_by, Some(agent.id));
+    }
+
+    #[test]
+    fn auto_claim_next_task_prefers_priority_queue_and_skips_other_users_assignments() {
+        let workspace_root = unique_temp_path("spotlight-auto-claim-priority");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let agents = default_agents(&users);
+        let agent = agents.first().unwrap().clone();
+        let owner_user_id = agent.owner_user_id.expect("agent should have owner");
+        let other_user_id = users
+            .iter()
+            .find(|user| user.id != owner_user_id)
+            .map(|user| user.id)
+            .expect("expected another user");
+        let project_id = projects.first().unwrap().id;
+
+        let older_unprioritized = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "older-open".into(),
+            description: "older open".into(),
+            status: TaskStatus::Open,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "older".into(),
+                at: "100".into(),
+            }],
+            runtime: None,
+        };
+        let owner_medium = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "owner-medium".into(),
+            description: "owner medium".into(),
+            status: TaskStatus::Open,
+            priority: Some(TaskPriority::Medium),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: Some(owner_user_id),
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "owner medium".into(),
+                at: "200".into(),
+            }],
+            runtime: None,
+        };
+        let shared_high = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "shared-high".into(),
+            description: "shared high".into(),
+            status: TaskStatus::Open,
+            priority: Some(TaskPriority::High),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "shared high".into(),
+                at: "300".into(),
+            }],
+            runtime: None,
+        };
+        let other_users_high = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "other-users-high".into(),
+            description: "other users high".into(),
+            status: TaskStatus::Open,
+            priority: Some(TaskPriority::High),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: Some(other_user_id),
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: "other users high".into(),
+                at: "50".into(),
+            }],
+            runtime: None,
+        };
+
+        let mut state = BoardState {
+            users,
+            projects,
+            tasks: vec![
+                older_unprioritized,
+                owner_medium,
+                shared_high.clone(),
+                other_users_high,
+            ],
+            agents,
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+        };
+
+        let claimed = auto_claim_next_task(&mut state, agent.id)
+            .unwrap()
+            .expect("should auto claim the highest-priority eligible task");
+
+        assert_eq!(claimed.id, shared_high.id);
+        assert_eq!(claimed.status, TaskStatus::Claimed);
+        assert!(
+            claimed
+                .activities
+                .iter()
+                .any(|item| item.kind == "task.auto_claim_reason"
+                    && item.message.contains("高优先级"))
+        );
+    }
+
+    #[test]
+    fn select_next_auto_resume_task_prefers_high_priority_paused_task_for_same_agent() {
+        let workspace_root = unique_temp_path("spotlight-auto-resume-priority");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let agents = default_agents(&users);
+        let agent = agents.first().unwrap().clone();
+        let project_id = projects.first().unwrap().id;
+
+        let low_priority = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "paused-low".into(),
+            description: "paused low".into(),
+            status: TaskStatus::Paused,
+            priority: Some(TaskPriority::Low),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: Some(agent.id),
+            activities: vec![
+                TaskActivity {
+                    kind: "task.created".into(),
+                    message: "low".into(),
+                    at: "100".into(),
+                },
+                TaskActivity {
+                    kind: "task.watchdog_recovered".into(),
+                    message: "recovered".into(),
+                    at: "101".into(),
+                },
+            ],
+            runtime: Some(platform_core::TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-low".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+        };
+        let high_priority = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "paused-high".into(),
+            description: "paused high".into(),
+            status: TaskStatus::Paused,
+            priority: Some(TaskPriority::High),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: Some(agent.id),
+            activities: vec![
+                TaskActivity {
+                    kind: "task.created".into(),
+                    message: "high".into(),
+                    at: "200".into(),
+                },
+                TaskActivity {
+                    kind: "task.watchdog_recovered".into(),
+                    message: "recovered".into(),
+                    at: "201".into(),
+                },
+            ],
+            runtime: Some(platform_core::TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-high".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+        };
+
+        let selected =
+            select_next_auto_resume_task_id(&[low_priority, high_priority.clone()], agent.id)
+                .expect("expected paused task to be selected for auto resume");
+
+        assert_eq!(selected, high_priority.id);
+    }
+
+    #[test]
+    fn reconcile_watchdog_state_recovers_stale_running_task_and_releases_agent() {
+        let workspace_root = unique_temp_path("spotlight-watchdog");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let mut agents = default_agents(&users);
+        let agent_id = agents.first().unwrap().id;
+        let task_id = Uuid::new_v4();
+        agents.first_mut().unwrap().current_task_id = Some(task_id);
+        agents.first_mut().unwrap().status = "运行中".into();
+        let project_id = projects.first().unwrap().id;
+
+        let mut state = BoardState {
+            users,
+            projects,
+            tasks: vec![Task {
+                id: task_id,
+                project_id,
+                title: "stale-running".into(),
+                description: "stale running".into(),
+                status: TaskStatus::Running,
+                priority: Some(TaskPriority::High),
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                source_task_id: None,
+                claimed_by: Some(agent_id),
+                activities: vec![TaskActivity {
+                    kind: "task.started".into(),
+                    message: "running".into(),
+                    at: "1".into(),
+                }],
+                runtime: Some(platform_core::TaskRuntime {
+                    provider: "codex".into(),
+                    thread_id: Some("thread-1".into()),
+                    active_turn_id: Some("turn-1".into()),
+                    git_auto_merge_enabled: false,
+                    log: vec![RuntimeLogEntry {
+                        kind: "assistant".into(),
+                        message: "still running".into(),
+                        at: "1".into(),
+                    }],
+                    last_error: None,
+                }),
+            }],
+            agents,
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+        };
+
+        let sessions_to_stop = reconcile_watchdog_state(
+            &mut state,
+            &HashSet::from([task_id]),
+            (TASK_STALE_TIMEOUT_SECS as u128 + 10) * 1_000_000_000,
+        );
+
+        assert_eq!(sessions_to_stop, vec![task_id]);
+        let task = state.tasks.first().unwrap();
+        assert_eq!(task.status, TaskStatus::Open);
+        assert_eq!(task.claimed_by, None);
+        assert!(task
+            .activities
+            .iter()
+            .any(|item| item.kind == "task.watchdog_recovered"));
+        assert_eq!(
+            task.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.active_turn_id.as_deref()),
+            None
+        );
+        let agent = state.agents.first().unwrap();
+        assert_eq!(agent.current_task_id, None);
+        assert_eq!(agent.status, "空闲");
+    }
+
+    #[tokio::test]
+    async fn automation_cycle_auto_claims_open_task_without_ui_polling() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("failed to resolve workspace root")
+            .to_path_buf();
+        let state = default_state(RuntimeMode::Stub, workspace_root);
+
+        run_automation_cycle_once(&state)
+            .await
+            .expect("automation cycle should succeed");
+
+        let guard = state.inner.lock().await;
+        assert!(guard
+            .agents
+            .iter()
+            .any(|agent| agent.auto_mode && agent.current_task_id.is_some()));
+        assert!(guard
+            .tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Claimed)));
     }
 
     #[tokio::test]
@@ -4323,6 +6342,8 @@ mod tests {
                 project_id: Some(project_id),
                 title: title.into(),
                 description: format!("为 {title} 生成测试数据"),
+                priority: None,
+                labels: Vec::new(),
             })
             .unwrap();
 
@@ -4380,6 +6401,8 @@ mod tests {
             project_id: Some(project_id),
             title: "验证暂停恢复流程".into(),
             description: "启动后暂停，再补充提示词并恢复，最后验证状态流转。".into(),
+            priority: None,
+            labels: Vec::new(),
         })
         .unwrap();
         let create_response = app
@@ -4486,6 +6509,367 @@ mod tests {
             .find(|candidate| candidate.id == agent.id)
             .unwrap();
         assert_eq!(updated_agent.status, "空闲");
+    }
+
+    #[tokio::test]
+    async fn real_codex_runtime_can_resume_task_with_same_thread_after_session_loss() {
+        let _env_lock = codex_stub_env_lock().lock().await;
+        let stub_env = TestCodexStubEnvironment::install();
+        let workspace_root = unique_temp_path("spotlight-real-codex-task");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (app, state) = test_app_with_state(RuntimeMode::RealCodex, workspace_root).await;
+
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.title.contains("[0.1.2] 接通真实 Codex 长会话运行时"))
+            .cloned()
+            .expect("expected seeded runtime task");
+        let agent = snapshot.agents.first().cloned().expect("expected agent");
+
+        let claim_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/claim/{}", task.id, agent.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+
+        let start_payload = serde_json::to_vec(&AgentInvocationRequest {
+            agent_name_hint: agent.name.clone(),
+            prompt: Some("先输出最小实现方案，再保持线程上下文。".into()),
+        })
+        .unwrap();
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/start/{}", task.id, agent.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(start_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+
+        let pause_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/pause", task.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pause_response.status(), StatusCode::OK);
+        sleep(Duration::from_millis(80)).await;
+
+        state.runtime_sessions.lock().await.remove(&task.id);
+
+        let resume_payload = serde_json::to_vec(&AgentResumeRequest {
+            agent_name_hint: agent.name.clone(),
+            prompt: "我补充了一段提示词，请在原线程里继续执行。".into(),
+        })
+        .unwrap();
+        let resume_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/resume/{}", task.id, agent.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(resume_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume_response.status(), StatusCode::OK);
+        sleep(Duration::from_millis(80)).await;
+
+        let guard = state.inner.lock().await;
+        let updated_task = guard
+            .tasks
+            .iter()
+            .find(|candidate| candidate.id == task.id)
+            .expect("expected updated task");
+        let runtime = updated_task.runtime.as_ref().expect("expected runtime");
+        assert_eq!(updated_task.status, TaskStatus::Running);
+        assert_eq!(runtime.thread_id.as_deref(), Some("stub-thread-1"));
+        assert!(runtime
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| turn_id.starts_with("stub-turn-")));
+        assert!(runtime
+            .log
+            .iter()
+            .any(|entry| entry.message.contains("原线程里继续执行")));
+        drop(guard);
+
+        let requests = stub_env.read_requests();
+        assert!(requests.iter().any(|request| {
+            request.get("method").and_then(Value::as_str) == Some("thread/resume")
+                && request
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    == Some("stub-thread-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn real_codex_project_session_can_continue_after_runtime_session_loss() {
+        let _env_lock = codex_stub_env_lock().lock().await;
+        let stub_env = TestCodexStubEnvironment::install();
+        let workspace_root = unique_temp_path("spotlight-real-codex-project-session");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (app, state) = test_app_with_state(RuntimeMode::RealCodex, workspace_root).await;
+
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.is_spotlight_self)
+            .cloned()
+            .expect("expected spotlight project");
+
+        let start_payload = serde_json::json!({
+            "title": "Codex 长会话测试",
+            "prompt": "先帮我概括这个项目的当前目标。"
+        })
+        .to_string();
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{}/sessions", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(start_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let context: ProjectContextSnapshot = read_json(start_response).await;
+        let session = context
+            .sessions
+            .iter()
+            .find(|candidate| candidate.title == "Codex 长会话测试")
+            .cloned()
+            .expect("expected project session");
+
+        {
+            let mut guard = state.inner.lock().await;
+            let project_session = guard
+                .project_sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == session.id)
+                .expect("expected mutable project session");
+            project_session.active_turn_id = None;
+            project_session.status = "completed".into();
+        }
+        state.runtime_sessions.lock().await.remove(&session.id);
+
+        let continue_payload = serde_json::json!({
+            "prompt": "我补充一点：请沿用原来的上下文继续分析。"
+        })
+        .to_string();
+        let continue_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/project-sessions/{}/turns", session.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(continue_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(continue_response.status(), StatusCode::OK);
+        sleep(Duration::from_millis(80)).await;
+
+        let guard = state.inner.lock().await;
+        let updated_session = guard
+            .project_sessions
+            .iter()
+            .find(|candidate| candidate.id == session.id)
+            .expect("expected updated session");
+        assert_eq!(updated_session.thread_id.as_deref(), Some("stub-thread-1"));
+        assert!(updated_session
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| turn_id.starts_with("stub-turn-")));
+        assert_eq!(updated_session.status, "running");
+        drop(guard);
+
+        let requests = stub_env.read_requests();
+        assert!(requests.iter().any(|request| {
+            request.get("method").and_then(Value::as_str) == Some("thread/resume")
+                && request
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    == Some("stub-thread-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancel_task_marks_task_as_canceled_and_blocks_claim_start_resume() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+        let agent = snapshot.agents.first().unwrap().clone();
+
+        let create_payload = serde_json::to_vec(&CreateTaskRequest {
+            project_id: Some(project_id),
+            title: "取消后不应再被执行".into(),
+            description: "验证撤销态会阻止后续认领和启动".into(),
+            priority: Some(TaskPriority::Medium),
+            labels: vec!["cancel".into()],
+        })
+        .unwrap();
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let created_task = read_task(create_response).await;
+
+        let cancel_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/cancel", created_task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "reason": "该需求改为进入等待队列，当前先不做"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+
+        let canceled_snapshot = read_snapshot(cancel_response).await;
+        let canceled_task = canceled_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == created_task.id)
+            .unwrap();
+        assert_eq!(canceled_task.status, TaskStatus::Canceled);
+        assert_eq!(canceled_task.claimed_by, None);
+        assert!(canceled_task
+            .activities
+            .iter()
+            .any(|item| item.kind == "task.canceled"));
+
+        let claim_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/claim/{}", created_task.id, agent.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::CONFLICT);
+
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/start/{}", created_task.id, agent.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AgentInvocationRequest {
+                            agent_name_hint: agent.name.clone(),
+                            prompt: Some("这条已撤销任务不应继续执行".into()),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::CONFLICT);
+
+        let resume_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/tasks/{}/resume/{}",
+                        created_task.id, agent.id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AgentResumeRequest {
+                            agent_name_hint: agent.name.clone(),
+                            prompt: "这条已撤销任务不应恢复".into(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume_response.status(), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -4600,6 +6984,100 @@ mod tests {
     }
 
     #[test]
+    fn compose_task_prompt_includes_recent_context_and_scope_signals() {
+        let project_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let project = Project {
+            id: project_id,
+            name: "Spotlight".into(),
+            description: "自举项目".into(),
+            workspace_roots: vec![WorkspaceRoot {
+                id: workspace_id,
+                label: "主目录".into(),
+                path: "C:/Users/zuoho/code/spotlight".into(),
+                writable: true,
+            }],
+            is_spotlight_self: true,
+        };
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "整理桌面端布局".into(),
+            description: "根据最近协作决策收口界面".into(),
+            status: TaskStatus::Claimed,
+            priority: Some(TaskPriority::High),
+            labels: vec!["desktop".into()],
+            creator_user_id: None,
+            assignee_user_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![
+                TaskActivity {
+                    kind: "task.created".into(),
+                    message: "创建桌面端布局收口任务".into(),
+                    at: "1".into(),
+                },
+                TaskActivity {
+                    kind: "task.updated".into(),
+                    message: "左下角聊天框先不做，改为只保留项目聊天室".into(),
+                    at: "2".into(),
+                },
+            ],
+            runtime: Some(platform_core::TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: vec![RuntimeLogEntry {
+                    kind: "assistant".into(),
+                    message: "已确认左侧小聊天框是重复入口，接下来会直接移除。".into(),
+                    at: "3".into(),
+                }],
+                last_error: None,
+            }),
+        };
+        let latest_scan = ProjectScanSummary {
+            project_id,
+            workspace_id,
+            workspace_label: "主目录".into(),
+            workspace_path: "C:/Users/zuoho/code/spotlight".into(),
+            scanned_at: "4".into(),
+            stack_summary: "Rust + Tauri + 原生前端".into(),
+            detected_stacks: vec!["Rust".into(), "Tauri".into()],
+            top_level_entries: vec!["apps".into(), "crates".into(), "docs".into()],
+            key_files: vec!["Cargo.toml".into(), "apps/server/src/main.rs".into()],
+            document_files: vec!["docs/system-architecture.md".into()],
+            notes: vec!["桌面端和服务端共用一个工作区".into()],
+        };
+        let chat_messages = vec![ProjectChatMessage {
+            id: Uuid::new_v4(),
+            project_id,
+            user_id: None,
+            user_display_name: "架构师".into(),
+            content: "左侧的去掉，只保留项目聊天室，这块先别再做重复聊天框。".into(),
+            at: "5".into(),
+        }];
+
+        let prompt = super::compose_task_prompt(
+            &task,
+            &project,
+            Some(&latest_scan),
+            &chat_messages,
+            Some("先把客户端这轮体验问题修掉".into()),
+        );
+
+        assert!(prompt.contains("最近扫描摘要"));
+        assert!(prompt.contains("Rust + Tauri + 原生前端"));
+        assert!(prompt.contains("最近任务活动"));
+        assert!(prompt.contains("左下角聊天框先不做"));
+        assert!(prompt.contains("最近运行输出"));
+        assert!(prompt.contains("最近项目聊天室"));
+        assert!(prompt.contains("左侧的去掉，只保留项目聊天室"));
+        assert!(prompt.contains("不要继续实现对应子需求"));
+        assert!(prompt.contains("用户补充提示词"));
+    }
+
+    #[test]
     fn extract_task_completion_report_reads_json_code_block() {
         let log = vec![new_runtime_entry(
             "assistant",
@@ -4630,6 +7108,8 @@ mod tests {
             title: "实现项目目录接入".into(),
             description: "source".into(),
             status: TaskStatus::Done,
+            priority: None,
+            labels: Vec::new(),
             creator_user_id,
             assignee_user_id: None,
             source_task_id: None,
@@ -4660,6 +7140,7 @@ mod tests {
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
         };
 
         assert!(super::process_task_completion_outputs(
@@ -4673,6 +7154,12 @@ mod tests {
             .pending_questions
             .iter()
             .any(|question| question.source_task_id == source_task.id));
+        let follow_up_task = state
+            .tasks
+            .iter()
+            .find(|task| task.source_task_id == Some(source_task.id))
+            .unwrap();
+        assert_eq!(follow_up_task.priority, Some(TaskPriority::High));
         let source = state
             .tasks
             .iter()

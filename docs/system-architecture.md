@@ -169,15 +169,25 @@ The system is event-driven but still queue-safe.
 
 Flow:
 
+Target flow:
+
 1. server emits a WebSocket event indicating eligible queued work exists
 2. desktop core wakes eligible Agents
 3. Agent calls `pull-next`
 4. server atomically allocates the oldest eligible task
 5. local executor performs preflight and starts the task run
 
+Current `0.1.0` implementation:
+
+1. the board UI polls the server periodically
+2. when it sees an idle Agent with auto mode enabled, it calls `pull-next`
+3. the server allocates the oldest eligible `open` task and marks it `CLAIMED`
+4. the UI immediately calls the task start endpoint for that Agent
+5. the task enters `RUNNING` and is sent into the Agent runtime
+
 Why this model:
 
-- avoids wasteful polling
+- long-term goal avoids wasteful polling
 - still prevents race conditions by keeping claim logic server-side and atomic
 
 ## 5. Task Execution Pipeline

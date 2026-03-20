@@ -176,18 +176,22 @@ Output:
 - likely uncovered areas
 - review recommendations
 
-### 6.4 Milestone Risk Forecast
+### 6.4 Delivery ETA and Milestone Risk Forecast
 
 Input:
 
 - current open tasks
+- remaining effort estimate
 - completion velocity
+- historical cycle time
 - failure and retry rates
+- acceptance queue wait time
 - people load
 - build and deploy stability
 
 Output:
 
+- likely delivery date range
 - risk score
 - likely delay factors
 - confidence range
@@ -206,6 +210,23 @@ Output:
 - cost projection
 - overloaded areas
 - likely staffing pressure
+
+### 6.6 Token Efficiency Analysis
+
+Input:
+
+- insight run history
+- scenario-level token usage
+- cache hit and miss deltas
+- escalation frequency
+- repeated low-value prompts
+
+Output:
+
+- recommended model downgrades or upgrades
+- cache and TTL tuning suggestions
+- reusable prompt and summary patterns
+- projected token savings
 
 ## 7. Token-Saving Strategies
 
@@ -293,9 +314,11 @@ Recommended built-in scenarios:
 - `build_failure_explainer`
 - `deploy_failure_explainer`
 - `acceptance_assistant`
+- `delivery_eta_forecast`
 - `milestone_risk_forecast`
 - `capacity_analysis`
 - `cost_projection`
+- `token_efficiency_advisor`
 - `task_deduplication`
 - `project_health_explainer`
 
@@ -320,6 +343,8 @@ Examples:
 
 - daily summary: scheduled
 - build failure explainer: event-driven
+- delivery ETA forecast: scheduled or manual
+- token efficiency advisor: scheduled or manual
 - milestone risk review: scheduled or manual
 
 ## 10. Result Quality and Safety
@@ -396,8 +421,10 @@ I recommend shipping in this order:
 1. daily summary
 2. build failure explainer
 3. acceptance assistant
-4. project health explainer
-5. milestone risk forecast
+4. delivery ETA forecast
+5. token efficiency advisor
+6. project health explainer
+7. milestone risk forecast
 
 This gives strong value quickly without exploding token cost.
 

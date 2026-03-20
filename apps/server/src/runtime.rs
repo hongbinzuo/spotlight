@@ -143,17 +143,20 @@ impl CodexRuntimeSession {
             )
             .await?;
 
-        response
-            .get("thread")
-            .and_then(|thread| thread.get("id"))
-            .and_then(Value::as_str)
-            .map(|value| value.to_string())
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Codex thread/start 响应里缺少 thread.id".into(),
-                )
-            })
+        extract_thread_id(&response, "thread/start")
+    }
+
+    pub async fn resume_thread(&self, thread_id: &str) -> AppResult<String> {
+        let response = self
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id
+                }),
+            )
+            .await?;
+
+        extract_thread_id(&response, "thread/resume")
     }
 
     pub async fn start_turn(&self, cwd: &Path, thread_id: &str, prompt: &str) -> AppResult<String> {
@@ -176,17 +179,7 @@ impl CodexRuntimeSession {
             )
             .await?;
 
-        response
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-            .map(|value| value.to_string())
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Codex turn/start 响应里缺少 turn.id".into(),
-                )
-            })
+        extract_turn_id(&response, "turn/start")
     }
 
     pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> AppResult<()> {
@@ -199,6 +192,11 @@ impl CodexRuntimeSession {
         )
         .await
         .map(|_| ())
+    }
+
+    pub async fn shutdown(&self) {
+        let mut child = self.child.lock().await;
+        let _ = child.kill().await;
     }
 
     async fn initialize(&self) -> AppResult<()> {
@@ -380,6 +378,34 @@ impl CodexRuntimeSession {
             }
         }
     }
+}
+
+fn extract_thread_id(response: &Value, method: &str) -> AppResult<String> {
+    response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Codex {method} 响应里缺少 thread.id"),
+            )
+        })
+}
+
+fn extract_turn_id(response: &Value, method: &str) -> AppResult<String> {
+    response
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Codex {method} 响应里缺少 turn.id"),
+            )
+        })
 }
 
 fn extract_error_message(error: &Value) -> String {

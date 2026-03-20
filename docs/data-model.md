@@ -413,6 +413,13 @@ Recommended selection order for `pull-next`:
 1. oldest `open` or `approved` task assigned to the requesting Agent
 2. oldest eligible `open` or `approved` task in `public_queue`
 
+Current `0.1.0` implementation notes:
+
+- the minimal server implementation currently only auto-allocates tasks in `open`
+- tasks in terminal states such as `done` are skipped during selection
+- the server records the allocation by moving the task to `CLAIMED`
+- ordering is derived from the earliest task activity timestamp, from oldest to newest
+
 Atomic update requirement:
 
 - the selection and state transition to `auto_claimed` must happen in one transaction

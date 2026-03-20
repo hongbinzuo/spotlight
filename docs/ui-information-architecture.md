@@ -137,11 +137,22 @@ This panel should surface:
 
 ### 4.4 Auto Mode Flow
 
+Target flow:
+
 1. Agent auto mode is enabled
 2. server emits `task.available`
 3. local Agent wakes and calls `pull-next`
 4. task becomes `auto_claimed`
 5. preflight, tagging, and execution start automatically
+
+Current `0.1.0` implementation:
+
+1. Agent auto mode is enabled
+2. board polling refresh detects an idle Agent
+3. the UI calls `POST /agents/{agentId}/pull-next`
+4. the server skips completed tasks and allocates the oldest eligible `open` task
+5. the allocated task is marked `CLAIMED`
+6. the UI immediately calls the task start endpoint and execution begins
 
 ### 4.5 Acceptance Flow
 

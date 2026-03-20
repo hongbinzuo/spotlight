@@ -403,6 +403,8 @@ name = "provider-runtime"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -541,6 +543,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "platform-core",
+ "provider-runtime",
  "serde",
  "serde_json",
  "tokio",

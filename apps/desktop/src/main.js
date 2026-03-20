@@ -28,6 +28,21 @@ const elements = {
 
 let serverRunning = false;
 
+function setupDesktopMaintenanceActions() {
+  const actionList = document.querySelector(".action-list");
+  if (!actionList || document.getElementById("rebuildDesktopButton")) {
+    return;
+  }
+
+  const rebuildButton = document.createElement("button");
+  rebuildButton.id = "rebuildDesktopButton";
+  rebuildButton.className = "secondary";
+  rebuildButton.textContent = "重建并重启客户端";
+  rebuildButton.addEventListener("click", rebuildDesktop);
+  actionList.appendChild(rebuildButton);
+  elements.rebuildDesktopButton = rebuildButton;
+}
+
 function markReady() {
   window.__SPOTLIGHT_DESKTOP_MARK_READY__?.();
 }
@@ -175,11 +190,41 @@ async function openInBrowser() {
   }
 }
 
+async function rebuildDesktop() {
+  const button = elements.rebuildDesktopButton;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在准备重启";
+  }
+
+  setProbeStatus(
+    "busy",
+    "准备重启客户端",
+    "客户端正在交给外部 helper 处理重编译和重启，当前窗口会自动退出。"
+  );
+
+  try {
+    const plan = await invokeWithTimeout("rebuild_and_restart_desktop", {}, 5000);
+    setProbeStatus(
+      "busy",
+      "客户端即将退出",
+      `${plan.message}。日志：${plan.log_path}`
+    );
+  } catch (error) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "重建并重启客户端";
+    }
+    setProbeStatus("error", "重启准备失败", String(error));
+  }
+}
+
 elements.checkButton.addEventListener("click", refreshStatus);
 elements.probeButton.addEventListener("click", probeBackend);
 elements.reloadButton.addEventListener("click", refreshFrame);
 elements.browserButton.addEventListener("click", openInBrowser);
 elements.copyUrlButton.addEventListener("click", copyBackendUrl);
 
+setupDesktopMaintenanceActions();
 refreshStatus();
 setInterval(refreshStatus, 5000);

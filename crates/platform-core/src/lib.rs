@@ -42,6 +42,10 @@ pub struct Task {
     pub description: String,
     pub status: TaskStatus,
     #[serde(default)]
+    pub priority: Option<TaskPriority>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
     pub creator_user_id: Option<Uuid>,
     #[serde(default)]
     pub assignee_user_id: Option<Uuid>,
@@ -61,6 +65,7 @@ pub enum TaskStatus {
     Paused,
     Done,
     Failed,
+    Canceled,
 }
 
 impl TaskStatus {
@@ -72,6 +77,25 @@ impl TaskStatus {
             Self::Paused => "PAUSED",
             Self::Done => "DONE",
             Self::Failed => "FAILED",
+            Self::Canceled => "CANCELED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskPriority {
+    High,
+    Medium,
+    Low,
+}
+
+impl TaskPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
         }
     }
 }
@@ -147,6 +171,10 @@ pub struct CreateTaskRequest {
     pub project_id: Option<Uuid>,
     pub title: String,
     pub description: String,
+    #[serde(default)]
+    pub priority: Option<TaskPriority>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +338,8 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
         title: title.into(),
         description: description.into(),
         status: TaskStatus::Open,
+        priority: None,
+        labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
         source_task_id: None,
@@ -351,8 +381,9 @@ fn now_string() -> String {
 mod tests {
     use super::{
         merge_unique_tasks, seed_demo_tasks, seed_tasks_from_agents_markdown, seed_tasks_from_docs,
-        TaskStatus,
+        TaskPriority, TaskStatus,
     };
+    use std::path::Path;
     use uuid::Uuid;
 
     #[test]
@@ -376,6 +407,14 @@ mod tests {
         assert_eq!(TaskStatus::Paused.as_str(), "PAUSED");
         assert_eq!(TaskStatus::Done.as_str(), "DONE");
         assert_eq!(TaskStatus::Failed.as_str(), "FAILED");
+        assert_eq!(TaskStatus::Canceled.as_str(), "CANCELED");
+    }
+
+    #[test]
+    fn task_priority_string_values_are_stable_for_ui_rendering() {
+        assert_eq!(TaskPriority::High.as_str(), "HIGH");
+        assert_eq!(TaskPriority::Medium.as_str(), "MEDIUM");
+        assert_eq!(TaskPriority::Low.as_str(), "LOW");
     }
 
     #[test]
@@ -414,5 +453,22 @@ mod tests {
         merge_unique_tasks(&mut existing, other);
 
         assert_eq!(existing.len(), 4);
+    }
+
+    #[test]
+    fn spotlight_agents_release_plan_includes_admin_console_slices() {
+        let agents_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md");
+        let markdown = std::fs::read_to_string(&agents_path).expect("should read root AGENTS.md");
+
+        let tasks = seed_tasks_from_agents_markdown(&markdown, Uuid::nil());
+        let titles: Vec<&str> = tasks.iter().map(|task| task.title.as_str()).collect();
+
+        assert!(titles.contains(&"[0.1.5] 后台 Web 壳"));
+        assert!(titles.contains(&"[0.1.5] 项目配置"));
+        assert!(titles.contains(&"[0.1.5] 人员与能力管理"));
+        assert!(titles.contains(&"[0.1.5] Agent 与 Runtime 状态"));
+        assert!(titles.contains(&"[0.1.5] 系统监控面板"));
+        assert!(titles.contains(&"[0.1.5] 审计和风险中心第一版"));
+        assert!(titles.contains(&"[0.1.5] 计费与部署配置视图"));
     }
 }
