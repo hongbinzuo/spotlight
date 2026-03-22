@@ -140,6 +140,58 @@ body {
   margin-top: 10px;
 }
 
+.focus-list {
+  display: grid;
+  gap: 8px;
+}
+
+.focus-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(0, 0, 0, 0.08);
+  font-size: 14px;
+}
+
+.focus-row:last-child {
+  border-bottom: 0;
+}
+
+.focus-row span {
+  color: var(--muted);
+}
+
+.focus-row strong {
+  text-align: right;
+  word-break: break-word;
+}
+
+.focus-list {
+  display: grid;
+  gap: 8px;
+}
+
+.focus-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px dashed rgba(0, 0, 0, 0.08);
+}
+
+.focus-row:last-child {
+  border-bottom: 0;
+}
+
+.focus-row span {
+  color: var(--muted);
+}
+
+.focus-row strong {
+  text-align: right;
+}
+
 button {
   font: inherit;
   border-radius: 999px;

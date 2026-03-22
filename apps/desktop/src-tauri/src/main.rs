@@ -4,9 +4,10 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::Mutex,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::Manager;
 use url::Url;
@@ -15,6 +16,7 @@ use url::Url;
 struct BackendStatus {
     backend_url: String,
     server_running: bool,
+    backend_state: String,
     message: String,
     platform: String,
 }
@@ -37,18 +39,33 @@ struct DesktopRestartPlan {
     executable_path: String,
 }
 
+#[derive(Default)]
+struct BackendLaunchState {
+    tracker: Mutex<BackendLaunchTracker>,
+}
+
+#[derive(Default)]
+struct BackendLaunchTracker {
+    last_attempt_at: Option<Instant>,
+    last_message: Option<String>,
+}
+
 const BACKEND_URL: &str = "http://127.0.0.1:3000";
 const BACKEND_ADDR: &str = "127.0.0.1:3000";
+const BACKEND_LAUNCH_COOLDOWN: Duration = Duration::from_secs(8);
 
 #[tauri::command]
-fn app_status() -> Result<BackendStatus, String> {
+fn app_status(launch_state: tauri::State<BackendLaunchState>) -> Result<BackendStatus, String> {
     let tcp_connected = is_backend_running();
     let http_responding = backend_http_responding();
     let running = tcp_connected && http_responding;
+    let (backend_state, message) =
+        derive_backend_status(&launch_state, tcp_connected, http_responding);
     Ok(BackendStatus {
         backend_url: BACKEND_URL.to_string(),
         server_running: running,
-        message: backend_status_message(tcp_connected, http_responding),
+        backend_state: backend_state.into(),
+        message,
         platform: current_platform_label(),
     })
 }
@@ -67,15 +84,17 @@ fn probe_backend() -> Result<BackendProbe, String> {
 }
 
 #[tauri::command]
-fn open_backend_in_browser() -> Result<(), String> {
+fn open_backend_in_browser(url: Option<String>) -> Result<(), String> {
     if !is_backend_running() {
         return Err("本机 Spotlight 服务未运行，请先单独启动服务端。".into());
     }
 
+    let target_url = resolve_backend_browser_url(url)?;
+
     #[cfg(target_os = "windows")]
     {
         Command::new("cmd")
-            .args(["/C", "start", "", BACKEND_URL])
+            .args(["/C", "start", "", target_url.as_str()])
             .spawn()
             .map_err(|error| format!("打开浏览器失败：{error}"))?;
         return Ok(());
@@ -84,7 +103,7 @@ fn open_backend_in_browser() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         Command::new("open")
-            .arg(BACKEND_URL)
+            .arg(target_url.as_str())
             .spawn()
             .map_err(|error| format!("打开浏览器失败：{error}"))?;
         return Ok(());
@@ -93,7 +112,7 @@ fn open_backend_in_browser() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         Command::new("xdg-open")
-            .arg(BACKEND_URL)
+            .arg(target_url.as_str())
             .spawn()
             .map_err(|error| format!("打开浏览器失败：{error}"))?;
         return Ok(());
@@ -101,6 +120,21 @@ fn open_backend_in_browser() -> Result<(), String> {
 
     #[allow(unreachable_code)]
     Err("当前平台暂不支持自动打开浏览器".into())
+}
+
+fn resolve_backend_browser_url(url: Option<String>) -> Result<String, String> {
+    let raw = url.unwrap_or_else(|| BACKEND_URL.to_string());
+    let parsed = Url::parse(&raw).map_err(|error| format!("解析浏览器地址失败：{error}"))?;
+    let backend = Url::parse(BACKEND_URL).map_err(|error| format!("解析后台地址失败：{error}"))?;
+
+    if parsed.scheme() != backend.scheme()
+        || parsed.host_str() != backend.host_str()
+        || parsed.port_or_known_default() != backend.port_or_known_default()
+    {
+        return Err("浏览器打开地址必须指向本机 Spotlight 服务。".into());
+    }
+
+    Ok(parsed.to_string())
 }
 
 #[tauri::command]
@@ -139,6 +173,7 @@ fn rebuild_and_restart_desktop(app: tauri::AppHandle) -> Result<DesktopRestartPl
 
 fn main() {
     tauri::Builder::default()
+        .manage(BackendLaunchState::default())
         .invoke_handler(tauri::generate_handler![
             app_status,
             probe_backend,
@@ -217,6 +252,111 @@ fn current_platform_label() -> String {
     }
 }
 
+fn derive_backend_status<'a>(
+    launch_state: &'a BackendLaunchState,
+    tcp_connected: bool,
+    http_responding: bool,
+) -> (&'a str, String) {
+    if tcp_connected && http_responding {
+        clear_backend_launch_tracker(launch_state);
+        return ("ready", backend_status_message(true, true));
+    }
+
+    if tcp_connected {
+        if recently_attempted_backend_launch(launch_state) {
+            return ("starting", backend_http_starting_message());
+        }
+        return ("partial", backend_status_message(true, false));
+    }
+
+    request_backend_launch(launch_state)
+}
+
+fn request_backend_launch<'a>(launch_state: &'a BackendLaunchState) -> (&'a str, String) {
+    {
+        let tracker = launch_state
+            .tracker
+            .lock()
+            .expect("backend launch tracker lock should not be poisoned");
+        if tracker
+            .last_attempt_at
+            .is_some_and(|attempted_at| attempted_at.elapsed() < BACKEND_LAUNCH_COOLDOWN)
+        {
+            return (
+                "starting",
+                tracker
+                    .last_message
+                    .clone()
+                    .unwrap_or_else(backend_launch_waiting_message),
+            );
+        }
+    }
+
+    let workspace_root = match find_workspace_root() {
+        Ok(root) => root,
+        Err(error) => {
+            return (
+                "offline",
+                format!(
+                    "无法定位 Spotlight 工作区，暂时不能自动拉起本地服务。请先手动运行 `cargo run -p spotlight-server`。{error}"
+                ),
+            );
+        }
+    };
+
+    let candidates = backend_launch_candidates(&workspace_root);
+    let Some(server_binary) = candidates.iter().find(|path| path.exists()).cloned() else {
+        let checked_paths = candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、");
+        return (
+            "offline",
+            format!(
+                "未找到本地 `spotlight-server` 可执行文件。已检查：{checked_paths}。请先运行 `cargo build -p spotlight-server`，或手动启动服务端。"
+            ),
+        );
+    };
+
+    match spawn_backend_process(&server_binary, &workspace_root) {
+        Ok(()) => {
+            let message = backend_launch_message(&server_binary);
+            let mut tracker = launch_state
+                .tracker
+                .lock()
+                .expect("backend launch tracker lock should not be poisoned");
+            tracker.last_attempt_at = Some(Instant::now());
+            tracker.last_message = Some(message.clone());
+            ("starting", message)
+        }
+        Err(error) => (
+            "offline",
+            format!(
+                "自动拉起本地 Spotlight 服务失败：{error}。请先手动运行 `cargo run -p spotlight-server`。"
+            ),
+        ),
+    }
+}
+
+fn clear_backend_launch_tracker(launch_state: &BackendLaunchState) {
+    let mut tracker = launch_state
+        .tracker
+        .lock()
+        .expect("backend launch tracker lock should not be poisoned");
+    tracker.last_attempt_at = None;
+    tracker.last_message = None;
+}
+
+fn recently_attempted_backend_launch(launch_state: &BackendLaunchState) -> bool {
+    launch_state
+        .tracker
+        .lock()
+        .expect("backend launch tracker lock should not be poisoned")
+        .last_attempt_at
+        .is_some_and(|attempted_at| attempted_at.elapsed() < BACKEND_LAUNCH_COOLDOWN)
+}
+
 fn backend_status_message(tcp_connected: bool, http_responding: bool) -> String {
     match (tcp_connected, http_responding) {
         (true, true) => "桌面客户端已经连接到本机 Spotlight 服务。".into(),
@@ -225,6 +365,21 @@ fn backend_status_message(tcp_connected: bool, http_responding: bool) -> String 
         }
         (false, _) => "本机 Spotlight 服务未运行。请单独启动服务端后，再回到客户端刷新连接状态。".into(),
     }
+}
+
+fn backend_http_starting_message() -> String {
+    "已经拉起本地 Spotlight 服务进程，正在等待 HTTP 接口就绪。客户端会在服务准备好后自动连接。".into()
+}
+
+fn backend_launch_waiting_message() -> String {
+    "正在尝试自动拉起本地 Spotlight 服务，请稍候，客户端会自动重连。".into()
+}
+
+fn backend_launch_message(server_binary: &Path) -> String {
+    format!(
+        "正在自动拉起本地 Spotlight 服务：{}。客户端会在服务就绪后自动连接。",
+        server_binary.display()
+    )
 }
 
 fn backend_probe_message(tcp_connected: bool, http_responding: bool) -> String {
@@ -267,6 +422,49 @@ fn find_workspace_root() -> Result<PathBuf, String> {
     }
 
     Err("无法定位 Spotlight 工作区根目录，无法自动重建客户端".into())
+}
+
+fn backend_launch_candidates(workspace_root: &Path) -> Vec<PathBuf> {
+    let binary_name = server_binary_name();
+    vec![
+        workspace_root.join("target").join("debug").join(binary_name),
+        workspace_root.join("target").join("release").join(binary_name),
+        workspace_root
+            .join("apps")
+            .join("desktop")
+            .join("src-tauri")
+            .join("binaries")
+            .join(binary_name),
+    ]
+}
+
+fn server_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "spotlight-server.exe"
+    } else {
+        "spotlight-server"
+    }
+}
+
+fn spawn_backend_process(server_binary: &Path, workspace_root: &Path) -> Result<(), String> {
+    let mut command = Command::new(server_binary);
+    command
+        .current_dir(workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法启动 {}：{error}", server_binary.display()))
 }
 
 fn find_workspace_root_from(start: &Path) -> Option<PathBuf> {
@@ -452,8 +650,10 @@ log "客户端已重新启动"
 #[cfg(test)]
 mod tests {
     use super::{
+        backend_http_starting_message, backend_launch_candidates, backend_launch_message,
         backend_probe_message, backend_status_message, build_windows_restart_script,
-        find_workspace_root_from, release_executable_path,
+        find_workspace_root_from, release_executable_path, resolve_backend_browser_url,
+        server_binary_name,
     };
     use std::{
         fs,
@@ -486,6 +686,14 @@ mod tests {
     }
 
     #[test]
+    fn reports_starting_message_after_auto_launch() {
+        assert_eq!(
+            backend_http_starting_message(),
+            "已经拉起本地 Spotlight 服务进程，正在等待 HTTP 接口就绪。客户端会在服务准备好后自动连接。"
+        );
+    }
+
+    #[test]
     fn reports_probe_success_message() {
         assert_eq!(
             backend_probe_message(true, true),
@@ -499,6 +707,25 @@ mod tests {
             backend_probe_message(true, false),
             "原生探测异常：3000 端口可连接，但 HTTP 没有正常返回。"
         );
+    }
+
+    #[test]
+    fn browser_url_can_include_focus_query_params() {
+        let url = resolve_backend_browser_url(Some(
+            "http://127.0.0.1:3000/?project_id=project-1&task_id=task-2".into(),
+        ))
+        .unwrap();
+
+        assert!(url.contains("project_id=project-1"));
+        assert!(url.contains("task_id=task-2"));
+    }
+
+    #[test]
+    fn browser_url_rejects_other_hosts() {
+        let error =
+            resolve_backend_browser_url(Some("https://example.com/".into())).unwrap_err();
+
+        assert!(error.contains("Spotlight"));
     }
 
     #[test]
@@ -546,6 +773,28 @@ mod tests {
             path,
             PathBuf::from("C:/repo/apps/desktop/src-tauri/target/release/spotlight-desktop.exe")
         );
+    }
+
+    #[test]
+    fn backend_launch_candidates_prefer_workspace_target_outputs() {
+        let workspace_root = Path::new("C:/repo");
+        let candidates = backend_launch_candidates(workspace_root);
+
+        assert_eq!(
+            candidates.first(),
+            Some(&workspace_root.join("target").join("debug").join(server_binary_name()))
+        );
+        assert_eq!(
+            candidates.get(1),
+            Some(&workspace_root.join("target").join("release").join(server_binary_name()))
+        );
+    }
+
+    #[test]
+    fn backend_launch_message_mentions_binary_path() {
+        let message = backend_launch_message(Path::new("C:/repo/target/debug/spotlight-server.exe"));
+        assert!(message.contains("spotlight-server.exe"));
+        assert!(message.contains("自动连接"));
     }
 
     fn unique_temp_dir() -> PathBuf {

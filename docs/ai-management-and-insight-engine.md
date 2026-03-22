@@ -393,6 +393,15 @@ Recommended future entities:
 - `ai_insight_cache`
 - `ai_budgets`
 
+The insight engine should also consume structured facts from a versioned fact memory layer rather than re-reading raw logs by default.
+
+Recommended paired entities:
+
+- `memory_items`
+- `memory_revisions`
+- `memory_tags`
+- `memory_edges`
+
 Key rule:
 
 - keep execution-provider config and management-AI config related but separate

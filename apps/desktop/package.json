@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 1421",
-    "test": "node --test src/workspace-state.test.js",
+    "test": "node --test",
     "tauri": "tauri"
   },
   "devDependencies": {

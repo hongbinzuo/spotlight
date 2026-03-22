@@ -40,6 +40,10 @@
   - `0.1.5` 后台与运维控制台的任务切片、边界、测试要求与实施顺序。
 - `ai-management-and-insight-engine.md`
   - 多模型 AI 控制面，用于管理分析、预测、总结和低 Token 项目洞察。
+- `versioned-fact-memory-v1.md`
+  - 版本化事实记忆层，用于沉淀跨任务、跨会话的约束、决策、摘要与 AI 洞察输入事实。
+- `runtime-session-and-task-recovery-v1.md`
+  - 明确 task、session、thread、版本化记忆的边界，以及当前 `0.1.x` 阶段的恢复、回收和诊断规则。
 - `ai-insight-slices-0.1.7.md`
   - `0.1.7` AI 洞察与管理能力的版本切片、场景边界、测试要求与实施顺序。
 - `security-and-audit.md`
@@ -67,6 +71,8 @@
 16. `admin-and-ops-console.md`
 17. `admin-and-ops-slices-0.1.5.md`
 18. `ai-management-and-insight-engine.md`
-19. `ai-insight-slices-0.1.7.md`
-20. `security-and-audit.md`
-21. `delivery-plan.md`
+19. `versioned-fact-memory-v1.md`
+20. `runtime-session-and-task-recovery-v1.md`
+21. `ai-insight-slices-0.1.7.md`
+22. `security-and-audit.md`
+23. `delivery-plan.md`

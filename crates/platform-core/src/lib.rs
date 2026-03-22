@@ -54,6 +54,22 @@ pub struct Task {
     pub claimed_by: Option<Uuid>,
     pub activities: Vec<TaskActivity>,
     pub runtime: Option<TaskRuntime>,
+    #[serde(default)]
+    pub state_snapshot: TaskStateSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskStateSnapshot {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub last_evaluated_at: Option<String>,
+    #[serde(default)]
+    pub last_evaluated_by: Option<String>,
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +347,28 @@ pub fn merge_unique_tasks(existing: &mut Vec<Task>, incoming: Vec<Task>) {
     }
 }
 
+pub fn infer_task_priority(title: &str) -> Option<TaskPriority> {
+    let title = title.trim();
+    let version = title
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(version, _)| version.trim())?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    match (major, minor, patch) {
+        (0, 1, 0..=3) => Some(TaskPriority::High),
+        (0, 1, 4..=7) => Some(TaskPriority::Medium),
+        (0, 1, _) => Some(TaskPriority::Low),
+        _ => None,
+    }
+}
+
 fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
     Task {
         id: Uuid::new_v4(),
@@ -338,7 +376,7 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
         title: title.into(),
         description: description.into(),
         status: TaskStatus::Open,
-        priority: None,
+        priority: infer_task_priority(title),
         labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
@@ -349,6 +387,7 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
             "任务根据 Spotlight 文档规划自动生成",
         )],
         runtime: None,
+        state_snapshot: TaskStateSnapshot::default(),
     }
 }
 
@@ -380,8 +419,8 @@ fn now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_unique_tasks, seed_demo_tasks, seed_tasks_from_agents_markdown, seed_tasks_from_docs,
-        TaskPriority, TaskStatus,
+        infer_task_priority, merge_unique_tasks, seed_demo_tasks, seed_tasks_from_agents_markdown,
+        seed_tasks_from_docs, TaskPriority, TaskStatus,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -397,6 +436,20 @@ mod tests {
         assert!(tasks
             .iter()
             .any(|task| task.title.contains("[0.1.2] 接通真实 Codex 长会话运行时")));
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.title.starts_with("[0.1.0]"))
+                .and_then(|task| task.priority),
+            Some(TaskPriority::High)
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.title.starts_with("[0.1.7]"))
+                .and_then(|task| task.priority),
+            Some(TaskPriority::Medium)
+        );
     }
 
     #[test]
@@ -415,6 +468,23 @@ mod tests {
         assert_eq!(TaskPriority::High.as_str(), "HIGH");
         assert_eq!(TaskPriority::Medium.as_str(), "MEDIUM");
         assert_eq!(TaskPriority::Low.as_str(), "LOW");
+    }
+
+    #[test]
+    fn infer_task_priority_uses_version_bands_for_bootstrap_plan() {
+        assert_eq!(
+            infer_task_priority("[0.1.0] 搭建服务端骨架"),
+            Some(TaskPriority::High)
+        );
+        assert_eq!(
+            infer_task_priority("[0.1.6] Agent 状态视图"),
+            Some(TaskPriority::Medium)
+        );
+        assert_eq!(
+            infer_task_priority("[0.1.10] 安全、性能、回归基线统一补齐"),
+            Some(TaskPriority::Low)
+        );
+        assert_eq!(infer_task_priority("探索当前目录并生成建议任务"), None);
     }
 
     #[test]

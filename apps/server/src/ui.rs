@@ -1,9 +1,9 @@
-﻿pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
+pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Spotlight 0.1.0</title>
+  <title>Spotlight 自举控制台</title>
   <style>
     :root {
       --bg: #f3efe5;
@@ -94,7 +94,7 @@
     textarea { min-height: 86px; resize: vertical; }
     .summary {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 8px;
       margin-bottom: 12px;
     }
@@ -106,6 +106,25 @@
     }
     .summary-box strong { display: block; font-size: 22px; }
     .summary-box span { color: var(--muted); font-size: 12px; }
+    .summary-box small {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .summary-box.good {
+      border-color: rgba(42, 138, 92, 0.34);
+      background: #f3fbf6;
+    }
+    .summary-box.warn {
+      border-color: rgba(208, 124, 50, 0.34);
+      background: #fff7ec;
+    }
+    .summary-box.error {
+      border-color: rgba(183, 58, 58, 0.3);
+      background: #fff1ef;
+    }
     .project-card, .detail-card {
       border: 1px solid var(--border);
       border-radius: 18px;
@@ -279,6 +298,47 @@
       font-size: 12px;
       line-height: 1.5;
     }
+    .status-reason {
+      margin-top: 6px;
+      color: #5f5246;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .pill.attention {
+      background: #fff0ed;
+      border-color: rgba(183, 58, 58, 0.28);
+      color: #8f2d2d;
+    }
+    .state-panel {
+      margin-top: 10px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #fffaf3;
+      padding: 10px 12px;
+    }
+    .state-panel.warn {
+      background: #fff4e8;
+      border-color: rgba(208, 124, 50, 0.34);
+    }
+    .state-panel.error {
+      background: #fff0ed;
+      border-color: rgba(183, 58, 58, 0.28);
+    }
+    .evidence-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .evidence-pill {
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 3px 8px;
+      background: #fffdf9;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
     .task-insight-grid {
       display: grid;
       gap: 10px;
@@ -438,8 +498,8 @@
   <header>
     <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;">
       <div>
-        <h1>Spotlight 0.1.0</h1>
-        <p>左侧是任务看板，右侧是 Agent 面板。当前支持项目切换、自动认领、探索目录、启动任务、暂停、补充提示词后恢复。</p>
+        <h1>Spotlight 自举控制台</h1>
+        <p>以任务为中心的统一入口。左侧聚焦任务队列，右侧承载 Agent、项目上下文、恢复和执行追踪。</p>
       </div>
       <div class="detail-card" style="min-width:280px; padding:12px 14px;">
         <div class="section-head" style="margin-bottom:6px;">
@@ -549,15 +609,133 @@
   <aside id="runningTasksWindow" class="floating-runtime-window"></aside>
   <script>
     let board = { current_user: null, users: [], projects: [], tasks: [], agents: [], pending_questions: [] };
-    let projectContext = { project_id: null, primary_workspace: null, latest_scan: null, sessions: [], chat_messages: [] };
-    let selectedProjectId = null;
-    let selectedTaskId = null;
+    const emptyProjectMemory = () => ({ items: [], revisions: [], tags: [], edges: [] });
+    const emptyProjectContext = (projectId = null) => ({
+      project_id: projectId,
+      primary_workspace: null,
+      latest_scan: null,
+      sessions: [],
+      chat_messages: [],
+      memory: emptyProjectMemory()
+    });
+    const emptyProjectSummary = (projectId = null) => ({
+      project_id: projectId,
+      project_name: "",
+      generated_at: null,
+      primary_workspace: null,
+      latest_scan: null,
+      task_counts: { open: 0, claimed: 0, running: 0, paused: 0, done: 0, failed: 0, canceled: 0 },
+      agent_summary: { total: 0, auto_mode_enabled: 0, busy: 0, idle: 0 },
+      session_summary: { total: 0, running: 0, paused: 0, completed: 0, failed: 0 },
+      open_pending_question_count: 0,
+      pending_questions: [],
+      active_constraints: [],
+      recent_task_summaries: []
+    });
+    let projectContext = emptyProjectContext();
+    let projectSummary = emptyProjectSummary();
+    const UI_FOCUS_STORAGE_KEY = "spotlight.ui.focus.v1";
+    const PARENT_FOCUS_MESSAGE_SOURCE = "spotlight-board-focus";
+    const initialFocusState = readInitialFocusState();
+    let selectedProjectId = initialFocusState.projectId;
+    let selectedTaskId = initialFocusState.taskId;
     let selectedAgentIdState = null;
-    let selectedProjectSessionId = null;
+    let selectedProjectSessionId = initialFocusState.sessionId;
     let noticeState = { kind: "", message: "" };
     const workspaceDraft = { label: "", path: "", writable: true, isPrimaryDefault: true };
+    const constraintDraft = { title: "", content: "" };
     const API_PREFIX = "/api/v1";
     let projectChatDraft = "";
+
+    function normalizedId(value) {
+      return typeof value === "string" && value.trim() ? value.trim() : null;
+    }
+
+    function normalizedLabel(value) {
+      return typeof value === "string" && value.trim() ? value.trim() : null;
+    }
+
+    function normalizeFocusState(raw = {}) {
+      return {
+        projectId: normalizedId(raw.projectId),
+        taskId: normalizedId(raw.taskId),
+        sessionId: normalizedId(raw.sessionId),
+        projectName: normalizedLabel(raw.projectName),
+        taskTitle: normalizedLabel(raw.taskTitle),
+        sessionTitle: normalizedLabel(raw.sessionTitle)
+      };
+    }
+
+    function readStoredFocusState() {
+      try {
+        return normalizeFocusState(JSON.parse(window.localStorage.getItem(UI_FOCUS_STORAGE_KEY) || "null"));
+      } catch (_) {
+        return normalizeFocusState();
+      }
+    }
+
+    function readInitialFocusState() {
+      const params = new URLSearchParams(window.location.search);
+      const queryFocus = normalizeFocusState({
+        projectId: params.get("project_id"),
+        taskId: params.get("task_id"),
+        sessionId: params.get("session_id")
+      });
+      const storedFocus = readStoredFocusState();
+
+      return {
+        projectId: queryFocus.projectId || storedFocus.projectId,
+        taskId: queryFocus.taskId || storedFocus.taskId,
+        sessionId: queryFocus.sessionId || storedFocus.sessionId,
+        projectName: queryFocus.projectId
+          ? (queryFocus.projectId === storedFocus.projectId ? storedFocus.projectName : null)
+          : storedFocus.projectName,
+        taskTitle: queryFocus.taskId
+          ? (queryFocus.taskId === storedFocus.taskId ? storedFocus.taskTitle : null)
+          : storedFocus.taskTitle,
+        sessionTitle: queryFocus.sessionId
+          ? (queryFocus.sessionId === storedFocus.sessionId ? storedFocus.sessionTitle : null)
+          : storedFocus.sessionTitle
+      };
+    }
+
+    function currentFocusState() {
+      const project = selectedProject();
+      const task = selectedTask();
+      const session = selectedProjectSession();
+      return normalizeFocusState({
+        projectId: selectedProjectId,
+        taskId: selectedTaskId,
+        sessionId: selectedProjectSessionId,
+        projectName: project?.name,
+        taskTitle: task?.title,
+        sessionTitle: session?.title
+      });
+    }
+
+    function hasFocusState(focus) {
+      return Boolean(focus?.projectId || focus?.taskId || focus?.sessionId);
+    }
+
+    function persistFocusState() {
+      const focus = currentFocusState();
+      try {
+        if (hasFocusState(focus)) {
+          window.localStorage.setItem(UI_FOCUS_STORAGE_KEY, JSON.stringify(focus));
+        } else {
+          window.localStorage.removeItem(UI_FOCUS_STORAGE_KEY);
+        }
+      } catch (_) {
+        // 忽略页面本地状态持久化失败，保持主界面可用
+      }
+
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          source: PARENT_FOCUS_MESSAGE_SOURCE,
+          focus
+        }, "*");
+      }
+    }
 
     function statusLabel(status) {
       return {
@@ -573,6 +751,10 @@
 
     function selectedProject() {
       return board.projects.find(project => project.id === selectedProjectId) || null;
+    }
+
+    function selectedTask() {
+      return board.tasks.find(task => task.id === selectedTaskId) || null;
     }
 
     function selectedProjectSession() {
@@ -727,6 +909,226 @@
       return "还没有执行痕迹";
     }
 
+    const AUTO_ACTIVITY_KINDS = [
+      "task.auto_claimed",
+      "task.auto_started",
+      "task.auto_resumed",
+      "task.auto_retry_queued",
+      "task.watchdog_recovered"
+    ];
+
+    function taskStateSnapshot(task) {
+      return task?.state_snapshot || {};
+    }
+
+    function taskStateReason(task) {
+      return String(taskStateSnapshot(task).reason || "").trim();
+    }
+
+    function taskStateEvidence(task) {
+      return Array.isArray(taskStateSnapshot(task).evidence)
+        ? taskStateSnapshot(task).evidence.filter(item => typeof item === "string" && item.trim())
+        : [];
+    }
+
+    function taskNeedsAttention(task) {
+      return Boolean(taskStateSnapshot(task).needs_attention);
+    }
+
+    function taskHasStateSnapshot(task) {
+      return Boolean(taskStateReason(task)) && taskStateEvidence(task).length > 0;
+    }
+
+    function taskStateEvaluatedAt(task) {
+      return taskStateSnapshot(task).last_evaluated_at || null;
+    }
+
+    function taskStateEvaluatedBy(task) {
+      return String(taskStateSnapshot(task).last_evaluated_by || "").trim();
+    }
+
+    function formatEvidenceLabel(entry) {
+      if (!entry) return "无状态证据";
+      if (entry.startsWith("last_activity:")) {
+        const payload = entry.slice("last_activity:".length);
+        const [kind, at] = payload.split("@");
+        const suffix = at ? ` / ${formatTimestamp(at)}` : "";
+        return `最后活动：${kind || "unknown"}${suffix}`;
+      }
+      if (entry.startsWith("runtime.thread_id:")) {
+        return `线程上下文：${entry.slice("runtime.thread_id:".length)}`;
+      }
+      if (entry.startsWith("runtime.active_turn_id:")) {
+        return `活跃 turn：${entry.slice("runtime.active_turn_id:".length)}`;
+      }
+      if (entry.startsWith("runtime.last_error:")) {
+        return `最近错误：${entry.slice("runtime.last_error:".length)}`;
+      }
+      if (entry.startsWith("completion.summary:")) {
+        return `完成摘要：${entry.slice("completion.summary:".length)}`;
+      }
+      if (entry === "status.completed_evidence_mismatch") {
+        return "完成证据与当前状态不一致";
+      }
+      if (entry === "status.done_without_strong_evidence") {
+        return "已完成但缺少强证据";
+      }
+      return entry;
+    }
+
+    function taskAutoManaged(task) {
+      const currentAgent = taskCurrentAgent(task);
+      if (currentAgent?.auto_mode) {
+        return true;
+      }
+      return (task?.activities || []).some(item => AUTO_ACTIVITY_KINDS.includes(item.kind));
+    }
+
+    function taskRecoveryConsistent(task) {
+      if (!taskHasStateSnapshot(task)) {
+        return false;
+      }
+      if (task.status === "RUNNING") {
+        return Boolean(task.runtime?.active_turn_id) || !taskNeedsAttention(task);
+      }
+      return !task.runtime?.active_turn_id;
+    }
+
+    function taskHasEvolutionEvidence(task, summaryDigestIds = new Set()) {
+      if (task.status !== "DONE") {
+        return false;
+      }
+      if (summaryDigestIds.has(task.id)) {
+        return true;
+      }
+      return taskStateEvidence(task).some(item =>
+        item.startsWith("completion.summary:")
+        || item.startsWith("last_activity:task.done@")
+        || item.startsWith("last_activity:task.completed@")
+      );
+    }
+
+    function ratio(numerator, denominator) {
+      return denominator > 0 ? numerator / denominator : 1;
+    }
+
+    function clamp01(value) {
+      return Math.max(0, Math.min(1, Number(value) || 0));
+    }
+
+    function percent(value) {
+      return Math.round(clamp01(value) * 100);
+    }
+
+    function governanceTone(value) {
+      const score = clamp01(value);
+      if (score >= 0.9) return "good";
+      if (score >= 0.7) return "warn";
+      return "error";
+    }
+
+    function governanceLabel(value) {
+      const score = clamp01(value);
+      if (score >= 0.95) return "已接近 100% 自治";
+      if (score >= 0.85) return "自动化链路较稳定";
+      if (score >= 0.7) return "已有主要自治能力，但仍有缺口";
+      return "仍需人工盯看与补位";
+    }
+
+    function projectGovernanceMetrics(tasks, summary) {
+      const currentTasks = Array.isArray(tasks) ? tasks : [];
+      const executableTasks = currentTasks.filter(task => !["DONE", "CANCELED"].includes(task.status));
+      const recoverableTasks = currentTasks.filter(task => ["CLAIMED", "RUNNING", "PAUSED", "FAILED"].includes(task.status));
+      const doneTasks = currentTasks.filter(task => task.status === "DONE");
+      const snapshotCompleteCount = currentTasks.filter(taskHasStateSnapshot).length;
+      const autoManagedCount = executableTasks.filter(taskAutoManaged).length;
+      const recoveryConsistentCount = recoverableTasks.filter(taskRecoveryConsistent).length;
+      const summaryDigestIds = new Set(
+        (summary?.recent_task_summaries || [])
+          .map(item => normalizedId(item.task_id))
+          .filter(Boolean)
+      );
+      const evolutionCount = doneTasks.filter(task => taskHasEvolutionEvidence(task, summaryDigestIds)).length;
+      const attentionCount = currentTasks.filter(taskNeedsAttention).length;
+      const unmanagedOpenCount = currentTasks.filter(task =>
+        task.status === "OPEN" && !taskAutoManaged(task)
+      ).length;
+
+      const stateConfidence = ratio(snapshotCompleteCount, currentTasks.length);
+      const autoRunCoverage = ratio(autoManagedCount, executableTasks.length);
+      const recoveryCoverage = ratio(recoveryConsistentCount, recoverableTasks.length);
+      const evolutionCoverage = ratio(evolutionCount, doneTasks.length);
+      const overall = (stateConfidence + autoRunCoverage + recoveryCoverage + evolutionCoverage) / 4;
+
+      return {
+        overall,
+        overall_label: governanceLabel(overall),
+        counts: {
+          attention: attentionCount,
+          unmanaged_open: unmanagedOpenCount
+        },
+        metrics: [
+          {
+            key: "state-confidence",
+            title: "状态可信度",
+            score: stateConfidence,
+            detail: `${snapshotCompleteCount}/${currentTasks.length || 0} 个任务有状态原因和证据`
+          },
+          {
+            key: "auto-run",
+            title: "自动运行覆盖",
+            score: autoRunCoverage,
+            detail: `${autoManagedCount}/${executableTasks.length || 0} 个非终态任务已纳入自动推进链路`
+          },
+          {
+            key: "auto-recovery",
+            title: "自动恢复覆盖",
+            score: recoveryCoverage,
+            detail: `${recoveryConsistentCount}/${recoverableTasks.length || 0} 个活跃/可恢复任务状态自洽`
+          },
+          {
+            key: "evolution",
+            title: "自动进化沉淀率",
+            score: evolutionCoverage,
+            detail: `${evolutionCount}/${doneTasks.length || 0} 个已完成任务已有摘要或记忆沉淀`
+          }
+        ]
+      };
+    }
+
+    function taskRecoverySuggestion(task) {
+      const reason = taskStateReason(task);
+      if (task.status === "RUNNING") {
+        return task.runtime?.active_turn_id
+          ? "长会话正在运行，继续观察实时输出和活动流转即可。"
+          : "标记为 RUNNING 但缺少活跃 turn，系统应继续校正，如无恢复再人工处理。";
+      }
+      if (task.status === "CLAIMED") {
+        return task.runtime?.thread_id
+          ? "已派发且保留上下文，应优先由自动恢复继续推进。"
+          : "已认领但尚未建立长会话，可先观察自动启动链路。";
+      }
+      if (task.status === "PAUSED") {
+        if (reason.includes("会话已断开") || taskStateEvidence(task).some(item => item.startsWith("runtime.thread_id:"))) {
+          return "任务已有可恢复上下文，应由系统优先进行自动恢复。";
+        }
+        if (taskNeedsAttention(task)) {
+          return "服务端已标记需人工复核，先确认状态再恢复。";
+        }
+        return "当前是可等待恢复的暂停状态，留意最近活动和障碍信息。";
+      }
+      if (task.status === "FAILED") {
+        return "先看最近错误与状态证据，再决定重试、恢复还是拆出修复任务。";
+      }
+      if (task.status === "DONE") {
+        return "先确认是否已沉淀完成摘要和后续任务，确保系统能基于历史继续进化。";
+      }
+      if (reason.includes("历史执行痕迹")) {
+        return "任务看起来像是回退到 OPEN，应优先检查自动认领和状态回写链路。";
+      }
+      return "等待自动调度或按优先级进入下一轮推进。";
+    }
+
     function taskFlowEntries(task) {
       const flowKinds = [
         "task.auto_claimed",
@@ -811,17 +1213,26 @@
     async function loadBoard() {
       try {
         board = await request("/api/board");
+        const focusedTask = selectedTaskId
+          ? board.tasks.find(task => task.id === selectedTaskId)
+          : null;
+        if (focusedTask) {
+          selectedProjectId = focusedTask.project_id;
+        }
         if (!selectedProjectId || !board.projects.some(project => project.id === selectedProjectId)) {
           selectedProjectId = preferredProjectId();
         }
         const currentTasks = tasksForCurrentProject();
         if (!selectedTaskId || !currentTasks.some(task => task.id === selectedTaskId)) {
-          selectedTaskId = currentTasks[0]?.id || null;
+          selectedTaskId = currentTasks.find(task => ["RUNNING", "CLAIMED", "PAUSED"].includes(task.status))?.id
+            || currentTasks[0]?.id
+            || null;
         }
         if (!selectedAgentIdState || !board.agents.some(agent => agent.id === selectedAgentIdState)) {
           selectedAgentIdState = board.agents[0]?.id || null;
         }
         await loadProjectContext(selectedProjectId);
+        persistFocusState();
         render();
       } catch (error) {
         console.error(error);
@@ -831,21 +1242,51 @@
 
     async function loadProjectContext(projectId) {
       if (!projectId) {
-        projectContext = { project_id: null, primary_workspace: null, latest_scan: null, sessions: [], chat_messages: [] };
+        projectContext = emptyProjectContext();
+        projectSummary = emptyProjectSummary();
         selectedProjectSessionId = null;
         return;
       }
 
       try {
-        projectContext = await request(`/api/projects/${projectId}/context`);
+        projectContext = normalizedProjectContext(await request(`/api/projects/${projectId}/context`));
+        projectSummary = normalizedProjectSummary(await request(`/api/projects/${projectId}/summary`));
         if (!selectedProjectSessionId || !projectContext.sessions.some(session => session.id === selectedProjectSessionId)) {
           selectedProjectSessionId = projectContext.sessions[0]?.id || null;
         }
+        persistFocusState();
       } catch (error) {
         console.error(error);
-        projectContext = { project_id: projectId, primary_workspace: null, latest_scan: null, sessions: [], chat_messages: [] };
+        projectContext = emptyProjectContext(projectId);
+        projectSummary = emptyProjectSummary(projectId);
         selectedProjectSessionId = null;
         setNotice("error", error.message || "加载项目上下文失败");
+      }
+    }
+
+    async function saveProjectConstraint() {
+      const projectId = selectedProjectId;
+      if (!projectId) return;
+      const title = constraintDraft.title.trim();
+      const content = constraintDraft.content.trim();
+      if (!title || !content) {
+        setNotice("warn", "请先填写约束标题和内容，再沉淀到项目记忆。");
+        return;
+      }
+
+      try {
+        await request(`/api/projects/${projectId}/memory/constraints`, {
+          method: "POST",
+          body: JSON.stringify({ title, content })
+        });
+        constraintDraft.title = "";
+        constraintDraft.content = "";
+        await loadProjectContext(projectId);
+        renderProjectContextCard();
+        setNotice("success", "项目约束已写入版本化记忆，可用于后续任务执行。");
+      } catch (error) {
+        console.error(error);
+        setNotice("error", error.message || "沉淀项目约束失败");
       }
     }
 
@@ -1342,6 +1783,117 @@
       return new Date(seconds * 1000).toLocaleString();
     }
 
+    function previewText(value, limit = 120) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      if (!text) return "暂无内容";
+      if (text.length <= limit) return text;
+      return `${text.slice(0, limit)}...`;
+    }
+
+    function normalizedProjectContext(raw = {}) {
+      return {
+        project_id: normalizedId(raw.project_id),
+        primary_workspace: raw.primary_workspace || null,
+        latest_scan: raw.latest_scan || null,
+        sessions: Array.isArray(raw.sessions) ? raw.sessions : [],
+        chat_messages: Array.isArray(raw.chat_messages) ? raw.chat_messages : [],
+        memory: {
+          items: Array.isArray(raw.memory?.items) ? raw.memory.items : [],
+          revisions: Array.isArray(raw.memory?.revisions) ? raw.memory.revisions : [],
+          tags: Array.isArray(raw.memory?.tags) ? raw.memory.tags : [],
+          edges: Array.isArray(raw.memory?.edges) ? raw.memory.edges : []
+        }
+      };
+    }
+
+    function normalizedProjectSummary(raw = {}) {
+      return {
+        project_id: normalizedId(raw.project_id),
+        project_name: typeof raw.project_name === "string" ? raw.project_name : "",
+        generated_at: raw.generated_at || null,
+        primary_workspace: raw.primary_workspace || null,
+        latest_scan: raw.latest_scan || null,
+        task_counts: {
+          open: Number(raw.task_counts?.open || 0),
+          claimed: Number(raw.task_counts?.claimed || 0),
+          running: Number(raw.task_counts?.running || 0),
+          paused: Number(raw.task_counts?.paused || 0),
+          done: Number(raw.task_counts?.done || 0),
+          failed: Number(raw.task_counts?.failed || 0),
+          canceled: Number(raw.task_counts?.canceled || 0)
+        },
+        agent_summary: {
+          total: Number(raw.agent_summary?.total || 0),
+          auto_mode_enabled: Number(raw.agent_summary?.auto_mode_enabled || 0),
+          busy: Number(raw.agent_summary?.busy || 0),
+          idle: Number(raw.agent_summary?.idle || 0)
+        },
+        session_summary: {
+          total: Number(raw.session_summary?.total || 0),
+          running: Number(raw.session_summary?.running || 0),
+          paused: Number(raw.session_summary?.paused || 0),
+          completed: Number(raw.session_summary?.completed || 0),
+          failed: Number(raw.session_summary?.failed || 0)
+        },
+        open_pending_question_count: Number(raw.open_pending_question_count || 0),
+        pending_questions: Array.isArray(raw.pending_questions) ? raw.pending_questions : [],
+        active_constraints: Array.isArray(raw.active_constraints) ? raw.active_constraints : [],
+        recent_task_summaries: Array.isArray(raw.recent_task_summaries) ? raw.recent_task_summaries : []
+      };
+    }
+
+    function projectMemorySnapshot() {
+      return normalizedProjectContext(projectContext).memory;
+    }
+
+    function activeProjectConstraints(projectId) {
+      if (!projectId) return [];
+      const memory = projectMemorySnapshot();
+      const tagName = `project/${projectId}/active-constraints`;
+      const revisionsById = new Map(memory.revisions.map(revision => [revision.id, revision]));
+      return memory.items
+        .filter(item =>
+          item.scope_kind === "project"
+          && item.scope_id === projectId
+          && item.memory_kind === "project_constraint"
+        )
+        .map(item => {
+          const tag = memory.tags.find(entry => entry.memory_item_id === item.id && entry.tag === tagName);
+          const revision = tag ? revisionsById.get(tag.target_revision_id) : null;
+          if (!revision) return null;
+          return { item, revision };
+        })
+        .filter(Boolean)
+        .sort((left, right) => String(left.revision.title || "").localeCompare(String(right.revision.title || ""), "zh-CN"));
+    }
+
+    function recentProjectTaskSummaries(projectId, limit = 4) {
+      if (!projectId) return [];
+      const memory = projectMemorySnapshot();
+      const revisionsById = new Map(memory.revisions.map(revision => [revision.id, revision]));
+      const projectTaskIds = new Set(
+        board.tasks
+          .filter(task => task.project_id === projectId)
+          .map(task => task.id)
+      );
+      return memory.items
+        .filter(item =>
+          item.scope_kind === "task"
+          && projectTaskIds.has(item.scope_id)
+          && item.memory_kind === "task_summary"
+        )
+        .map(item => {
+          const tagName = `task/${item.scope_id}/latest-summary`;
+          const tag = memory.tags.find(entry => entry.memory_item_id === item.id && entry.tag === tagName);
+          const revision = tag ? revisionsById.get(tag.target_revision_id) : null;
+          if (!revision) return null;
+          return { item, revision };
+        })
+        .filter(Boolean)
+        .sort((left, right) => Number(right.revision.created_at || 0) - Number(left.revision.created_at || 0))
+        .slice(0, limit);
+    }
+
     function sessionStatusLabel(status) {
       return {
         running: "运行中",
@@ -1362,6 +1914,8 @@
       const scan = projectContext.latest_scan;
       const workspace = projectContext.primary_workspace;
       const pendingQuestions = pendingQuestionsForCurrentProject();
+      const constraints = activeProjectConstraints(project.id);
+      const taskSummaries = recentProjectTaskSummaries(project.id, 4);
       const scanBlock = scan ? `
         <div class="meta">
           <span class="pill">最近扫描 ${escapeHtml(formatUnixTime(scan.scanned_at))}</span>
@@ -1375,6 +1929,64 @@
         <div class="muted" style="margin-top:4px;">文档文件：${escapeHtml(scan.document_files.join("、") || "未识别")}</div>
         <div class="muted" style="margin-top:4px;">提示：${escapeHtml(scan.notes.join("；") || "暂无")}</div>
       ` : `<div class="muted">还没有项目扫描摘要。接入目录后可以直接扫描，用于后续项目问答和任务拆解。</div>`;
+
+      const constraintsBlock = `
+        <div class="detail-card" style="margin-top:12px; padding:12px;">
+          <div class="section-head">
+            <h4>当前有效项目约束</h4>
+            <span class="pill">${constraints.length} 条</span>
+          </div>
+          <div class="create-box" style="margin-bottom:12px;">
+            <input
+              placeholder="约束标题，例如：保留移动端入口"
+              value="${escapeHtml(constraintDraft.title)}"
+              oninput="constraintDraft.title = this.value"
+            />
+            <textarea
+              placeholder="约束内容，例如：统一入口和 API 不能只服务桌面端。"
+              oninput="constraintDraft.content = this.value"
+            >${escapeHtml(constraintDraft.content)}</textarea>
+            <div class="inline-actions">
+              <button class="secondary" onclick="saveProjectConstraint()">沉淀项目约束</button>
+            </div>
+          </div>
+          ${constraints.length ? constraints.map(entry => `
+            <article class="message" style="margin-bottom:8px;">
+              <div class="message-meta">
+                <strong>${escapeHtml(entry.revision.title)}</strong>
+                <span>${escapeHtml(formatUnixTime(entry.revision.created_at))}</span>
+              </div>
+              <div class="description">${escapeHtml(entry.revision.content)}</div>
+              <div class="meta">
+                <span class="pill">修订 ${escapeHtml(String(entry.revision.revision_no || 1))}</span>
+                <span class="pill">${escapeHtml(entry.item.stable_key || "未命名约束")}</span>
+              </div>
+            </article>
+          `).join("") : `<div class="muted">当前还没有沉淀到记忆层的长期项目约束。</div>`}
+        </div>
+      `;
+
+      const taskSummaryBlock = `
+        <div class="detail-card" style="margin-top:12px; padding:12px;">
+          <div class="section-head">
+            <h4>最近任务摘要</h4>
+            <span class="pill">${taskSummaries.length} 条</span>
+          </div>
+          ${taskSummaries.length ? taskSummaries.map(entry => `
+            <article class="message" style="margin-bottom:8px;">
+              <div class="message-meta">
+                <strong>${escapeHtml(entry.revision.title)}</strong>
+                <span>${escapeHtml(relativeTime(entry.revision.created_at))}</span>
+              </div>
+              <div class="description">${escapeHtml(previewText(entry.revision.content, 160))}</div>
+              <div class="meta">
+                <span class="pill">${escapeHtml(formatUnixTime(entry.revision.created_at))}</span>
+                <span class="pill">${escapeHtml(entry.revision.source_kind || "未知来源")}</span>
+              </div>
+            </article>
+          `).join("") : `<div class="muted">当前项目还没有沉淀任务完成摘要。</div>`}
+        </div>
+      `;
 
       const questionsBlock = pendingQuestions.length ? `
         <div class="detail-card" style="margin-top:12px; padding:12px;">
@@ -1419,6 +2031,8 @@
           </div>
         </div>
         ${scanBlock}
+        ${constraintsBlock}
+        ${taskSummaryBlock}
         ${questionsBlock}
       `;
     }
@@ -1554,14 +2168,30 @@
     function renderSummary() {
       const tasks = tasksForCurrentProject();
       const pendingQuestions = pendingQuestionsForCurrentProject();
+      const summary = projectSummary?.project_id === selectedProjectId ? projectSummary : null;
+      const governance = projectGovernanceMetrics(tasks, summary);
       const counts = {
-        total: tasks.length,
-        open: tasks.filter(task => task.status === "OPEN").length,
-        active: tasks.filter(task => ["CLAIMED", "RUNNING", "PAUSED"].includes(task.status)).length,
-        done: tasks.filter(task => task.status === "DONE").length,
-        canceled: tasks.filter(task => task.status === "CANCELED").length,
-        questions: pendingQuestions.length
+        total: summary
+          ? summary.task_counts.open + summary.task_counts.claimed + summary.task_counts.running + summary.task_counts.paused + summary.task_counts.done + summary.task_counts.failed + summary.task_counts.canceled
+          : tasks.length,
+        open: summary ? summary.task_counts.open : tasks.filter(task => task.status === "OPEN").length,
+        active: summary
+          ? summary.task_counts.claimed + summary.task_counts.running + summary.task_counts.paused
+          : tasks.filter(task => ["CLAIMED", "RUNNING", "PAUSED"].includes(task.status)).length,
+        done: summary ? summary.task_counts.done : tasks.filter(task => task.status === "DONE").length,
+        canceled: summary ? summary.task_counts.canceled : tasks.filter(task => task.status === "CANCELED").length,
+        questions: summary ? summary.open_pending_question_count : pendingQuestions.length,
+        sessions: summary ? summary.session_summary.total : projectContext.sessions.length,
+        agentsBusy: summary ? summary.agent_summary.busy : board.agents.filter(agent => agent.current_task_id).length,
+        agentsAuto: summary ? summary.agent_summary.auto_mode_enabled : board.agents.filter(agent => agent.auto_mode).length
       };
+      const governanceBoxes = governance.metrics.map(metric => `
+        <div class="summary-box ${governanceTone(metric.score)}">
+          <strong>${percent(metric.score)}%</strong>
+          <span>${escapeHtml(metric.title)}</span>
+          <small>${escapeHtml(metric.detail)}</small>
+        </div>
+      `).join("");
       document.getElementById("summary").innerHTML = `
         <div class="summary-box"><strong>${counts.total}</strong><span>任务总数</span></div>
         <div class="summary-box"><strong>${counts.open}</strong><span>待处理</span></div>
@@ -1569,6 +2199,14 @@
         <div class="summary-box"><strong>${counts.done}</strong><span>已完成</span></div>
         <div class="summary-box"><strong>${counts.canceled}</strong><span>已撤销</span></div>
         <div class="summary-box"><strong>${counts.questions}</strong><span>待回答问题</span></div>
+        <div class="summary-box"><strong>${counts.sessions}</strong><span>项目会话</span></div>
+        <div class="summary-box"><strong>${counts.agentsBusy}/${counts.agentsAuto}</strong><span>忙碌 Agent / 自动模式</span></div>
+        <div class="summary-box ${governanceTone(governance.overall)}">
+          <strong>${percent(governance.overall)}%</strong>
+          <span>自治指数</span>
+          <small>${escapeHtml(`${governance.overall_label}；待复核 ${governance.counts.attention} 个，裸 OPEN ${governance.counts.unmanaged_open} 个`)}</small>
+        </div>
+        ${governanceBoxes}
       `;
     }
 
@@ -1592,6 +2230,15 @@
           <div class="task-item-summary">
             <div>最近脉冲：${escapeHtml(taskExecutionPulse(task))}</div>
             ${lastInterestingActivity(task) ? `<div>最近状态：${escapeHtml(lastInterestingActivity(task).message)}</div>` : ``}
+          </div>
+          <div class="status-reason">
+            <span>状态依据：${escapeHtml(taskStateReason(task) || "服务端尚未生成状态快照")}</span>
+            ${taskNeedsAttention(task) ? `<span class="pill attention">需复核</span>` : ``}
+          </div>
+          <div class="evidence-list">
+            ${taskStateEvidence(task).slice(0, 2).map(item => `
+              <span class="evidence-pill">${escapeHtml(formatEvidenceLabel(item))}</span>
+            `).join("") || `<span class="evidence-pill">暂无证据</span>`}
           </div>
         </article>
       `).join("");
@@ -1622,6 +2269,11 @@
       const lastEntry = taskLastRuntimeEntry(task);
       const lastActivity = lastInterestingActivity(task);
       const lastError = task.runtime?.last_error;
+      const stateReason = taskStateReason(task) || "服务端尚未生成状态快照。";
+      const stateEvidence = taskStateEvidence(task);
+      const evaluatedAt = taskStateEvaluatedAt(task);
+      const evaluatedBy = taskStateEvaluatedBy(task);
+      const recoverySuggestion = taskRecoverySuggestion(task);
 
       taskDetail.innerHTML = `
         <h3>${escapeHtml(task.title)}</h3>
@@ -1634,6 +2286,21 @@
           <span class="pill">${task.runtime?.thread_id ? "长会话已建立" : "尚未建立长会话"}</span>
         </div>
         <p class="description">${escapeHtml(task.description)}</p>
+        <div class="state-panel ${task.status === "FAILED" ? "error" : taskNeedsAttention(task) ? "warn" : ""}">
+          <div class="meta">
+            <span class="pill">状态依据</span>
+            ${taskNeedsAttention(task) ? `<span class="pill attention">需复核</span>` : ``}
+            ${evaluatedAt ? `<span class="pill">最近评估 ${escapeHtml(formatTimestamp(evaluatedAt))}</span>` : ``}
+            ${evaluatedBy ? `<span class="pill">评估器 ${escapeHtml(evaluatedBy)}</span>` : ``}
+          </div>
+          <div class="status-reason">${escapeHtml(stateReason)}</div>
+          <div class="evidence-list">
+            ${(stateEvidence.length ? stateEvidence : ["暂无证据"]).map(item => `
+              <span class="evidence-pill">${escapeHtml(item === "暂无证据" ? item : formatEvidenceLabel(item))}</span>
+            `).join("")}
+          </div>
+          <div class="muted">恢复建议：${escapeHtml(recoverySuggestion)}</div>
+        </div>
       `;
 
       taskExecutionOverview.innerHTML = `
@@ -1653,10 +2320,10 @@
             <strong>${escapeHtml(task.runtime?.active_turn_id ? "当前 turn 活跃" : task.runtime?.thread_id ? "线程已建，等待继续" : "尚未建立")}</strong>
             <div class="muted">${escapeHtml(task.runtime?.thread_id || "无 thread_id")}</div>
           </div>
-          <div class="insight-card ${lastError ? "error" : flowEntries.some(item => item.kind === "task.watchdog_recovered") ? "warn" : ""}">
-            <div class="muted">失败 / 回收 / 重试</div>
-            <strong>${escapeHtml(lastError || "当前无错误")}</strong>
-            <div class="muted">${escapeHtml(flowEntries[0]?.message || "当前没有特殊流转")}</div>
+          <div class="insight-card ${taskNeedsAttention(task) ? "warn" : lastError ? "error" : flowEntries.some(item => item.kind === "task.watchdog_recovered") ? "warn" : ""}">
+            <div class="muted">治理状态</div>
+            <strong>${escapeHtml(taskNeedsAttention(task) ? "需复核" : "状态已纳入治理")}</strong>
+            <div class="muted">${escapeHtml(stateReason)}</div>
           </div>
         </div>
       `;
@@ -1717,6 +2384,9 @@
                 <div>${escapeHtml(taskClaimLabel(task))}</div>
                 <div>最近脉冲：${escapeHtml(taskExecutionPulse(task))}</div>
               </div>
+              <div class="status-reason">
+                ${escapeHtml(`状态依据：${previewText(taskStateReason(task) || "等待服务端生成状态快照", 72)}`)}
+              </div>
             </article>
           `).join("") : `<div class="muted">当前没有运行中的任务，系统会从等待队列自动接下一条。</div>`}
         </div>
@@ -1773,20 +2443,27 @@
       const tasks = tasksForCurrentProject();
       selectedTaskId = tasks[0]?.id || null;
       await loadProjectContext(projectId);
+      persistFocusState();
       render();
     }
 
     function changeProjectSession(sessionId) {
       selectedProjectSessionId = sessionId;
+      persistFocusState();
       render();
     }
 
-    function selectTask(taskId) {
+    async function selectTask(taskId) {
       const task = board.tasks.find(item => item.id === taskId);
-      if (task) {
-        selectedProjectId = task.project_id;
-      }
       selectedTaskId = taskId;
+      if (task) {
+        const projectChanged = task.project_id !== selectedProjectId;
+        selectedProjectId = task.project_id;
+        if (projectChanged) {
+          await loadProjectContext(selectedProjectId);
+        }
+      }
+      persistFocusState();
       render();
     }
 
@@ -1799,6 +2476,7 @@
         .replaceAll("'", "&#39;");
     }
 
+    window.addEventListener("beforeunload", persistFocusState);
     loadBoard();
     setInterval(loadBoard, 2500);
     window.addEventListener("resize", resizeRuntimeLog);
@@ -1814,6 +2492,13 @@ mod layout_regression_tests {
     #[test]
     fn project_chat_layout_and_default_project_hooks_are_present() {
         assert!(INDEX_HTML.contains("preferredProjectId()"));
+        assert!(INDEX_HTML.contains("readInitialFocusState()"));
+        assert!(INDEX_HTML.contains("persistFocusState()"));
+        assert!(INDEX_HTML.contains("spotlight-board-focus"));
+        assert!(INDEX_HTML.contains("projectName"));
+        assert!(INDEX_HTML.contains("taskTitle"));
+        assert!(INDEX_HTML.contains("sessionTitle"));
+        assert!(INDEX_HTML.contains("function selectedTask()"));
         assert!(INDEX_HTML.contains("sendProjectChatMessage()"));
         assert!(INDEX_HTML.contains("captureEditableFocus()"));
         assert!(INDEX_HTML.contains("restoreEditableFocus(focusState)"));
@@ -1867,8 +2552,31 @@ mod tests {
         assert!(INDEX_HTML.contains("continueProjectSession()"));
         assert!(INDEX_HTML.contains("sendProjectChatMessage()"));
         assert!(INDEX_HTML.contains("answerPendingQuestion("));
+        assert!(INDEX_HTML.contains("saveProjectConstraint()"));
         assert!(INDEX_HTML.contains("setNotice("));
         assert!(INDEX_HTML.contains("projectSessionLiveEntries(session)"));
+    }
+
+    #[test]
+    fn project_context_panel_includes_versioned_memory_sections() {
+        assert!(INDEX_HTML.contains(
+            "const emptyProjectMemory = () => ({ items: [], revisions: [], tags: [], edges: [] })"
+        ));
+        assert!(INDEX_HTML.contains("当前有效项目约束"));
+        assert!(INDEX_HTML.contains("最近任务摘要"));
+        assert!(INDEX_HTML.contains("project/${projectId}/active-constraints"));
+        assert!(INDEX_HTML.contains("task/${item.scope_id}/latest-summary"));
+        assert!(INDEX_HTML.contains("/memory/constraints"));
+        assert!(INDEX_HTML.contains("项目约束已写入版本化记忆"));
+    }
+
+    #[test]
+    fn unified_entry_page_uses_task_centered_title_and_summary_model() {
+        assert!(!INDEX_HTML.contains("Spotlight 0.1.0"));
+        assert!(INDEX_HTML.contains("<title>Spotlight 自举控制台</title>"));
+        assert!(INDEX_HTML.contains("<h1>Spotlight 自举控制台</h1>"));
+        assert!(INDEX_HTML.contains("normalizedProjectSummary("));
+        assert!(INDEX_HTML.contains("/summary"));
     }
 
     #[test]
@@ -1894,5 +2602,14 @@ mod tests {
         assert!(INDEX_HTML.contains("renderRunningTasksWindow()"));
         assert!(INDEX_HTML.contains("状态流转与活动"));
         assert!(INDEX_HTML.contains("运行任务窗口"));
+    }
+
+    #[test]
+    fn governance_metrics_and_state_reasoning_are_present() {
+        assert!(INDEX_HTML.contains("function taskStateSnapshot(task)"));
+        assert!(INDEX_HTML.contains("function projectGovernanceMetrics(tasks, summary)"));
+        assert!(INDEX_HTML.contains("自治指数"));
+        assert!(INDEX_HTML.contains("状态依据"));
+        assert!(INDEX_HTML.contains("需复核"));
     }
 }

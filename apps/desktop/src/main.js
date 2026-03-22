@@ -4,6 +4,14 @@ import {
   deriveWorkspaceErrorState,
   deriveWorkspaceState
 } from "./workspace-state.js";
+import {
+  buildBoardUrl,
+  clearDesktopFocus,
+  hasBoardFocus,
+  parseBoardFocusMessage,
+  readDesktopFocus,
+  writeDesktopFocus
+} from "./board-focus-state.js";
 
 const elements = {
   boardFrame: document.getElementById("boardFrame"),
@@ -12,6 +20,7 @@ const elements = {
   reloadButton: document.getElementById("reloadButton"),
   browserButton: document.getElementById("browserButton"),
   copyUrlButton: document.getElementById("copyUrlButton"),
+  clearFocusButton: document.getElementById("clearFocusButton"),
   statusCard: document.getElementById("statusCard"),
   statusTitle: document.getElementById("statusTitle"),
   statusMessage: document.getElementById("statusMessage"),
@@ -23,10 +32,15 @@ const elements = {
   workspaceBadge: document.getElementById("workspaceBadge"),
   workspacePlaceholder: document.getElementById("workspacePlaceholder"),
   placeholderTitle: document.getElementById("placeholderTitle"),
-  placeholderMessage: document.getElementById("placeholderMessage")
+  placeholderMessage: document.getElementById("placeholderMessage"),
+  restoredProjectValue: document.getElementById("restoredProjectValue"),
+  restoredTaskValue: document.getElementById("restoredTaskValue"),
+  restoredSessionValue: document.getElementById("restoredSessionValue"),
+  restoredFocusHint: document.getElementById("restoredFocusHint")
 };
 
 let serverRunning = false;
+let restoredBoardFocus = readDesktopFocus(globalThis.localStorage);
 
 function setupDesktopMaintenanceActions() {
   const actionList = document.querySelector(".action-list");
@@ -54,7 +68,7 @@ function requestFallback(error) {
 function tauriInvoke(command, args = {}) {
   const invoke = window.__TAURI__?.core?.invoke;
   if (!invoke) {
-    throw new Error("当前环境没有注入 Tauri API。请使用 `npm run tauri dev` 启动桌面客户端。");
+    throw new Error("当前环境没有注入 Tauri API，请使用 `npm run tauri dev` 启动桌面客户端。");
   }
   return invoke(command, args);
 }
@@ -101,6 +115,63 @@ function hidePlaceholder() {
   elements.workspacePlaceholder.hidden = true;
 }
 
+function formatFocusLabel(label, fallbackPrefix, id) {
+  if (label) {
+    return label;
+  }
+  if (id) {
+    return `${fallbackPrefix} ${id}`;
+  }
+  return "未记录";
+}
+
+function renderRestoredFocus() {
+  const hasFocus = hasBoardFocus(restoredBoardFocus);
+
+  elements.restoredProjectValue.textContent = formatFocusLabel(
+    restoredBoardFocus.projectName,
+    "项目",
+    restoredBoardFocus.projectId
+  );
+  elements.restoredTaskValue.textContent = formatFocusLabel(
+    restoredBoardFocus.taskTitle,
+    "任务",
+    restoredBoardFocus.taskId
+  );
+  elements.restoredSessionValue.textContent = formatFocusLabel(
+    restoredBoardFocus.sessionTitle,
+    "会话",
+    restoredBoardFocus.sessionId
+  );
+  elements.restoredFocusHint.textContent = hasFocus
+    ? "下次打开客户端时，会优先恢复到这里；你也可以随时清除这条记录。"
+    : "当前还没有恢复记录。你在看板里切换项目、任务或项目会话后，这里会自动更新。";
+
+  if (elements.clearFocusButton) {
+    elements.clearFocusButton.disabled = !hasFocus;
+  }
+}
+
+function persistBoardFocus(focus) {
+  restoredBoardFocus = writeDesktopFocus(focus, globalThis.localStorage);
+  renderRestoredFocus();
+}
+
+function handleBoardMessage(event) {
+  const focus = parseBoardFocusMessage(event.data);
+  if (!focus) {
+    return;
+  }
+
+  persistBoardFocus(focus);
+}
+
+function clearRestoredFocus() {
+  restoredBoardFocus = clearDesktopFocus(globalThis.localStorage);
+  renderRestoredFocus();
+  setProbeStatus("ready", "已清除恢复记录", "下次重新打开客户端时，将从默认入口进入，不再自动恢复上次视图。");
+}
+
 function applyWorkspaceState(view) {
   setStatus(view.statusKind, view.statusTitle, view.statusMessage);
   elements.workspaceBadge.textContent = view.workspaceBadge;
@@ -117,12 +188,12 @@ function refreshFrame() {
   if (!serverRunning) {
     showPlaceholder(
       "服务端未启动",
-      "客户端界面已正常加载。请先单独启动 spotlight-server，再刷新内嵌面板。"
+      "客户端界面已正常加载。请先启动 `spotlight-server`，再刷新内嵌看板。"
     );
     return;
   }
 
-  elements.boardFrame.src = `${BACKEND_URL}?ts=${Date.now()}`;
+  elements.boardFrame.src = buildBoardUrl(BACKEND_URL, restoredBoardFocus);
   hidePlaceholder();
 }
 
@@ -148,7 +219,7 @@ async function refreshStatus() {
 }
 
 async function probeBackend() {
-  setProbeStatus("busy", "正在探测", "客户端正在尝试从原生侧探测本机服务。");
+  setProbeStatus("busy", "正在探测", "客户端正在从原生侧探测本地 Spotlight 服务。");
 
   try {
     const probe = await invokeWithTimeout("probe_backend");
@@ -183,7 +254,9 @@ async function openInBrowser() {
   }
 
   try {
-    await invokeWithTimeout("open_backend_in_browser");
+    await invokeWithTimeout("open_backend_in_browser", {
+      url: buildBoardUrl(BACKEND_URL, restoredBoardFocus)
+    });
   } catch (error) {
     applyWorkspaceState(deriveWorkspaceErrorState(error));
     requestFallback(error);
@@ -200,7 +273,7 @@ async function rebuildDesktop() {
   setProbeStatus(
     "busy",
     "准备重启客户端",
-    "客户端正在交给外部 helper 处理重编译和重启，当前窗口会自动退出。"
+    "客户端正在把重编译和重启交给外部 helper 处理，当前窗口会自动退出。"
   );
 
   try {
@@ -219,12 +292,15 @@ async function rebuildDesktop() {
   }
 }
 
-elements.checkButton.addEventListener("click", refreshStatus);
-elements.probeButton.addEventListener("click", probeBackend);
-elements.reloadButton.addEventListener("click", refreshFrame);
-elements.browserButton.addEventListener("click", openInBrowser);
-elements.copyUrlButton.addEventListener("click", copyBackendUrl);
+elements.checkButton?.addEventListener("click", refreshStatus);
+elements.probeButton?.addEventListener("click", probeBackend);
+elements.reloadButton?.addEventListener("click", refreshFrame);
+elements.browserButton?.addEventListener("click", openInBrowser);
+elements.copyUrlButton?.addEventListener("click", copyBackendUrl);
+elements.clearFocusButton?.addEventListener("click", clearRestoredFocus);
+window.addEventListener("message", handleBoardMessage);
 
 setupDesktopMaintenanceActions();
+renderRestoredFocus();
 refreshStatus();
 setInterval(refreshStatus, 5000);

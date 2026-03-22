@@ -146,6 +146,15 @@ Responsibilities:
 - admin console APIs for project config, role grants, monitoring, billing, and platform operations
 - AI insight orchestration, prompt shaping, caching, and forecast generation
 
+Current minimum read-model endpoint:
+
+- `GET /api/v1/projects/{project_id}/summary`
+
+Bootstrap note:
+
+- the `0.1.x` self-hosting implementation still persists runtime state in `.spotlight/server-state.json` before the database migration is complete
+- task/session/thread recovery semantics and the current watchdog rules are documented in `runtime-session-and-task-recovery-v1.md`
+
 ## 4. Execution Model
 
 ### 4.1 Local Agent Execution
@@ -162,6 +171,7 @@ Session isolation:
 - multiple Agents in one project are independent
 - context is not automatically shared between Agents
 - session history is linked through task runs, not through shared memory
+- long-lived shared facts must be promoted into versioned memory instead of assuming provider threads are reusable shared context
 
 ### 4.2 Event-Driven Auto Execution
 
@@ -203,6 +213,27 @@ flowchart TD
   G --> H["Complete / fail / retry / rollback"]
   H --> I["Pending acceptance or manual review"]
 ```
+
+## 5.1 Versioned Fact Memory Layer
+
+The system should add a versioned fact memory layer inside the central service, but this layer should not replace `task`, `task_run`, `project_session`, or audit entities.
+
+Its responsibilities are:
+
+- persist long-lived project constraints, decisions, and summaries as immutable revisions
+- expose mutable tags that point to the currently effective revision
+- provide structured facts for AI insight scenarios
+- provide stable, auditable facts for resume and recovery flows across desktop, mobile, and admin surfaces
+
+Important boundaries:
+
+- execution sessions remain provider/task-run scoped
+- session history is still linked through task runs rather than shared live memory
+- the first implementation should stay on the existing storage path instead of introducing Redis or Neo4j
+
+Reference:
+
+- see `docs/versioned-fact-memory-v1.md`
 
 ## 6. Multi-Workspace Behavior
 

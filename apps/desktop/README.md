@@ -1,32 +1,35 @@
 # Spotlight Desktop
 
-This is the real desktop shell for Spotlight.
+这是 Spotlight 的真实桌面执行壳，而不是简单打开一个浏览器标签页。
 
 当前目标：
 
-- package Spotlight as a cross-platform desktop client
-- support Windows and macOS from the same codebase
-- start or attach to the local `spotlight-server`
-- render a simple Chinese desktop shell around the local task board
+- 把 Spotlight 打包成跨平台桌面客户端
+- 用同一套代码支持 Windows 和 macOS
+- 自动连接或拉起本地 `spotlight-server`
+- 在桌面壳内承载中文任务看板与 Agent 工作区
 
-## Current Mode
+## 当前模式
 
-The desktop app is a Tauri shell that:
+当前桌面端是一个 Tauri shell，它会：
 
-- loads a local front-end
-- checks whether `http://127.0.0.1:3000` is alive
-- tries to start the local `spotlight-server` if needed
-- embeds the running task board in an in-app view
-- can hand off desktop rebuild and restart to an external helper process on local development machines
+- 加载本地前端界面
+- 检查 `http://127.0.0.1:3000` 是否可用
+- 当后端离线时优先尝试自动拉起本地 `spotlight-server`
+- 记住最近聚焦的项目、任务和项目会话，并在重开后恢复
+- 在侧边栏展示最近恢复位置，并支持一键清除恢复记录
+- 以内嵌视图承载运行中的统一任务看板
+- 在本地开发机上把桌面端重建和重启交给外部 helper 处理
 
-当前阶段默认版本号采用 `0.1.x` 规则，工程包和配置中的版本号使用完整语义化格式，例如 `0.1.0`。
+当前阶段默认采用 `0.1.x` 版本规则，工程包和配置中的版本号使用完整语义化格式，例如 `0.1.0`。
 
-目前桌面壳会优先在仓库工作区里寻找本地服务端二进制。
+开发时桌面壳会优先在仓库工作区内查找本地服务端二进制。推荐路径：
 
-Preferred path during development:
+- Windows：`../../target/debug/spotlight-server.exe`
+- macOS：`../../target/debug/spotlight-server`
+- 本地 release 构建后：`../../target/release/spotlight-server(.exe)`
 
-- `../../target/debug/spotlight-server.exe` on Windows
-- `../../target/debug/spotlight-server` on macOS
+如果这些二进制不存在，桌面壳会退回到手动运行 `cargo run -p spotlight-server` 的方式。
 
 ## Windows
 
@@ -37,42 +40,42 @@ npm run tauri dev
 
 ## macOS
 
-Build on a Mac machine:
+请在 Mac 机器上构建：
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-or build an app bundle:
+或者构建 app bundle：
 
 ```bash
 npm run tauri build
 ```
 
-Important:
+注意：
 
-- macOS application bundles must be built on macOS
-- a Windows machine cannot produce a signed native macOS `.app` for your friend
-- release builds should be produced with `npm run tauri build`
-- do not rely on `src-tauri/target/release/spotlight-desktop.exe` if it was created by plain `cargo build --release`, because that binary can still expect the Vite dev server at `http://127.0.0.1:1421`
+- macOS 应用包必须在 macOS 上构建
+- Windows 机器不能直接产出签名后的原生 macOS `.app`
+- 正式构建请使用 `npm run tauri build`
+- 不要依赖仅通过 `cargo build --release` 生成的 `src-tauri/target/release/spotlight-desktop.exe`，因为它仍可能依赖 Vite 开发服务器 `http://127.0.0.1:1421`
 
-## Self Restart
+## 自重启
 
-The desktop shell now includes a native `rebuild_and_restart_desktop` command.
+桌面壳已经包含原生命令 `rebuild_and_restart_desktop`。
 
-On local development machines it works like this:
+在本地开发机上的工作方式是：
 
-- the client writes a helper script into the system temp directory
-- the helper waits for the current `spotlight-desktop.exe` process to exit
-- the helper runs `npm run tauri build -- --no-bundle`
-- the helper launches the rebuilt release executable again
+- 客户端把 helper 脚本写到系统临时目录
+- helper 等待当前 `spotlight-desktop.exe` 进程退出
+- helper 执行 `npm run tauri build -- --no-bundle`
+- helper 再次拉起重建后的 release 可执行文件
 
-This is intended for Spotlight self-hosted local iteration, so the client can keep evolving itself without requiring a manual rebuild every time the desktop code changes.
+这套机制是为 Spotlight 本地自举迭代准备的，让客户端能在桌面代码变化后继续自我演进，而不要求每次都手动重建。
 
-## Next Desktop Steps
+## 下一步
 
-- replace the embedded web board with a native left-right desktop layout
-- route desktop actions directly to Tauri commands where helpful
-- bundle the local server as a sidecar for packaged builds
-- add window/session restoration and richer desktop status handling
+- 把当前嵌入式网页看板逐步替换为更原生的左右分栏桌面布局
+- 在合适的地方把桌面动作直接收拢到 Tauri 命令
+- 为打包版本引入本地服务 sidecar
+- 在后续版本里把恢复入口、自动运行状态和会话控制做得更完整

@@ -14,6 +14,30 @@ export function deriveWorkspaceState(status) {
     };
   }
 
+  if (status.backend_state === "starting") {
+    return {
+      statusKind: "busy",
+      statusTitle: "正在拉起本地服务",
+      statusMessage: status.message,
+      workspaceBadge: "拉起中",
+      placeholderTitle: "正在准备本地服务",
+      placeholderMessage: status.message,
+      shouldLoadFrame: false
+    };
+  }
+
+  if (status.backend_state === "partial") {
+    return {
+      statusKind: "busy",
+      statusTitle: "服务正在恢复",
+      statusMessage: status.message,
+      workspaceBadge: "等待就绪",
+      placeholderTitle: "服务已启动但尚未就绪",
+      placeholderMessage: status.message,
+      shouldLoadFrame: false
+    };
+  }
+
   return {
     statusKind: "idle",
     statusTitle: "本地服务未连接",

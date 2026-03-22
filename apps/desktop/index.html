@@ -3,18 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Spotlight Desktop</title>
+    <title>Spotlight 自举客户端</title>
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <p class="eyebrow">Spotlight Desktop</p>
-          <h1>桌面客户端</h1>
+          <p class="eyebrow">任务为中心的桌面入口</p>
+          <h1>Spotlight 自举客户端</h1>
           <p class="muted">
-            这是 Windows 和 macOS 共用的桌面壳。当前版本先把本地服务自动拉起、嵌入任务看板和
-            Agent 面板跑通，再继续向更原生的客户端体验迭代。
+            这是 Windows 和 macOS 共用的任务工作台桌面壳。当前优先把本地服务自动拉起、任务看板嵌入、
+            恢复入口和统一工作区打通，不让客户端壳版本盖过任务版本与任务状态本身。
           </p>
         </div>
 
@@ -22,23 +22,47 @@
           <h2>本地服务</h2>
           <div id="statusCard" class="status-card status-idle">
             <strong id="statusTitle">正在检查</strong>
-            <p id="statusMessage">客户端正在检查本机 Spotlight 服务状态。</p>
+            <p id="statusMessage">客户端正在确认本机 Spotlight 服务状态。</p>
           </div>
           <div class="action-list">
             <button id="checkButton" class="primary">检查服务状态</button>
             <button id="probeButton" class="secondary">测试连接</button>
-            <button id="reloadButton" class="secondary">刷新内嵌面板</button>
+            <button id="reloadButton" class="secondary">刷新内嵌看板</button>
             <button id="browserButton" class="secondary">用浏览器打开</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>最近恢复位置</h2>
+          <div class="focus-list">
+            <div class="focus-row">
+              <span>项目</span>
+              <strong id="restoredProjectValue">未记录</strong>
+            </div>
+            <div class="focus-row">
+              <span>任务</span>
+              <strong id="restoredTaskValue">未记录</strong>
+            </div>
+            <div class="focus-row">
+              <span>会话</span>
+              <strong id="restoredSessionValue">未记录</strong>
+            </div>
+          </div>
+          <p id="restoredFocusHint" class="muted">
+            当前还没有恢复记录。你在看板里切换项目、任务或项目会话后，这里会自动更新。
+          </p>
+          <div class="inline-actions">
+            <button id="clearFocusButton" class="secondary small" disabled>清除恢复记录</button>
           </div>
         </section>
 
         <section class="panel">
           <h2>当前能力</h2>
           <ul class="info-list">
-            <li>真正的 Tauri 桌面窗口，不是单独打开浏览器页。</li>
-            <li>客户端界面可独立加载，服务端由你单独启动。</li>
-            <li>服务可用时，窗口内会直接嵌入项目看板和 Agent 操作区。</li>
-            <li>后续版本再把任务区和会话区逐步原生化。</li>
+            <li>真实 Tauri 桌面窗口，不是简单拉起一个浏览器页签。</li>
+            <li>本地服务可探测、可自动拉起，并保留兼容模式 fallback。</li>
+            <li>重新打开客户端后，可恢复最近查看的项目、任务和项目会话入口。</li>
+            <li>移动端与浏览器仍然继续走统一入口，不绑定桌面专属协议。</li>
           </ul>
         </section>
 
@@ -61,7 +85,7 @@
           <h2>连接诊断</h2>
           <div class="status-card status-idle" id="probeCard">
             <strong id="probeTitle">尚未探测</strong>
-            <p id="probeMessage">点击“测试连接”后，这里会显示客户端原生探测结果。</p>
+            <p id="probeMessage">点击“测试连接”后，这里会显示原生探测结果。</p>
           </div>
         </section>
       </aside>
@@ -69,7 +93,7 @@
       <main class="workspace">
         <div class="workspace-head">
           <div>
-            <p class="eyebrow">内嵌工作区</p>
+            <p class="eyebrow">统一工作区</p>
             <h2>项目任务看板与 Agent 运行面板</h2>
           </div>
           <div id="workspaceBadge" class="workspace-badge">等待连接</div>
@@ -105,6 +129,7 @@
         window.__SPOTLIGHT_DESKTOP_FALLBACK_STARTED__ = true;
 
         const backendUrl = "http://127.0.0.1:3000";
+        const focusStorageKey = "spotlight.desktop.focus.v1";
         const boardFrame = document.getElementById("boardFrame");
         const statusCard = document.getElementById("statusCard");
         const statusTitle = document.getElementById("statusTitle");
@@ -123,20 +148,57 @@
           return;
         }
 
+        const normalizedId = function (value) {
+          return typeof value === "string" && value.trim() ? value.trim() : null;
+        };
+
+        const readStoredFocus = function () {
+          try {
+            const raw = JSON.parse(window.localStorage.getItem(focusStorageKey) || "null");
+            return {
+              projectId: normalizedId(raw?.projectId),
+              taskId: normalizedId(raw?.taskId),
+              sessionId: normalizedId(raw?.sessionId)
+            };
+          } catch (_) {
+            return {
+              projectId: null,
+              taskId: null,
+              sessionId: null
+            };
+          }
+        };
+
+        const buildBoardUrl = function () {
+          const focus = readStoredFocus();
+          const url = new URL(backendUrl);
+          if (focus.projectId) {
+            url.searchParams.set("project_id", focus.projectId);
+          }
+          if (focus.taskId) {
+            url.searchParams.set("task_id", focus.taskId);
+          }
+          if (focus.sessionId) {
+            url.searchParams.set("session_id", focus.sessionId);
+          }
+          url.searchParams.set("ts", String(Date.now()));
+          return url.toString();
+        };
+
         const loadFrame = function () {
-          boardFrame.src = backendUrl + "?ts=" + Date.now();
+          boardFrame.src = buildBoardUrl();
         };
 
         statusCard.className = "status-card status-busy";
         statusTitle.textContent = "进入兼容模式";
         statusMessage.textContent =
-          "桌面端未能及时连通原生状态桥，已直接尝试加载本地 Spotlight 服务。";
+          "桌面端暂时无法连通原生状态桥，已直接尝试加载本地 Spotlight 服务。";
         platformValue.textContent = "兼容模式";
         urlValue.textContent = backendUrl;
         workspaceBadge.textContent = "正在直连";
         placeholderTitle.textContent = "正在直连本地服务";
         placeholderMessage.textContent = reason
-          ? "原因：" + reason
+          ? `原因：${reason}`
           : "桌面客户端已切换到兼容模式，正在直接连接本地 Spotlight 服务。";
 
         boardFrame.addEventListener(
@@ -154,13 +216,13 @@
 
         reloadButton?.addEventListener("click", loadFrame);
         browserButton?.addEventListener("click", function () {
-          window.open(backendUrl, "_blank");
+          window.open(buildBoardUrl(), "_blank");
         });
         copyUrlButton?.addEventListener("click", async function () {
           try {
             await navigator.clipboard.writeText(backendUrl);
           } catch (_) {
-            // fallback 模式下忽略剪贴板失败
+            // fallback 模式下忽略剪贴板失败。
           }
         });
 
