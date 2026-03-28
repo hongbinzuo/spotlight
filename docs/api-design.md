@@ -100,7 +100,8 @@ Supports filters:
 当前 `0.1.0` 实现说明：
 
 - 已提供项目级任务看板读取接口
-- 当前先支持 `status` 查询参数
+- 当前先支持 `status` 查询参数，且可接受当前任务状态枚举值：
+  `OPEN`、`CLAIMED`、`APPROVAL_REQUESTED`、`APPROVED`、`RUNNING`、`PAUSED`、`PENDING_ACCEPTANCE`、`ACCEPTED`、`DONE`、`FAILED`、`MANUAL_REVIEW`、`CANCELED`
 - 其余筛选项作为 `0.1.1` 看板增强范围继续补齐
 
 ### `POST /projects/{projectId}/tasks`
@@ -124,6 +125,12 @@ Request:
 ### `POST /tasks/{taskId}/claim`
 
 Human-driven claim for a specific Agent.
+
+Current `0.1.0` implementation notes:
+
+- only `open` and `approved` tasks can be manually claimed
+- repeated claim by the same Agent is treated as idempotent and keeps the existing binding
+- `paused` / `manual_review` / terminal tasks must go through resume, reassess, or explicit reopen flow instead of direct claim
 
 ### `POST /tasks/{taskId}/request-approval`
 

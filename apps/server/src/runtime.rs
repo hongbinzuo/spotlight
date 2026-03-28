@@ -1,128 +1,118 @@
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
 };
 
 use axum::http::StatusCode;
-use serde_json::{json, Value};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{mpsc, oneshot, Mutex},
-    time::{timeout, Duration},
+use provider_runtime::{
+    ProviderRegistry, RuntimeError, RuntimeErrorKind, SharedProviderSession, CLAUDE_PROVIDER_ID,
+    CODEX_PROVIDER_ID,
 };
+use tokio::sync::mpsc;
 
 type AppResult<T> = Result<T, (StatusCode, String)>;
 
-#[derive(Debug)]
-pub enum RuntimeEvent {
-    ThreadStarted { thread_id: String },
-    TurnStarted { turn_id: String },
-    AgentDelta { delta: String },
-    CommandDelta { delta: String },
-    PlanDelta { delta: String },
-    TurnCompleted { turn_id: String, status: String },
-    Error { message: String },
-    Stderr { message: String },
-    Exited { message: String },
+pub use provider_runtime::RuntimeEvent;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderLaunchPlan {
+    candidate_ids: Vec<&'static str>,
 }
 
-pub struct CodexRuntimeSession {
-    stdin: Mutex<ChildStdin>,
-    child: Mutex<Child>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    next_id: AtomicU64,
+/// 默认 Provider 候选链优先使用 Codex，失败后回退到 Claude。
+/// 可通过环境变量 `SPOTLIGHT_PROVIDER` 覆盖顺序，支持单值或逗号分隔列表。
+fn resolve_provider_launch_plan() -> ProviderLaunchPlan {
+    resolve_provider_launch_plan_from_env(std::env::var("SPOTLIGHT_PROVIDER").ok().as_deref())
 }
 
-impl CodexRuntimeSession {
+fn resolve_provider_launch_plan_from_env(raw: Option<&str>) -> ProviderLaunchPlan {
+    let mut candidate_ids = Vec::new();
+
+    if let Some(raw) = raw {
+        for token in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            push_known_provider_id(&mut candidate_ids, token);
+        }
+    }
+
+    if candidate_ids.is_empty() {
+        candidate_ids.push(CODEX_PROVIDER_ID);
+    }
+
+    for fallback_id in [CODEX_PROVIDER_ID, CLAUDE_PROVIDER_ID] {
+        if !candidate_ids.contains(&fallback_id) {
+            candidate_ids.push(fallback_id);
+        }
+    }
+
+    ProviderLaunchPlan { candidate_ids }
+}
+
+fn push_known_provider_id(candidate_ids: &mut Vec<&'static str>, raw: &str) {
+    let provider_id = if raw.eq_ignore_ascii_case(CODEX_PROVIDER_ID) {
+        Some(CODEX_PROVIDER_ID)
+    } else if raw.eq_ignore_ascii_case(CLAUDE_PROVIDER_ID) {
+        Some(CLAUDE_PROVIDER_ID)
+    } else {
+        None
+    };
+
+    if let Some(provider_id) = provider_id {
+        if !candidate_ids.contains(&provider_id) {
+            candidate_ids.push(provider_id);
+        }
+    }
+}
+
+fn default_registry() -> ProviderRegistry {
+    ProviderRegistry::new().with_claude().with_codex()
+}
+
+pub struct ProviderRuntimeSession {
+    inner: SharedProviderSession,
+}
+
+impl ProviderRuntimeSession {
     pub async fn spawn(
         workspace_root: PathBuf,
         event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     ) -> AppResult<Arc<Self>> {
-        let mut command = if cfg!(windows) {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", "codex", "app-server", "--listen", "stdio://"]);
-            cmd
-        } else {
-            let mut cmd = Command::new("codex");
-            cmd.args(["app-server", "--listen", "stdio://"]);
-            cmd
-        };
+        let registry = default_registry();
+        let plan = resolve_provider_launch_plan();
+        let candidate_count = plan.candidate_ids.len();
+        let mut failures = Vec::new();
+        let mut last_kind = RuntimeErrorKind::Unavailable;
 
-        command
-            .current_dir(workspace_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = command.spawn().map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("无法启动 Codex App Server：{error}"),
-            )
-        })?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法获取 Codex stdin".into(),
-            )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法获取 Codex stdout".into(),
-            )
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法获取 Codex stderr".into(),
-            )
-        })?;
-
-        let session = Arc::new(Self {
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        });
-
-        let stdout_session = session.clone();
-        let stdout_events = event_tx.clone();
-        tokio::spawn(async move {
-            stdout_session.read_stdout(stdout, stdout_events).await;
-        });
-
-        let stderr_events = event_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+        for (index, provider_id) in plan.candidate_ids.into_iter().enumerate() {
+            match registry
+                .start_session(provider_id, workspace_root.clone(), event_tx.clone())
+                .await
+            {
+                Ok(session) => return Ok(Arc::new(Self { inner: session })),
+                Err(error) => {
+                    last_kind = error.kind.clone();
+                    failures.push(format!("{provider_id}: {}", error.message));
+                    if index + 1 < candidate_count {
+                        eprintln!(
+                            "Provider ({provider_id}) 启动失败：{}；尝试下一个候选 Provider",
+                            error.message
+                        );
+                    }
                 }
-                let _ = stderr_events.send(RuntimeEvent::Stderr {
-                    message: trimmed.to_string(),
-                });
             }
-        });
+        }
 
-        let exit_session = session.clone();
-        tokio::spawn(async move {
-            let result = exit_session.child.lock().await.wait().await;
-            let message = match result {
-                Ok(status) => format!("Codex App Server 已退出：{status}"),
-                Err(error) => format!("等待 Codex App Server 退出时失败：{error}"),
-            };
-            let _ = event_tx.send(RuntimeEvent::Exited { message });
-        });
+        Err(runtime_error_to_app(RuntimeError::new(
+            last_kind,
+            format!("所有候选 Provider 均不可用：{}", failures.join("；")),
+        )))
+    }
 
-        session.initialize().await?;
-        Ok(session)
+    pub fn provider_id(&self) -> &str {
+        self.inner.provider_id()
     }
 
     pub async fn start_thread(
@@ -130,304 +120,120 @@ impl CodexRuntimeSession {
         cwd: &Path,
         developer_instructions: &str,
     ) -> AppResult<String> {
-        let response = self
-            .request(
-                "thread/start",
-                json!({
-                    "cwd": cwd.to_string_lossy(),
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access",
-                    "developerInstructions": developer_instructions,
-                    "experimentalRawEvents": false
-                }),
-            )
-            .await?;
-
-        extract_thread_id(&response, "thread/start")
+        self.inner
+            .start_thread(cwd, developer_instructions)
+            .await
+            .map_err(runtime_error_to_app)
     }
 
     pub async fn resume_thread(&self, thread_id: &str) -> AppResult<String> {
-        let response = self
-            .request(
-                "thread/resume",
-                json!({
-                    "threadId": thread_id
-                }),
-            )
-            .await?;
-
-        extract_thread_id(&response, "thread/resume")
+        self.inner
+            .resume_thread(thread_id)
+            .await
+            .map_err(runtime_error_to_app)
     }
 
     pub async fn start_turn(&self, cwd: &Path, thread_id: &str, prompt: &str) -> AppResult<String> {
-        let response = self
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{
-                        "type": "text",
-                        "text": prompt,
-                        "text_elements": []
-                    }],
-                    "cwd": cwd.to_string_lossy(),
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {
-                        "type": "dangerFullAccess"
-                    }
-                }),
-            )
-            .await?;
-
-        extract_turn_id(&response, "turn/start")
+        self.inner
+            .start_turn(cwd, thread_id, prompt)
+            .await
+            .map_err(runtime_error_to_app)
     }
 
     pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> AppResult<()> {
-        self.request(
-            "turn/interrupt",
-            json!({
-                "threadId": thread_id,
-                "turnId": turn_id
-            }),
-        )
-        .await
-        .map(|_| ())
+        self.inner
+            .interrupt_turn(thread_id, turn_id)
+            .await
+            .map_err(runtime_error_to_app)
     }
 
     pub async fn shutdown(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.kill().await;
-    }
-
-    async fn initialize(&self) -> AppResult<()> {
-        self.request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "spotlight",
-                    "title": "Spotlight",
-                    "version": "0.1.0"
-                },
-                "capabilities": {
-                    "experimentalApi": false
-                }
-            }),
-        )
-        .await
-        .map(|_| ())
-    }
-
-    async fn request(&self, method: &str, params: Value) -> AppResult<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        let request = json!({
-            "method": method,
-            "id": id,
-            "params": params
-        });
-
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(request.to_string().as_bytes())
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("写入 Codex App Server 请求失败：{error}"),
-                    )
-                })?;
-            stdin.write_all(b"\n").await.map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("写入 Codex App Server 换行失败：{error}"),
-                )
-            })?;
-            stdin.flush().await.map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("刷新 Codex App Server stdin 失败：{error}"),
-                )
-            })?;
-        }
-
-        timeout(Duration::from_secs(60), rx)
-            .await
-            .map_err(|_| {
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("等待 Codex {method} 响应超时"),
-                )
-            })?
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Codex {method} 响应通道已关闭"),
-                )
-            })?
-            .map_err(|message| (StatusCode::BAD_GATEWAY, message))
-    }
-
-    async fn read_stdout(
-        self: Arc<Self>,
-        stdout: ChildStdout,
-        event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let Ok(payload) = serde_json::from_str::<Value>(trimmed) else {
-                let _ = event_tx.send(RuntimeEvent::Error {
-                    message: format!("无法解析 Codex 输出：{trimmed}"),
-                });
-                continue;
-            };
-
-            if let Some(id) = payload.get("id").and_then(Value::as_u64) {
-                let tx = self.pending.lock().await.remove(&id);
-                if let Some(tx) = tx {
-                    if let Some(error) = payload.get("error") {
-                        let _ = tx.send(Err(extract_error_message(error)));
-                    } else {
-                        let _ = tx.send(Ok(payload.get("result").cloned().unwrap_or(Value::Null)));
-                    }
-                }
-                continue;
-            }
-
-            let Some(method) = payload.get("method").and_then(Value::as_str) else {
-                continue;
-            };
-            let params = payload.get("params").cloned().unwrap_or(Value::Null);
-
-            match method {
-                "thread/started" => {
-                    if let Some(thread_id) = params
-                        .get("thread")
-                        .and_then(|thread| thread.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        let _ = event_tx.send(RuntimeEvent::ThreadStarted {
-                            thread_id: thread_id.to_string(),
-                        });
-                    }
-                }
-                "turn/started" => {
-                    if let Some(turn_id) = params
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        let _ = event_tx.send(RuntimeEvent::TurnStarted {
-                            turn_id: turn_id.to_string(),
-                        });
-                    }
-                }
-                "turn/completed" => {
-                    let turn_id = params
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let status = params
-                        .get("turn")
-                        .and_then(|turn| turn.get("status"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let _ = event_tx.send(RuntimeEvent::TurnCompleted { turn_id, status });
-                }
-                "item/agentMessage/delta" => {
-                    if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                        let _ = event_tx.send(RuntimeEvent::AgentDelta {
-                            delta: delta.to_string(),
-                        });
-                    }
-                }
-                "item/commandExecution/outputDelta" => {
-                    if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                        let _ = event_tx.send(RuntimeEvent::CommandDelta {
-                            delta: delta.to_string(),
-                        });
-                    }
-                }
-                "item/plan/delta" => {
-                    if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                        let _ = event_tx.send(RuntimeEvent::PlanDelta {
-                            delta: delta.to_string(),
-                        });
-                    }
-                }
-                "error" => {
-                    let message = params
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Codex 运行时返回了未知错误")
-                        .to_string();
-                    let _ = event_tx.send(RuntimeEvent::Error { message });
-                }
-                _ => {}
-            }
-        }
+        let _ = self.inner.shutdown().await;
     }
 }
 
-fn extract_thread_id(response: &Value, method: &str) -> AppResult<String> {
-    response
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Codex {method} 响应里缺少 thread.id"),
-            )
-        })
-}
+// 兼容仍在拆分中的旧模块命名，避免一次性重写整个服务端。
+#[allow(dead_code)]
+pub type CodexRuntimeSession = ProviderRuntimeSession;
 
-fn extract_turn_id(response: &Value, method: &str) -> AppResult<String> {
-    response
-        .get("turn")
-        .and_then(|turn| turn.get("id"))
-        .and_then(Value::as_str)
-        .map(|value| value.to_string())
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Codex {method} 响应里缺少 turn.id"),
-            )
-        })
-}
-
-fn extract_error_message(error: &Value) -> String {
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| error.as_str().unwrap_or("Codex 返回了未知错误"))
-        .to_string()
+fn runtime_error_to_app(error: RuntimeError) -> (StatusCode, String) {
+    let status = match error.kind {
+        RuntimeErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        RuntimeErrorKind::NotFound => StatusCode::NOT_FOUND,
+        RuntimeErrorKind::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        RuntimeErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        RuntimeErrorKind::Unavailable | RuntimeErrorKind::Protocol => StatusCode::BAD_GATEWAY,
+        RuntimeErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.message)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexRuntimeSession, RuntimeEvent};
+    use super::{
+        resolve_provider_launch_plan_from_env, runtime_error_to_app, ProviderRuntimeSession,
+        RuntimeEvent,
+    };
+    use axum::http::StatusCode;
+    use provider_runtime::{RuntimeError, RuntimeErrorKind, CLAUDE_PROVIDER_ID, CODEX_PROVIDER_ID};
     use std::path::PathBuf;
     use tokio::{
         sync::mpsc,
         time::{timeout, Duration},
     };
 
+    #[test]
+    fn runtime_error_kind_maps_to_expected_status_code() {
+        let cases = [
+            (RuntimeErrorKind::InvalidRequest, StatusCode::BAD_REQUEST),
+            (RuntimeErrorKind::NotFound, StatusCode::NOT_FOUND),
+            (RuntimeErrorKind::Unsupported, StatusCode::NOT_IMPLEMENTED),
+            (RuntimeErrorKind::Timeout, StatusCode::GATEWAY_TIMEOUT),
+            (RuntimeErrorKind::Unavailable, StatusCode::BAD_GATEWAY),
+            (RuntimeErrorKind::Protocol, StatusCode::BAD_GATEWAY),
+            (
+                RuntimeErrorKind::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (kind, expected_status) in cases {
+            let (actual_status, message) = runtime_error_to_app(RuntimeError::new(kind, "test"));
+            assert_eq!(actual_status, expected_status);
+            assert_eq!(message, "test");
+        }
+    }
+
+    #[test]
+    fn defaults_to_codex_then_claude() {
+        let plan = resolve_provider_launch_plan_from_env(None);
+        assert_eq!(
+            plan.candidate_ids,
+            vec![CODEX_PROVIDER_ID, CLAUDE_PROVIDER_ID]
+        );
+    }
+
+    #[test]
+    fn honors_explicit_provider_override() {
+        let plan = resolve_provider_launch_plan_from_env(Some("claude"));
+        assert_eq!(
+            plan.candidate_ids,
+            vec![CLAUDE_PROVIDER_ID, CODEX_PROVIDER_ID]
+        );
+    }
+
+    #[test]
+    fn supports_multiple_provider_candidates_and_ignores_unknown_values() {
+        let plan = resolve_provider_launch_plan_from_env(Some("unknown, claude , codex, claude"));
+        assert_eq!(
+            plan.candidate_ids,
+            vec![CLAUDE_PROVIDER_ID, CODEX_PROVIDER_ID]
+        );
+    }
+
     #[tokio::test]
-    #[ignore = "requires local Codex CLI auth and a working app-server install"]
-    async fn real_codex_session_smoke_test() {
+    #[ignore = "requires local Claude or Codex CLI install"]
+    async fn real_session_smoke_test() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|path| path.parent())
@@ -435,9 +241,9 @@ mod tests {
             .to_path_buf();
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let session = CodexRuntimeSession::spawn(workspace_root.clone(), event_tx)
+        let session = ProviderRuntimeSession::spawn(workspace_root.clone(), event_tx)
             .await
-            .expect("failed to spawn real codex session");
+            .expect("failed to spawn runtime session");
 
         let thread_id = session
             .start_thread(&workspace_root, "You are a concise smoke-test agent.")
@@ -449,7 +255,7 @@ mod tests {
             .start_turn(
                 &workspace_root,
                 &thread_id,
-                "Please reply with one short sentence confirming the app-server session is active.",
+                "Please reply with one short sentence confirming the session is active.",
             )
             .await
             .expect("failed to start turn");
@@ -458,7 +264,7 @@ mod tests {
         let mut saw_completion = false;
         let mut saw_error = None;
 
-        while let Ok(Some(event)) = timeout(Duration::from_secs(20), event_rx.recv()).await {
+        while let Ok(Some(event)) = timeout(Duration::from_secs(30), event_rx.recv()).await {
             match event {
                 RuntimeEvent::TurnCompleted { status, .. } => {
                     saw_completion = status == "completed" || status == "interrupted";
@@ -473,8 +279,10 @@ mod tests {
         }
 
         if let Some(message) = saw_error {
-            panic!("real codex smoke test received runtime error: {message}");
+            session.shutdown().await;
+            panic!("smoke test received runtime error: {message}");
         }
+        session.shutdown().await;
         assert!(saw_completion, "did not observe a turn completion event");
     }
 }

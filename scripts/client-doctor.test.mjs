@@ -6,11 +6,14 @@ import {
   analyzeHtml,
   analyzeProjectSummaries,
   computeAutonomyMetrics,
-  parseTaskVersion
+  parseTaskVersion,
+  resolveWebEndpointPolicy,
+  shouldRequireDesktopProcess
 } from "./client-doctor.mjs";
 
 test("parseTaskVersion extracts version from task title", () => {
   assert.equal(parseTaskVersion({ title: "[0.1.2] 接通真实 Codex 长会话运行时" }), "0.1.2");
+  assert.equal(parseTaskVersion({ title: "[0.1.0.2] 最小服务端" }), "0.1.0.2");
   assert.equal(parseTaskVersion({ title: "普通任务" }), null);
 });
 
@@ -159,6 +162,68 @@ test("analyzeProjectSummaries flags misleading zero-agent summary", () => {
   assert.equal(report.failures[0].code, "project_summary_missing_agents");
 });
 
+test("shouldRequireDesktopProcess only requires desktop for separate web origin", () => {
+  assert.equal(
+    shouldRequireDesktopProcess("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+    false
+  );
+  assert.equal(
+    shouldRequireDesktopProcess("http://127.0.0.1:3000", "http://127.0.0.1:1421"),
+    true
+  );
+});
+
+test("resolveWebEndpointPolicy treats packaged desktop frontend as optional", () => {
+  const policy = resolveWebEndpointPolicy(
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:1421",
+    [{ name: "spotlight-desktop.exe" }],
+    {
+      devUrl: "http://127.0.0.1:1421",
+      frontendDistExists: true
+    }
+  );
+
+  assert.equal(policy.required, false);
+  assert.equal(policy.optionalReason, "desktop_embedded_frontend_available");
+});
+
+test("analyzeBoard flags excessive active task parallelism", () => {
+  const report = analyzeBoard({
+    agents: [{ name: "本地 Codex Agent", auto_mode: true }],
+    tasks: [
+      {
+        title: "[0.1.2] 长会话接入",
+        status: "RUNNING",
+        claimed_by: "agent-1",
+        priority: "HIGH",
+        activities: [{ kind: "task.auto_started" }],
+        runtime: { log: [] },
+        state_snapshot: {
+          reason: "任务正在运行。",
+          evidence: ["last_activity:task.auto_started@1"],
+          needs_attention: false
+        }
+      },
+      {
+        title: "[0.1.3] Provider 协议",
+        status: "CLAIMED",
+        claimed_by: "agent-1",
+        priority: "HIGH",
+        activities: [{ kind: "task.auto_claimed" }],
+        runtime: { log: [] },
+        state_snapshot: {
+          reason: "任务已被认领，等待执行。",
+          evidence: ["last_activity:task.auto_claimed@2"],
+          needs_attention: false
+        }
+      }
+    ]
+  });
+
+  assert.equal(report.failures.some((item) => item.code === "active_task_parallelism_exceeded"), true);
+});
+
 test("computeAutonomyMetrics summarizes governance coverage", () => {
   const metrics = computeAutonomyMetrics(
     {
@@ -208,16 +273,23 @@ test("computeAutonomyMetrics summarizes governance coverage", () => {
     [
       {
         project_id: "project-1",
-        recent_task_summaries: [{ task_id: "task-done" }]
+        recent_task_summaries: [{ task_id: "task-done" }],
+        active_constraints: [
+          { stable_key: "project_constraint/user-feedback-log-visibility" },
+          { stable_key: "project_constraint/user-feedback-versioning" },
+          { stable_key: "project_constraint/user-feedback-client-governance" }
+        ]
       }
     ]
   );
 
-  assert.equal(metrics.overallPercent, 88);
+  assert.equal(metrics.overallPercent, 90);
   assert.equal(metrics.metrics.find((item) => item.code === "state_confidence")?.percent, 100);
   assert.equal(metrics.metrics.find((item) => item.code === "auto_run_coverage")?.percent, 50);
   assert.equal(metrics.metrics.find((item) => item.code === "auto_recovery_coverage")?.percent, 100);
   assert.equal(metrics.metrics.find((item) => item.code === "evolution_coverage")?.percent, 100);
+  assert.equal(metrics.metrics.find((item) => item.code === "feedback_learning_coverage")?.percent, 100);
+  assert.equal(metrics.counts.learnedFeedback, 3);
   assert.equal(metrics.counts.unmanagedOpen, 1);
 });
 

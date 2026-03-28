@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,12 +53,107 @@ pub struct Task {
     #[serde(default)]
     pub assignee_user_id: Option<Uuid>,
     #[serde(default)]
+    pub assignment_mode: TaskAssignmentMode,
+    #[serde(default)]
+    pub requested_agent_id: Option<Uuid>,
+    #[serde(default)]
     pub source_task_id: Option<Uuid>,
     pub claimed_by: Option<Uuid>,
     pub activities: Vec<TaskActivity>,
     pub runtime: Option<TaskRuntime>,
     #[serde(default)]
+    pub approval: TaskApprovalState,
+    #[serde(default)]
+    pub acceptance: TaskAcceptanceState,
+    #[serde(default)]
     pub state_snapshot: TaskStateSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAssignmentMode {
+    PublicQueue,
+    AssignedAgent,
+}
+
+impl Default for TaskAssignmentMode {
+    fn default() -> Self {
+        Self::PublicQueue
+    }
+}
+
+impl TaskAssignmentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicQueue => "public_queue",
+            Self::AssignedAgent => "assigned_agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskApprovalStatus {
+    NotRequired,
+    Requested,
+    Approved,
+    Denied,
+    Expired,
+}
+
+impl Default for TaskApprovalStatus {
+    fn default() -> Self {
+        Self::NotRequired
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskApprovalState {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub status: TaskApprovalStatus,
+    #[serde(default)]
+    pub requested_by_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    #[serde(default)]
+    pub reviewer_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskAcceptanceStatus {
+    NotStarted,
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+impl Default for TaskAcceptanceStatus {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskAcceptanceState {
+    #[serde(default)]
+    pub owner_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub status: TaskAcceptanceStatus,
+    #[serde(default)]
+    pub pending_since: Option<String>,
+    #[serde(default)]
+    pub reviewed_by_user_id: Option<Uuid>,
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -77,10 +175,15 @@ pub struct TaskStateSnapshot {
 pub enum TaskStatus {
     Open,
     Claimed,
+    ApprovalRequested,
+    Approved,
     Running,
     Paused,
+    PendingAcceptance,
+    Accepted,
     Done,
     Failed,
+    ManualReview,
     Canceled,
 }
 
@@ -89,11 +192,34 @@ impl TaskStatus {
         match self {
             Self::Open => "OPEN",
             Self::Claimed => "CLAIMED",
+            Self::ApprovalRequested => "APPROVAL_REQUESTED",
+            Self::Approved => "APPROVED",
             Self::Running => "RUNNING",
             Self::Paused => "PAUSED",
+            Self::PendingAcceptance => "PENDING_ACCEPTANCE",
+            Self::Accepted => "ACCEPTED",
             Self::Done => "DONE",
             Self::Failed => "FAILED",
+            Self::ManualReview => "MANUAL_REVIEW",
             Self::Canceled => "CANCELED",
+        }
+    }
+
+    pub fn parse_filter(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "OPEN" => Some(Self::Open),
+            "CLAIMED" => Some(Self::Claimed),
+            "APPROVAL_REQUESTED" => Some(Self::ApprovalRequested),
+            "APPROVED" => Some(Self::Approved),
+            "RUNNING" => Some(Self::Running),
+            "PAUSED" => Some(Self::Paused),
+            "PENDING_ACCEPTANCE" => Some(Self::PendingAcceptance),
+            "ACCEPTED" => Some(Self::Accepted),
+            "DONE" => Some(Self::Done),
+            "FAILED" => Some(Self::Failed),
+            "MANUAL_REVIEW" => Some(Self::ManualReview),
+            "CANCELED" => Some(Self::Canceled),
+            _ => None,
         }
     }
 }
@@ -142,6 +268,50 @@ pub struct RuntimeLogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRunRecord {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub run_number: u32,
+    pub state: String,
+    pub provider: String,
+    #[serde(default)]
+    pub started_by_agent_id: Option<Uuid>,
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub primary_workspace_path: Option<String>,
+    #[serde(default)]
+    pub session_threads: Vec<String>,
+    #[serde(default)]
+    pub attempts: Vec<TaskRunAttemptRecord>,
+    #[serde(default)]
+    pub log: Vec<RuntimeLogEntry>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRunAttemptRecord {
+    pub id: Uuid,
+    pub attempt_number: u32,
+    pub trigger_kind: String,
+    pub status: String,
+    pub prompt: String,
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: Uuid,
     #[serde(default)]
@@ -179,6 +349,8 @@ pub struct BoardSnapshot {
     pub tasks: Vec<Task>,
     pub agents: Vec<Agent>,
     #[serde(default)]
+    pub task_run_history: HashMap<Uuid, Vec<TaskRunRecord>>,
+    #[serde(default)]
     pub pending_questions: Vec<PendingQuestion>,
 }
 
@@ -191,6 +363,12 @@ pub struct CreateTaskRequest {
     pub priority: Option<TaskPriority>,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub requested_agent_id: Option<Uuid>,
+    #[serde(default)]
+    pub approval_required: bool,
+    #[serde(default)]
+    pub acceptance_owner_user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,12 +439,14 @@ pub fn seed_tasks_from_agents_markdown(content: &str, project_id: Uuid) -> Vec<T
     let mut current_version = String::new();
     let mut current_release_title = String::new();
     let mut in_scope = false;
+    let mut scope_index = 0_u32;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
 
         if is_release_heading(line) {
             in_scope = false;
+            scope_index = 0;
             let heading = line.trim_start_matches('#').trim();
             let after_version = heading
                 .split("版本 ")
@@ -303,7 +483,13 @@ pub fn seed_tasks_from_agents_markdown(content: &str, project_id: Uuid) -> Vec<T
 
         if in_scope && line.starts_with("- ") && !current_version.is_empty() {
             let bullet = line.trim_start_matches("- ").trim();
-            let title = format!("[{}] {}", current_version, normalize_seed_title(bullet));
+            scope_index += 1;
+            let title = format!(
+                "[{}.{}] {}",
+                current_version,
+                scope_index,
+                normalize_seed_title(bullet)
+            );
             let description = format!(
                 "来源于 AGENTS.md 版本计划：{} / {}",
                 current_release_title, bullet
@@ -348,18 +534,17 @@ pub fn merge_unique_tasks(existing: &mut Vec<Task>, incoming: Vec<Task>) {
 }
 
 pub fn infer_task_priority(title: &str) -> Option<TaskPriority> {
-    let title = title.trim();
-    let version = title
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-        .map(|(version, _)| version.trim())?;
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    let patch = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() {
+    let version = extract_task_version(title)?;
+    let parts = version
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.len() < 3 {
         return None;
     }
+    let major = parts[0];
+    let minor = parts[1];
+    let patch = parts[2];
 
     match (major, minor, patch) {
         (0, 1, 0..=3) => Some(TaskPriority::High),
@@ -367,6 +552,23 @@ pub fn infer_task_priority(title: &str) -> Option<TaskPriority> {
         (0, 1, _) => Some(TaskPriority::Low),
         _ => None,
     }
+}
+
+pub fn extract_task_version(title: &str) -> Option<String> {
+    let version = title
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(version, _)| version.trim())?;
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() < 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
@@ -380,6 +582,8 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
         labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
+        assignment_mode: TaskAssignmentMode::PublicQueue,
+        requested_agent_id: None,
         source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
@@ -387,6 +591,8 @@ fn seed_task(project_id: Uuid, title: &str, description: &str) -> Task {
             "任务根据 Spotlight 文档规划自动生成",
         )],
         runtime: None,
+        approval: TaskApprovalState::default(),
+        acceptance: TaskAcceptanceState::default(),
         state_snapshot: TaskStateSnapshot::default(),
     }
 }
@@ -416,11 +622,82 @@ fn now_string() -> String {
     nanos.to_string()
 }
 
+// ─── 决策收件箱模型 ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    Approval,
+    Acceptance,
+    Reassess,
+    RiskAck,
+    ScopeChange,
+    Question,
+    Conflict,
+    Budget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionUrgency {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionStatus {
+    Pending,
+    Resolved,
+    Expired,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub style: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionCard {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    pub kind: DecisionKind,
+    pub urgency: DecisionUrgency,
+    pub title: String,
+    pub context: String,
+    pub options: Vec<DecisionOption>,
+    #[serde(default)]
+    pub recommended: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub timeout_action: Option<String>,
+    pub status: DecisionStatus,
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub resolved_by: Option<Uuid>,
+    #[serde(default)]
+    pub chosen_option: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        infer_task_priority, merge_unique_tasks, seed_demo_tasks, seed_tasks_from_agents_markdown,
-        seed_tasks_from_docs, TaskPriority, TaskStatus,
+        extract_task_version, infer_task_priority, merge_unique_tasks, seed_demo_tasks,
+        seed_tasks_from_agents_markdown, seed_tasks_from_docs, TaskPriority, TaskStatus,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -456,11 +733,40 @@ mod tests {
     fn task_status_string_values_are_stable_for_ui_rendering() {
         assert_eq!(TaskStatus::Open.as_str(), "OPEN");
         assert_eq!(TaskStatus::Claimed.as_str(), "CLAIMED");
+        assert_eq!(TaskStatus::ApprovalRequested.as_str(), "APPROVAL_REQUESTED");
+        assert_eq!(TaskStatus::Approved.as_str(), "APPROVED");
         assert_eq!(TaskStatus::Running.as_str(), "RUNNING");
         assert_eq!(TaskStatus::Paused.as_str(), "PAUSED");
+        assert_eq!(TaskStatus::PendingAcceptance.as_str(), "PENDING_ACCEPTANCE");
+        assert_eq!(TaskStatus::Accepted.as_str(), "ACCEPTED");
         assert_eq!(TaskStatus::Done.as_str(), "DONE");
         assert_eq!(TaskStatus::Failed.as_str(), "FAILED");
+        assert_eq!(TaskStatus::ManualReview.as_str(), "MANUAL_REVIEW");
         assert_eq!(TaskStatus::Canceled.as_str(), "CANCELED");
+    }
+
+    #[test]
+    fn task_status_filter_parser_accepts_all_current_statuses() {
+        let cases = [
+            ("open", TaskStatus::Open),
+            ("CLAIMED", TaskStatus::Claimed),
+            ("approval_requested", TaskStatus::ApprovalRequested),
+            ("approved", TaskStatus::Approved),
+            ("running", TaskStatus::Running),
+            ("paused", TaskStatus::Paused),
+            ("pending_acceptance", TaskStatus::PendingAcceptance),
+            ("accepted", TaskStatus::Accepted),
+            ("done", TaskStatus::Done),
+            ("failed", TaskStatus::Failed),
+            ("manual_review", TaskStatus::ManualReview),
+            ("canceled", TaskStatus::Canceled),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(TaskStatus::parse_filter(raw), Some(expected));
+        }
+
+        assert_eq!(TaskStatus::parse_filter("not_a_status"), None);
     }
 
     #[test]
@@ -474,6 +780,10 @@ mod tests {
     fn infer_task_priority_uses_version_bands_for_bootstrap_plan() {
         assert_eq!(
             infer_task_priority("[0.1.0] 搭建服务端骨架"),
+            Some(TaskPriority::High)
+        );
+        assert_eq!(
+            infer_task_priority("[0.1.0.2] 最小服务端"),
             Some(TaskPriority::High)
         );
         assert_eq!(
@@ -501,7 +811,17 @@ mod tests {
         let tasks = seed_tasks_from_agents_markdown(markdown, Uuid::nil());
 
         assert_eq!(tasks.len(), 2);
-        assert!(tasks[0].title.contains("[0.1.0] Rust 工作区"));
+        assert!(tasks[0].title.contains("[0.1.0.1] Rust 工作区"));
+        assert!(tasks[1].title.contains("[0.1.0.2] 最小服务端"));
+    }
+
+    #[test]
+    fn extract_task_version_supports_child_suffixes() {
+        assert_eq!(
+            extract_task_version("[0.1.0.2] 最小服务端"),
+            Some("0.1.0.2".into())
+        );
+        assert_eq!(extract_task_version("[0.1] 非法版本"), None);
     }
 
     #[test]
@@ -533,12 +853,12 @@ mod tests {
         let tasks = seed_tasks_from_agents_markdown(&markdown, Uuid::nil());
         let titles: Vec<&str> = tasks.iter().map(|task| task.title.as_str()).collect();
 
-        assert!(titles.contains(&"[0.1.5] 后台 Web 壳"));
-        assert!(titles.contains(&"[0.1.5] 项目配置"));
-        assert!(titles.contains(&"[0.1.5] 人员与能力管理"));
-        assert!(titles.contains(&"[0.1.5] Agent 与 Runtime 状态"));
-        assert!(titles.contains(&"[0.1.5] 系统监控面板"));
-        assert!(titles.contains(&"[0.1.5] 审计和风险中心第一版"));
-        assert!(titles.contains(&"[0.1.5] 计费与部署配置视图"));
+        assert!(titles.contains(&"[0.1.5.1] 后台 Web 壳"));
+        assert!(titles.contains(&"[0.1.5.2] 项目配置"));
+        assert!(titles.contains(&"[0.1.5.3] 人员与能力管理"));
+        assert!(titles.contains(&"[0.1.5.4] Agent 与 Runtime 状态"));
+        assert!(titles.contains(&"[0.1.5.5] 系统监控面板"));
+        assert!(titles.contains(&"[0.1.5.6] 审计和风险中心第一版"));
+        assert!(titles.contains(&"[0.1.5.7] 计费与部署配置视图"));
     }
 }

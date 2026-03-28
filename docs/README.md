@@ -50,6 +50,14 @@
   - 工作区边界、危险操作策略、Git 标签、回滚策略和审计要求。
 - `delivery-plan.md`
   - MVP 切片、里程碑与建议实施顺序。
+- `clawteam-reference-gap-analysis.md`
+  - 对比 ClawTeam / ClawTeam-OpenClaw 与 Spotlight 的目标差距，沉淀可借鉴的 4 类执行内核能力、当前实现缺陷与改进建议。
+- `clawteam-adoption-todo.md`
+  - 把 ClawTeam 与 Network-AI 的借鉴收敛成可执行路线图，包含执行层与协调治理层的波次顺序、完成定义、`main.rs` 模块化收口计划与当前进行中的 TODO。
+- `network-ai-reference-gap-analysis.md`
+  - 对比 Network-AI 与 Spotlight 的目标差距，沉淀原子共享状态、权限治理、预算熔断、journey 合规和项目上下文包等协调治理层借鉴点。
+- `workspace-serialization-transition-2026-03-28.md`
+  - 记录从“全局串行”过渡到“按工作区串行”的临时决策、实现范围、风险边界与后续重构顺序。
 
 ## 建议阅读顺序
 
@@ -76,3 +84,7 @@
 21. `ai-insight-slices-0.1.7.md`
 22. `security-and-audit.md`
 23. `delivery-plan.md`
+24. `clawteam-reference-gap-analysis.md`
+25. `clawteam-adoption-todo.md`
+26. `network-ai-reference-gap-analysis.md`
+27. `workspace-serialization-transition-2026-03-28.md`

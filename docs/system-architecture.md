@@ -153,6 +153,7 @@ Current minimum read-model endpoint:
 Bootstrap note:
 
 - the `0.1.x` self-hosting implementation still persists runtime state in `.spotlight/server-state.json` before the database migration is complete
+- the bootstrap state file now includes minimal `task_run_history` records with run state, attempts, linked threads, and pre-run snapshot references
 - task/session/thread recovery semantics and the current watchdog rules are documented in `runtime-session-and-task-recovery-v1.md`
 
 ## 4. Execution Model

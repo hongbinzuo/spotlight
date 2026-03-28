@@ -159,6 +159,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .section-head h4 { margin: 0; }
     .create-box { display: grid; gap: 8px; margin-bottom: 14px; }
+    .stack-flow {
+      display: grid;
+      gap: 12px;
+    }
     .task-list {
       display: grid;
       gap: 8px;
@@ -193,6 +197,49 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .description { white-space: pre-wrap; line-height: 1.6; color: #3c3228; }
     .detail-layout { display: grid; gap: 12px; }
+    .task-action-card {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: #fffdf9;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .fold-panel {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: #fffdf9;
+      overflow: hidden;
+    }
+    .fold-panel summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 14px 16px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: rgba(201, 123, 40, 0.06);
+    }
+    .fold-panel summary::-webkit-details-marker {
+      display: none;
+    }
+    .fold-panel summary::after {
+      content: "展开";
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .fold-panel[open] summary::after {
+      content: "收起";
+    }
+    .fold-body {
+      padding: 14px 16px 16px;
+      border-top: 1px solid rgba(0,0,0,0.06);
+    }
+    .fold-body > :last-child {
+      margin-bottom: 0;
+    }
     .two-col {
       display: grid;
       gap: 12px;
@@ -224,6 +271,18 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .copy-feedback {
       min-height: 18px;
       font-size: 12px;
+    }
+    .detail-search {
+      min-width: 220px;
+      max-width: 320px;
+    }
+    .detail-mode-hint {
+      margin: -2px 0 2px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .view-hidden {
+      display: none !important;
     }
     .log-item {
       padding-bottom: 10px;
@@ -412,6 +471,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       background: #f2f7ff;
       border-color: rgba(82, 124, 199, 0.24);
     }
+    .flow-entry.good {
+      background: #f3fbf6;
+      border-color: rgba(42, 138, 92, 0.28);
+    }
     .entry-head {
       display: flex;
       justify-content: space-between;
@@ -437,6 +500,35 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       font-size: 13px;
       max-height: 180px;
       overflow: auto;
+    }
+    .output-summary {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: #fffdf9;
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+    .output-summary.live {
+      background: #f3fbf6;
+      border-color: rgba(42, 138, 92, 0.32);
+    }
+    .output-summary.warn {
+      background: #fff7ec;
+      border-color: rgba(208, 124, 50, 0.32);
+    }
+    .output-summary.error {
+      background: #fff0ed;
+      border-color: rgba(183, 58, 58, 0.28);
+    }
+    .output-summary strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 16px;
+    }
+    .search-result-hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
     }
     .flow-entry .entry-body {
       line-height: 1.35;
@@ -524,83 +616,109 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
       <div class="panel-body">
         <div id="projectCard" class="project-card"></div>
+        <div id="decisionInbox" class="task-action-card" style="display:none;"></div>
         <div id="summary" class="summary"></div>
-        <div class="create-box">
-          <input id="title" placeholder="任务标题" />
-          <textarea id="description" placeholder="请输入任务描述、范围、上下文，或者你想补充给 Agent 的说明"></textarea>
-          <button onclick="createTask()">新增任务</button>
+        <div id="taskActionPanel" class="task-action-card"></div>
+        <div class="section-head" style="margin-bottom:10px;">
+          <h4>任务列表</h4>
+          <div class="inline-actions">
+            <select id="taskStatusFilter" onchange="changeTaskStatusFilter(this.value)" style="min-width:150px;">
+              <option value="ALL">全部状态</option>
+              <option value="OPEN">待处理</option>
+              <option value="CLAIMED">已认领</option>
+              <option value="APPROVAL_REQUESTED">待审批</option>
+              <option value="APPROVED">已批准</option>
+              <option value="RUNNING">运行中</option>
+              <option value="PAUSED">已暂停</option>
+              <option value="PENDING_ACCEPTANCE">待验收</option>
+              <option value="ACCEPTED">已验收</option>
+              <option value="DONE">已完成</option>
+              <option value="FAILED">失败</option>
+              <option value="MANUAL_REVIEW">人工复核</option>
+              <option value="CANCELED">已撤销</option>
+            </select>
+          </div>
         </div>
+        <div id="taskListHint" class="muted" style="margin-bottom:10px;"></div>
         <div id="tasks" class="task-list"></div>
+        <details class="fold-panel">
+          <summary>新增任务与补充输入</summary>
+          <div class="fold-body">
+            <div class="create-box" style="margin-bottom:0;">
+              <input id="title" placeholder="任务标题" />
+              <textarea id="description" placeholder="请输入任务描述、范围、上下文，或者你想补充给 Agent 的说明"></textarea>
+              <button onclick="createTask()">新增任务</button>
+            </div>
+          </div>
+        </details>
       </div>
     </section>
     <section class="panel">
       <div class="panel-header">
         <h2>Agent 面板</h2>
         <div class="toolbar">
+          <input
+            id="detailSearchInput"
+            class="detail-search"
+            placeholder="搜索当前任务输出 / 活动"
+            oninput="updateDetailSearch(this.value)"
+          />
+          <button id="simpleModeButton" class="secondary" onclick="setDetailMode('simple')">简洁模式</button>
+          <button id="diagnosticModeButton" class="secondary" onclick="setDetailMode('diagnostic')">诊断模式</button>
           <button class="secondary" onclick="loadBoard()">刷新状态</button>
         </div>
       </div>
       <div class="panel-body">
         <div class="detail-layout">
-          <div class="two-col">
+          <div id="detailModeHint" class="detail-mode-hint muted"></div>
+          <div class="stack-flow">
             <div class="detail-card">
-              <h4>项目目录与扫描</h4>
-              <div id="projectContextCard"></div>
+              <div id="taskDetail"></div>
             </div>
-            <div class="detail-card">
-              <h4>项目会话</h4>
-              <div id="projectSessionCard"></div>
-            </div>
-          </div>
-          <div class="detail-card">
-            <div id="taskDetail"></div>
-          </div>
-          <div class="two-col">
             <div class="detail-card">
               <h4>执行概览</h4>
               <div id="taskExecutionOverview" class="muted">请选择任务后查看执行状态。</div>
             </div>
             <div class="detail-card">
-              <h4>最近输出</h4>
+              <h4>关键输出</h4>
               <div id="runtimeStream" class="stream-feed muted">这里会高亮显示最新的实时输出、命令结果和错误。</div>
-            </div>
-          </div>
-          <div class="two-col">
-            <div class="detail-card">
-              <h4>任务操作</h4>
-              <div style="display:grid; gap:8px;">
-                <select id="agentSelect"></select>
-                <textarea id="promptBox" placeholder="这里可以输入启动提示词，或者在暂停后补充新的提示词再恢复"></textarea>
-                <div class="inline-actions">
-                  <button onclick="claimSelected()">认领</button>
-                  <button class="success" onclick="startSelected()">开始执行</button>
-                  <button class="warn" onclick="pauseSelected()">暂停</button>
-                  <button class="warn" onclick="cancelSelected()">撤销任务</button>
-                  <button class="secondary" onclick="resumeSelected()">补充后恢复</button>
-                </div>
-                <button class="secondary" onclick="toggleSelectedAgentAutoMode()">切换当前 Agent 自动认领</button>
-              </div>
             </div>
             <div class="detail-card">
               <h4>Agent 状态</h4>
               <div id="agents" class="agents"></div>
             </div>
-          </div>
-          <div class="detail-card">
-            <div class="section-head">
-              <h4>会话日志</h4>
-              <div class="inline-actions">
-                <span id="runtimeLogCopyFeedback" class="copy-feedback muted" aria-live="polite"></span>
-                <button id="scrollRuntimeLogTopButton" class="secondary" type="button" onclick="scrollRuntimeLogTop()" disabled>滚到顶部</button>
-                <button id="scrollRuntimeLogBottomButton" class="secondary" type="button" onclick="scrollRuntimeLogBottom()" disabled>滚到底部</button>
-                <button id="copyRuntimeLogButton" class="secondary" type="button" onclick="copyRuntimeLog()" disabled>复制日志</button>
+            <details id="projectSessionPanel" class="fold-panel">
+              <summary>项目会话与聊天室</summary>
+              <div class="fold-body">
+                <div id="projectSessionCard"></div>
               </div>
-            </div>
-            <textarea id="runtimeLog" class="log log-textarea muted" readonly spellcheck="false">请选择左侧任务后查看日志。</textarea>
-          </div>
-          <div class="detail-card">
-            <h4>状态流转与活动</h4>
-            <div id="activityLog" class="log flow-log muted">暂无活动。</div>
+            </details>
+            <details class="fold-panel">
+              <summary>项目上下文与辅助配置</summary>
+              <div class="fold-body">
+                <div id="projectContextCard"></div>
+              </div>
+            </details>
+            <details id="runtimeLogPanel" class="fold-panel diagnostic-only">
+              <summary>详细日志</summary>
+              <div class="fold-body">
+                <div class="section-head">
+                  <div class="inline-actions">
+                    <span id="runtimeLogCopyFeedback" class="copy-feedback muted" aria-live="polite"></span>
+                    <button id="scrollRuntimeLogTopButton" class="secondary" type="button" onclick="scrollRuntimeLogTop()" disabled>滚到顶部</button>
+                    <button id="scrollRuntimeLogBottomButton" class="secondary" type="button" onclick="scrollRuntimeLogBottom()" disabled>滚到底部</button>
+                    <button id="copyRuntimeLogButton" class="secondary" type="button" onclick="copyRuntimeLog()" disabled>复制日志</button>
+                  </div>
+                </div>
+                <textarea id="runtimeLog" class="log log-textarea muted" readonly spellcheck="false">请选择左侧任务后查看日志。</textarea>
+              </div>
+            </details>
+            <details id="activityLogPanel" class="fold-panel diagnostic-only">
+              <summary>状态流转与活动</summary>
+              <div class="fold-body">
+                <div id="activityLog" class="log flow-log muted">暂无活动。</div>
+              </div>
+            </details>
           </div>
         </div>
       </div>
@@ -635,8 +753,28 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let projectContext = emptyProjectContext();
     let projectSummary = emptyProjectSummary();
     const UI_FOCUS_STORAGE_KEY = "spotlight.ui.focus.v1";
+    const UI_DETAIL_MODE_STORAGE_KEY = "spotlight.ui.detail-mode.v1";
+    const UI_TASK_FILTER_STORAGE_KEY = "spotlight.ui.task-status-filter.v1";
+    const ALL_TASK_STATUS_FILTER = "ALL";
+    const EXPECTED_FEEDBACK_CONSTRAINTS = [
+      {
+        stableKey: "project_constraint/user-feedback-log-visibility",
+        title: "日志展示"
+      },
+      {
+        stableKey: "project_constraint/user-feedback-versioning",
+        title: "任务编号唯一"
+      },
+      {
+        stableKey: "project_constraint/user-feedback-client-governance",
+        title: "治理状态前置暴露"
+      }
+    ];
     const PARENT_FOCUS_MESSAGE_SOURCE = "spotlight-board-focus";
     const initialFocusState = readInitialFocusState();
+    let detailMode = readStoredDetailMode();
+    let detailSearchQuery = "";
+    let selectedTaskStatusFilter = readStoredTaskStatusFilter();
     let selectedProjectId = initialFocusState.projectId;
     let selectedTaskId = initialFocusState.taskId;
     let selectedAgentIdState = null;
@@ -737,6 +875,73 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
+    function readStoredDetailMode() {
+      try {
+        const stored = window.localStorage.getItem(UI_DETAIL_MODE_STORAGE_KEY);
+        return stored === "diagnostic" ? "diagnostic" : "simple";
+      } catch (_) {
+        return "simple";
+      }
+    }
+
+    function normalizeTaskStatusFilter(value) {
+      const normalized = String(value || "").trim().toUpperCase();
+      return [
+        ALL_TASK_STATUS_FILTER,
+        "OPEN",
+        "CLAIMED",
+        "APPROVAL_REQUESTED",
+        "APPROVED",
+        "RUNNING",
+        "PAUSED",
+        "PENDING_ACCEPTANCE",
+        "ACCEPTED",
+        "DONE",
+        "FAILED",
+        "MANUAL_REVIEW",
+        "CANCELED"
+      ].includes(normalized) ? normalized : ALL_TASK_STATUS_FILTER;
+    }
+
+    function readStoredTaskStatusFilter() {
+      try {
+        return normalizeTaskStatusFilter(window.localStorage.getItem(UI_TASK_FILTER_STORAGE_KEY));
+      } catch (_) {
+        return ALL_TASK_STATUS_FILTER;
+      }
+    }
+
+    function persistTaskStatusFilter() {
+      try {
+        window.localStorage.setItem(UI_TASK_FILTER_STORAGE_KEY, selectedTaskStatusFilter);
+      } catch (_) {
+        // 忽略本地筛选偏好持久化失败
+      }
+    }
+
+    function persistDetailMode() {
+      try {
+        window.localStorage.setItem(UI_DETAIL_MODE_STORAGE_KEY, detailMode);
+      } catch (_) {
+        // 忽略本地偏好持久化失败
+      }
+    }
+
+    function setDetailMode(mode) {
+      detailMode = mode === "diagnostic" ? "diagnostic" : "simple";
+      persistDetailMode();
+      render();
+    }
+
+    function isDiagnosticMode() {
+      return detailMode === "diagnostic";
+    }
+
+    function updateDetailSearch(value) {
+      detailSearchQuery = String(value || "").trim();
+      render();
+    }
+
     function statusLabel(status) {
       return {
         OPEN: "待处理",
@@ -751,6 +956,37 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     function selectedProject() {
       return board.projects.find(project => project.id === selectedProjectId) || null;
+    }
+
+    function statusLabel(status) {
+      return {
+        OPEN: "待处理",
+        CLAIMED: "已认领",
+        RUNNING: "运行中",
+        PAUSED: "已暂停",
+        DONE: "已完成",
+        FAILED: "失败",
+        CANCELED: "已撤销",
+        ACCEPTED: "已验收"
+      }[status] || status || "未知状态";
+    }
+
+    function taskStatusFilterLabel(status = selectedTaskStatusFilter) {
+      return {
+        ALL: "全部状态",
+        OPEN: "待处理",
+        CLAIMED: "已认领",
+        APPROVAL_REQUESTED: "待审批",
+        APPROVED: "已批准",
+        RUNNING: "运行中",
+        PAUSED: "已暂停",
+        PENDING_ACCEPTANCE: "待验收",
+        ACCEPTED: "已验收",
+        DONE: "已完成",
+        FAILED: "失败",
+        MANUAL_REVIEW: "人工复核",
+        CANCELED: "已撤销"
+      }[normalizeTaskStatusFilter(status)] || "全部状态";
     }
 
     function selectedTask() {
@@ -882,12 +1118,141 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return "assistant";
     }
 
+    function runtimeFragmentIsTiny(message) {
+      const text = String(message || "").trim();
+      return text && text.length <= 24 && !text.includes("\n");
+    }
+
+    function joinRuntimeFragments(fragments) {
+      return (fragments || []).reduce((combined, fragment) => {
+        const next = String(fragment || "");
+        if (!next) return combined;
+        if (!combined) return next;
+        if (combined.endsWith("\n") || next.startsWith("\n")) {
+          return `${combined}${next}`;
+        }
+        if (runtimeFragmentIsTiny(fragment)) {
+          return `${combined}${next}`;
+        }
+        return `${combined}\n${next}`;
+      }, "");
+    }
+
+    function groupedRuntimeEntryLabel(kinds) {
+      const labels = [...new Set((kinds || []).filter(Boolean))].map(runtimeEntryLabel);
+      if (!labels.length) return "未知输出";
+      if (labels.length === 1) return labels[0];
+      return `连续输出（${labels.join(" / ")}）`;
+    }
+
+    function groupedRuntimeEntryTone(kinds) {
+      const uniqueKinds = [...new Set((kinds || []).filter(Boolean))];
+      if (uniqueKinds.some(kind => ["error", "stderr"].includes(kind))) return "error";
+      if (uniqueKinds.some(kind => ["watchdog", "system"].includes(kind))) return "warn";
+      if (uniqueKinds.some(kind => ["command", "plan"].includes(kind))) return "command";
+      return "assistant";
+    }
+
+    function groupRuntimeEntries(entries, options = {}) {
+      const burstWindowMs = Number(options.burstWindowMs || 12000);
+      const maxCharsPerGroup = Number(options.maxCharsPerGroup || 1200);
+      const normalizedEntries = (entries || []).filter(item =>
+        item && String(item.message || "").trim()
+      );
+      const groups = [];
+
+      normalizedEntries.forEach(item => {
+        const kind = item.kind || "system";
+        const message = String(item.message || "");
+        const at = item.at || null;
+        const atMs = parseTimestamp(at)?.getTime() || 0;
+        const lastGroup = groups[groups.length - 1];
+        const shouldStartNewGroup = !lastGroup
+          || (atMs && lastGroup.lastAtMs && (atMs - lastGroup.lastAtMs) > burstWindowMs)
+          || lastGroup.totalChars >= maxCharsPerGroup;
+
+        if (shouldStartNewGroup) {
+          groups.push({
+            at,
+            atMs,
+            lastAt: at,
+            lastAtMs: atMs,
+            totalChars: 0,
+            segments: []
+          });
+        }
+
+        const currentGroup = groups[groups.length - 1];
+        currentGroup.lastAt = at;
+        currentGroup.lastAtMs = atMs;
+        currentGroup.totalChars += message.length;
+
+        const lastSegment = currentGroup.segments[currentGroup.segments.length - 1];
+        if (lastSegment && lastSegment.kind === kind) {
+          lastSegment.fragments.push(message);
+          return;
+        }
+
+        currentGroup.segments.push({
+          kind,
+          fragments: [message]
+        });
+      });
+
+      return groups.map(group => {
+        const kinds = group.segments.map(segment => segment.kind);
+        const singleKind = [...new Set(kinds)].length === 1;
+        const message = group.segments
+          .map(segment => {
+            const text = joinRuntimeFragments(segment.fragments);
+            return singleKind ? text : `[${runtimeEntryLabel(segment.kind)}]\n${text}`;
+          })
+          .join("\n\n");
+
+        return {
+          kind: singleKind ? kinds[0] : "mixed",
+          kinds,
+          label: groupedRuntimeEntryLabel(kinds),
+          tone: groupedRuntimeEntryTone(kinds),
+          message,
+          at: group.lastAt,
+          atMs: group.lastAtMs
+        };
+      });
+    }
+
     function activityTone(kind) {
       if (!kind) return "";
       if (kind.includes("error") || kind.includes("failed")) return "error";
+      if (kind.includes("done") || kind.includes("completed")) return "good";
       if (kind.includes("watchdog") || kind.includes("pause") || kind.includes("canceled")) return "warn";
+      if (kind.includes("lost")) return "warn";
       if (kind.includes("auto") || kind.includes("retry") || kind.includes("resume")) return "auto";
       return "";
+    }
+
+    function activityEntryLabel(kind) {
+      return {
+        "task.seeded": "任务已播种",
+        "task.created": "任务已创建",
+        "task.auto_claimed": "系统自动认领",
+        "task.auto_started": "系统自动启动",
+        "task.auto_resumed": "系统自动恢复",
+        "task.auto_retry_queued": "系统已排入自动重试",
+        "task.watchdog_recovered": "Watchdog 已回收任务",
+        "task.pause_requested": "已请求暂停",
+        "task.paused": "任务已暂停",
+        "task.resume_requested": "已请求恢复",
+        "task.resumed": "任务已恢复",
+        "task.runtime_session_lost": "运行会话已丢失",
+        "task.done": "任务已完成",
+        "task.canceled": "任务已取消",
+        "agent.invoked": "已调用 Agent",
+        "runtime.thread_started": "已建立长会话",
+        "runtime.turn_completed": "当前轮次已完成",
+        "runtime.error": "运行时错误",
+        "runtime.exited": "运行进程已退出"
+      }[kind] || kind || "未命名活动";
     }
 
     function lastInterestingActivity(task) {
@@ -1035,6 +1400,22 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return "仍需人工盯看与补位";
     }
 
+    function learnedFeedbackConstraintSummary(summary) {
+      const learnedKeys = new Set(
+        (summary?.active_constraints || [])
+          .map(item => String(item?.stable_key || ""))
+          .filter(key => key.startsWith("project_constraint/user-feedback-"))
+      );
+      const learned = EXPECTED_FEEDBACK_CONSTRAINTS.filter(item => learnedKeys.has(item.stableKey));
+      const missing = EXPECTED_FEEDBACK_CONSTRAINTS.filter(item => !learnedKeys.has(item.stableKey));
+      return {
+        total: EXPECTED_FEEDBACK_CONSTRAINTS.length,
+        learned,
+        missing,
+        score: ratio(learned.length, EXPECTED_FEEDBACK_CONSTRAINTS.length)
+      };
+    }
+
     function projectGovernanceMetrics(tasks, summary) {
       const currentTasks = Array.isArray(tasks) ? tasks : [];
       const executableTasks = currentTasks.filter(task => !["DONE", "CANCELED"].includes(task.status));
@@ -1058,14 +1439,23 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const autoRunCoverage = ratio(autoManagedCount, executableTasks.length);
       const recoveryCoverage = ratio(recoveryConsistentCount, recoverableTasks.length);
       const evolutionCoverage = ratio(evolutionCount, doneTasks.length);
-      const overall = (stateConfidence + autoRunCoverage + recoveryCoverage + evolutionCoverage) / 4;
+      const feedbackLearning = learnedFeedbackConstraintSummary(summary);
+      const overall = (
+        stateConfidence
+        + autoRunCoverage
+        + recoveryCoverage
+        + evolutionCoverage
+        + feedbackLearning.score
+      ) / 5;
 
       return {
         overall,
         overall_label: governanceLabel(overall),
         counts: {
           attention: attentionCount,
-          unmanaged_open: unmanagedOpenCount
+          unmanaged_open: unmanagedOpenCount,
+          learned_feedback: feedbackLearning.learned.length,
+          missing_feedback: feedbackLearning.missing.length
         },
         metrics: [
           {
@@ -1086,14 +1476,22 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             score: recoveryCoverage,
             detail: `${recoveryConsistentCount}/${recoverableTasks.length || 0} 个活跃/可恢复任务状态自洽`
           },
-          {
-            key: "evolution",
-            title: "自动进化沉淀率",
-            score: evolutionCoverage,
-            detail: `${evolutionCount}/${doneTasks.length || 0} 个已完成任务已有摘要或记忆沉淀`
-          }
-        ]
-      };
+            {
+              key: "evolution",
+              title: "自动进化沉淀率",
+              score: evolutionCoverage,
+              detail: `${evolutionCount}/${doneTasks.length || 0} 个已完成任务已有摘要或记忆沉淀`
+            },
+            {
+              key: "feedback-learning",
+              title: "反馈学习覆盖",
+              score: feedbackLearning.score,
+              detail: feedbackLearning.missing.length
+                ? `${feedbackLearning.learned.length}/${feedbackLearning.total} 条关键用户反馈已沉淀；仍缺 ${feedbackLearning.missing.map(item => item.title).join("、")}`
+                : `已沉淀 ${feedbackLearning.learned.length}/${feedbackLearning.total} 条关键用户反馈规则`
+            }
+          ]
+        };
     }
 
     function taskRecoverySuggestion(task) {
@@ -1129,40 +1527,136 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return "等待自动调度或按优先级进入下一轮推进。";
     }
 
+    function searchMatches(value, query = detailSearchQuery) {
+      const text = String(value || "").toLowerCase();
+      const pattern = String(query || "").trim().toLowerCase();
+      if (!pattern) return true;
+      return text.includes(pattern);
+    }
+
+    function filterRuntimeEntries(entries, query = detailSearchQuery) {
+      return (entries || []).filter(item =>
+        searchMatches(item?.kind, query) || searchMatches(item?.message, query)
+      );
+    }
+
+    function filterFlowEntries(entries, query = detailSearchQuery) {
+      return (entries || []).filter(item =>
+        searchMatches(item?.kind, query) || searchMatches(item?.message, query)
+      );
+    }
+
+    function taskPrimaryOutput(task) {
+      const runtimeEntries = groupRuntimeEntries(taskRuntimeEntries(task)).reverse();
+      const preferredRuntime = runtimeEntries.find(item =>
+        ["assistant", "error", "stderr", "command", "plan", "mixed"].includes(item.kind)
+        && String(item.message || "").trim()
+      );
+      if (preferredRuntime) {
+        return {
+          source: preferredRuntime.label || runtimeEntryLabel(preferredRuntime.kind),
+          message: preferredRuntime.message,
+          at: preferredRuntime.at,
+          kind: preferredRuntime.kind
+        };
+      }
+      const activity = lastInterestingActivity(task);
+      if (activity) {
+        return {
+          source: activity.kind,
+          message: activity.message,
+          at: activity.at,
+          kind: "activity"
+        };
+      }
+      return null;
+    }
+
+    function taskFreshness(task) {
+      const latestOutputAt = parseTimestamp(taskPrimaryOutput(task)?.at);
+      const latestActivityAt = parseTimestamp(lastInterestingActivity(task)?.at);
+      const latestAt = latestOutputAt || latestActivityAt;
+      if (!latestAt) {
+        return { tone: "warn", label: "暂无最新信号", detail: "还没有输出或活动记录。" };
+      }
+
+      const ageMs = Math.max(0, Date.now() - latestAt.getTime());
+      const ageMinutes = Math.floor(ageMs / 60000);
+      if (ageMinutes <= 2) {
+        return { tone: "live", label: "最新输出活跃", detail: `${relativeTime(Math.floor(latestAt.getTime() / 1000))} 仍有信号` };
+      }
+      if (ageMinutes <= 15) {
+        return { tone: "live", label: "最近刚更新", detail: `${relativeTime(Math.floor(latestAt.getTime() / 1000))} 有新信号` };
+      }
+      if (ageMinutes <= 60) {
+        return { tone: "warn", label: "输出暂时停住", detail: `最近一次信号在 ${ageMinutes} 分钟前` };
+      }
+      return { tone: "error", label: "长时间无新信号", detail: `最近一次信号在 ${ageMinutes} 分钟前` };
+    }
+
+    function renderDetailToolbar() {
+      const searchInput = document.getElementById("detailSearchInput");
+      const simpleModeButton = document.getElementById("simpleModeButton");
+      const diagnosticModeButton = document.getElementById("diagnosticModeButton");
+      const hint = document.getElementById("detailModeHint");
+      if (searchInput) {
+        searchInput.value = detailSearchQuery;
+      }
+      if (simpleModeButton) {
+        simpleModeButton.disabled = detailMode === "simple";
+      }
+      if (diagnosticModeButton) {
+        diagnosticModeButton.disabled = detailMode === "diagnostic";
+      }
+      if (hint) {
+        hint.textContent = detailMode === "diagnostic"
+          ? "诊断模式：显示详细日志、状态流转与项目会话；可用搜索框筛选当前任务日志。"
+          : "简洁模式：默认只看状态依据、执行概览和关键输出；详细日志与活动流转已折叠到诊断模式。";
+      }
+    }
+
+    function applyDetailModeLayout() {
+      document.querySelectorAll(".diagnostic-only").forEach(element => {
+        element.classList.toggle("view-hidden", !isDiagnosticMode());
+      });
+      document.querySelectorAll(".simple-secondary").forEach(element => {
+        element.classList.toggle("view-hidden", !isDiagnosticMode());
+      });
+      const runningWindow = document.getElementById("runningTasksWindow");
+      if (runningWindow) {
+        runningWindow.classList.toggle("view-hidden", !isDiagnosticMode());
+      }
+    }
+
+    function importantFlowActivity(item) {
+      const kind = String(item?.kind || "");
+      if (!kind || kind === "task.auto_claim_reason") {
+        return false;
+      }
+      return kind.startsWith("task.") || kind.startsWith("runtime.") || kind.startsWith("agent.");
+    }
+
     function taskFlowEntries(task) {
-      const flowKinds = [
-        "task.auto_claimed",
-        "task.auto_started",
-        "task.auto_resumed",
-        "task.auto_retry_queued",
-        "task.watchdog_recovered",
-        "task.canceled",
-        "task.pause_requested",
-        "task.resumed",
-        "task.resume_requested",
-        "agent.invoked",
-        "runtime.thread_started",
-        "runtime.turn_completed",
-        "runtime.error",
-        "runtime.exited"
-      ];
       return [...(task?.activities || [])]
-        .filter(item => flowKinds.includes(item.kind))
+        .filter(importantFlowActivity)
         .slice(-12)
         .reverse();
     }
 
     function taskLiveEntries(task) {
-      return taskRuntimeEntries(task)
-        .filter(item => ["assistant", "command", "plan", "stderr", "error", "watchdog", "system"].includes(item.kind))
-        .slice(-10)
+      return groupRuntimeEntries(
+        taskRuntimeEntries(task)
+          .filter(item => ["assistant", "command", "plan", "stderr", "error", "watchdog", "system"].includes(item.kind))
+          .slice(-40)
+      )
+        .slice(-6)
         .reverse();
     }
 
     function visibleActiveTasks() {
-      const statusRank = { RUNNING: 0, CLAIMED: 1, PAUSED: 2 };
+      const statusRank = { RUNNING: 0, CLAIMED: 1 };
       return board.tasks
-        .filter(task => ["RUNNING", "CLAIMED", "PAUSED"].includes(task.status))
+        .filter(task => ["RUNNING", "CLAIMED"].includes(task.status))
         .slice()
         .sort((left, right) => {
           const statusDelta = (statusRank[left.status] ?? 99) - (statusRank[right.status] ?? 99);
@@ -1178,16 +1672,62 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         });
     }
 
+    function visibleRecoverableTasks() {
+      return board.tasks
+        .filter(task => task.status === "PAUSED")
+        .slice()
+        .sort((left, right) => {
+          const leftPulse = parseTimestamp(taskLastRuntimeEntry(left)?.at)
+            || parseTimestamp(lastInterestingActivity(left)?.at);
+          const rightPulse = parseTimestamp(taskLastRuntimeEntry(right)?.at)
+            || parseTimestamp(lastInterestingActivity(right)?.at);
+          return rightPulse - leftPulse;
+        });
+    }
+
     function tasksForCurrentProject() {
       return board.tasks.filter(task => task.project_id === selectedProjectId);
     }
 
+    function taskMatchesStatusFilter(task, status = selectedTaskStatusFilter) {
+      const normalized = normalizeTaskStatusFilter(status);
+      return normalized === ALL_TASK_STATUS_FILTER || task?.status === normalized;
+    }
+
+    function filteredTasksForCurrentProject(status = selectedTaskStatusFilter) {
+      return tasksForCurrentProject().filter(task => taskMatchesStatusFilter(task, status));
+    }
+
+    function preferredTaskFromList(tasks) {
+      return tasks.find(task => ["RUNNING", "CLAIMED"].includes(task.status))
+        || tasks.find(task => task.status === "PAUSED")
+        || tasks[0]
+        || null;
+    }
+
+    function syncSelectedTaskForCurrentProject() {
+      const visibleTasks = filteredTasksForCurrentProject();
+      if (visibleTasks.some(task => task.id === selectedTaskId)) {
+        return;
+      }
+      selectedTaskId = preferredTaskFromList(visibleTasks)?.id || null;
+    }
+
+    function syncTaskStatusFilterControl() {
+      const select = document.getElementById("taskStatusFilter");
+      if (select) {
+        select.value = selectedTaskStatusFilter;
+      }
+    }
+
     function preferredProjectId() {
-      const activeTask = board.tasks.find(task =>
-        ["RUNNING", "CLAIMED", "PAUSED"].includes(task.status)
-      );
+      const activeTask = board.tasks.find(task => ["RUNNING", "CLAIMED"].includes(task.status));
       if (activeTask) {
         return activeTask.project_id;
+      }
+      const recoverableTask = board.tasks.find(task => task.status === "PAUSED");
+      if (recoverableTask) {
+        return recoverableTask.project_id;
       }
 
       return board.projects.find(project => !project.is_spotlight_self)?.id || board.projects[0]?.id || null;
@@ -1197,11 +1737,24 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return url.startsWith("/api/") ? url.replace(/^\/api/, API_PREFIX) : url;
     }
 
+    function normalizeRequestError(error) {
+      const message = String(error?.message || error || "").trim();
+      if (/failed to fetch|networkerror|load failed/i.test(message)) {
+        return "本地服务暂时不可用，请稍后重试。";
+      }
+      return message || "请求失败";
+    }
+
     async function request(url, options = {}) {
-      const response = await fetch(apiUrl(url), {
-        headers: { "Content-Type": "application/json" },
-        ...options
-      });
+      let response;
+      try {
+        response = await fetch(apiUrl(url), {
+          headers: { "Content-Type": "application/json" },
+          ...options
+        });
+      } catch (error) {
+        throw new Error(normalizeRequestError(error));
+      }
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || "请求失败");
@@ -1222,16 +1775,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (!selectedProjectId || !board.projects.some(project => project.id === selectedProjectId)) {
           selectedProjectId = preferredProjectId();
         }
-        const currentTasks = tasksForCurrentProject();
-        if (!selectedTaskId || !currentTasks.some(task => task.id === selectedTaskId)) {
-          selectedTaskId = currentTasks.find(task => ["RUNNING", "CLAIMED", "PAUSED"].includes(task.status))?.id
-            || currentTasks[0]?.id
-            || null;
-        }
+        syncSelectedTaskForCurrentProject();
         if (!selectedAgentIdState || !board.agents.some(agent => agent.id === selectedAgentIdState)) {
           selectedAgentIdState = board.agents[0]?.id || null;
         }
         await loadProjectContext(selectedProjectId);
+        await loadDecisions();
         persistFocusState();
         render();
       } catch (error) {
@@ -1366,16 +1915,24 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
-    async function startProjectSession() {
+    async function startProjectSession(mode = "general") {
       if (!selectedProjectId) return;
-      const prompt = window.prompt("请输入想发给 Agent 的项目问题：");
+      const modeLabel = sessionModeLabel(mode);
+      const prompt = window.prompt(
+        mode === "planner"
+          ? "请输入想交给规划器的目标："
+          : mode === "evaluator"
+            ? "请输入想交给评估器检查的范围："
+            : "请输入想发给 Agent 的项目问题："
+      );
       if (!prompt || !prompt.trim()) return;
-      const title = window.prompt("请输入本轮会话标题（可选）：", "") || "";
+      const title = window.prompt(`请输入本轮${modeLabel}标题（可选）：`, "") || "";
       try {
         await request(`/api/projects/${selectedProjectId}/sessions`, {
           method: "POST",
           body: JSON.stringify({
             title: title.trim() || null,
+            mode: mode,
             prompt: prompt.trim()
           })
         });
@@ -1542,11 +2099,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function selectedAgentId() {
-      return document.getElementById("agentSelect").value;
+      return document.getElementById("agentSelect")?.value || board.agents[0]?.id || "";
     }
 
     function selectedAgentName() {
       const select = document.getElementById("agentSelect");
+      if (!select) {
+        return board.agents[0]?.name || "本地 Codex Agent";
+      }
       return select.options[select.selectedIndex]?.dataset.name || "本地 Codex Agent";
     }
 
@@ -1558,7 +2118,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     async function startSelected() {
       if (!selectedTaskId) return;
-      const prompt = document.getElementById("promptBox").value.trim();
+      const prompt = document.getElementById("promptBox")?.value.trim() || "";
       try {
         await request(`/api/tasks/${selectedTaskId}/start/${selectedAgentId()}`, {
           method: "POST",
@@ -1600,7 +2160,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     async function resumeSelected() {
       if (!selectedTaskId) return;
-      const prompt = document.getElementById("promptBox").value.trim();
+      const prompt = document.getElementById("promptBox")?.value.trim() || "";
       if (!prompt) {
         alert("请先输入补充提示词，再恢复任务。");
         return;
@@ -1615,10 +2175,261 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       await loadBoard();
     }
 
+    async function reassessSelected() {
+      if (!selectedTaskId) return;
+      try {
+        const data = await request(`/api/v1/tasks/${selectedTaskId}/reassess`, { method: "POST" });
+        if (data.action === "skip") {
+          alert(`无需评估：${data.skip_reason}`);
+          return;
+        }
+        const rd = data.rule_decision || {};
+        const msg = [
+          `规则引擎判断：${rd.decision || "未知"}`,
+          `置信度：${rd.confidence || "?"}`,
+          `原因：${rd.reason || "无"}`,
+          rd.resume_hint ? `恢复建议：${rd.resume_hint}` : null,
+          "",
+          "完整评估提示词已生成，可复制给 Agent 执行深度评估。",
+          "是否将规则引擎的判断立即应用？"
+        ].filter(Boolean).join("\n");
+        if (confirm(msg)) {
+          await applyReassessDecision(selectedTaskId, rd.decision, rd.resume_hint);
+        }
+      } catch (error) {
+        alert("重评估失败：" + (error.message || error));
+      }
+    }
+
+    async function applyReassessDecision(taskId, decision, resumeHint) {
+      if (!decision) return;
+      switch (decision) {
+        case "DONE":
+          // 用 cancel 接口的逻辑暂时替代，后续可加专用接口
+          await request(`/api/tasks/${taskId}/cancel`, {
+            method: "POST",
+            body: JSON.stringify({ reason: "重评估判定：代码库已体现该任务成果，标记为已完成" })
+          });
+          break;
+        case "CANCELED":
+          await request(`/api/tasks/${taskId}/cancel`, {
+            method: "POST",
+            body: JSON.stringify({ reason: "重评估判定：任务目标已被取消或替代" })
+          });
+          break;
+        case "RESTART":
+          if (resumeHint) {
+            await request(`/api/tasks/${taskId}/resume/${selectedAgentId()}`, {
+              method: "POST",
+              body: JSON.stringify({
+                agent_name_hint: selectedAgentName(),
+                prompt: resumeHint
+              })
+            });
+          }
+          break;
+        case "REOPEN":
+        case "MANUAL_REVIEW":
+        default:
+          alert(`判定为 ${decision}，需要人工处理。`);
+          break;
+      }
+      await loadBoard();
+    }
+
+    async function reassessProject() {
+      if (!selectedProjectId) return;
+      try {
+        const data = await request(`/api/v1/projects/${selectedProjectId}/reassess`, { method: "POST" });
+        const summary = data.summary || {};
+        const lines = [`需要评估：${summary.total_needs_reassess || 0} 个任务`, `已跳过：${summary.total_skipped || 0} 个任务`];
+        if (data.needs_reassess?.length) {
+          lines.push("", "需评估任务：");
+          for (const item of data.needs_reassess) {
+            const rd = item.rule_decision || {};
+            lines.push(`  - [${rd.decision}] ${item.title}：${rd.reason || ""}`);
+          }
+        }
+        alert(lines.join("\n"));
+        await loadBoard();
+      } catch (error) {
+        alert("项目评估失败：" + (error.message || error));
+      }
+    }
+
     function formatRuntimeEntries(entries) {
-      return entries
-        .map(item => `[${item.kind}]\n${item.message}`)
+      return groupRuntimeEntries(entries, { burstWindowMs: 12000, maxCharsPerGroup: 2400 })
+        .map(item => `[${item.label || runtimeEntryLabel(item.kind)}]\n${item.message}`)
         .join("\n\n");
+    }
+
+    // ─── 决策收件箱 ────────────────────────────────────────────────
+
+    let pendingDecisions = [];
+
+    async function loadDecisions() {
+      try {
+        const data = await request(`/api/v1/decisions`);
+        pendingDecisions = data.pending || [];
+      } catch (error) {
+        pendingDecisions = [];
+      }
+    }
+
+    function renderDecisionInbox() {
+      const root = document.getElementById("decisionInbox");
+      if (!root) return;
+
+      if (!pendingDecisions.length) {
+        root.style.display = "none";
+        return;
+      }
+
+      root.style.display = "";
+      const urgencyIcon = { high: "\u{1f534}", medium: "\u{1f7e1}", low: "\u{1f7e2}" };
+      const cards = pendingDecisions.map(d => {
+        const icon = urgencyIcon[d.urgency] || "\u{2b55}";
+        const rec = d.recommended
+          ? `<span class="pill" style="font-size:11px;">推荐：${escapeHtml(d.recommended)} (${(d.confidence * 100).toFixed(0)}%)</span>`
+          : "";
+        const buttons = (d.options || []).map(opt => {
+          const cls = opt.style === "success" ? "success"
+            : opt.style === "warn" ? "warn"
+            : opt.style === "danger" ? "warn"
+            : "secondary";
+          return `<button class="${cls}" onclick="resolveDecision('${d.id}','${opt.id}')" style="font-size:12px;padding:4px 10px;">${escapeHtml(opt.label)}</button>`;
+        }).join(" ");
+
+        return `<div style="padding:8px 0;border-bottom:1px solid var(--border);">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span>${icon}</span>
+            <strong style="flex:1;">${escapeHtml(d.title)}</strong>
+            ${rec}
+          </div>
+          <div class="muted" style="margin:4px 0;font-size:12px;">${escapeHtml(d.context || "").slice(0,120)}</div>
+          <div class="inline-actions" style="margin-top:4px;">${buttons}</div>
+        </div>`;
+      }).join("");
+
+      const batchBtn = pendingDecisions.length > 1
+        ? `<button class="secondary" onclick="batchResolveDecisions()" style="font-size:12px;">全部按推荐处理</button>`
+        : "";
+
+      root.innerHTML = `
+        <div class="section-head">
+          <h4>\u{1f4e5} 决策收件箱 (${pendingDecisions.length})</h4>
+          ${batchBtn}
+        </div>
+        ${cards}
+      `;
+    }
+
+    async function resolveDecision(decisionId, chosenOption) {
+      try {
+        await request(`/api/v1/decisions/${decisionId}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ chosen_option: chosenOption })
+        });
+        await loadDecisions();
+        await loadBoard();
+      } catch (error) {
+        alert("处理决策失败：" + (error.message || error));
+      }
+    }
+
+    async function batchResolveDecisions() {
+      const count = pendingDecisions.filter(d => d.recommended && d.confidence >= 0.7).length;
+      if (!confirm(`将按推荐自动处理 ${count} 个决策（置信度 >= 70%），确认？`)) return;
+      try {
+        const data = await request("/api/v1/decisions/batch-resolve", {
+          method: "POST",
+          body: JSON.stringify({ mode: "recommended", min_confidence: 0.7 })
+        });
+        alert(`已处理 ${data.resolved_count} 个，跳过 ${data.skipped_count} 个`);
+        await loadDecisions();
+        await loadBoard();
+      } catch (error) {
+        alert("批量处理失败：" + (error.message || error));
+      }
+    }
+
+    // ─── 原有功能 ──────────────────────────────────────────────────
+
+    function renderDecisionInbox() {
+      const root = document.getElementById("decisionInbox");
+      if (!root) return;
+
+      if (!pendingDecisions.length) {
+        root.style.display = "none";
+        return;
+      }
+
+      root.style.display = "";
+      const urgencyIcon = { high: "\u{1f534}", medium: "\u{1f7e1}", low: "\u{1f7e2}" };
+      const cards = pendingDecisions.map(d => {
+        const icon = urgencyIcon[d.urgency] || "\u{2b55}";
+        const recommendation = d.recommended
+          ? `<span class="pill" style="font-size:11px;">推荐：${escapeHtml(d.recommended)} (${((d.confidence || 0) * 100).toFixed(0)}%)</span>`
+          : "";
+        const buttons = (d.options || []).map(opt => {
+          const cls = opt.style === "success" ? "success"
+            : opt.style === "warn" ? "warn"
+            : opt.style === "danger" ? "warn"
+            : "secondary";
+          return `<button class="${cls}" onclick="resolveDecision('${d.id}','${opt.id}')" style="font-size:12px;padding:4px 10px;">${escapeHtml(opt.label)}</button>`;
+        }).join(" ");
+
+        return `<div style="padding:8px 0;border-bottom:1px solid var(--border);">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span>${icon}</span>
+            <strong style="flex:1;">${escapeHtml(d.title)}</strong>
+            ${recommendation}
+          </div>
+          <div class="muted" style="margin:4px 0;font-size:12px;white-space:pre-wrap;">${escapeHtml(d.context || "")}</div>
+          <div class="inline-actions" style="margin-top:4px;">${buttons}</div>
+        </div>`;
+      }).join("");
+
+      const batchButton = pendingDecisions.length > 1
+        ? `<button class="secondary" onclick="batchResolveDecisions()" style="font-size:12px;">全部按推荐处理</button>`
+        : "";
+
+      root.innerHTML = `
+        <div class="section-head">
+          <h4>\u{1f4e5} 决策收件箱 (${pendingDecisions.length})</h4>
+          ${batchButton}
+        </div>
+        ${cards}
+      `;
+    }
+
+    async function resolveDecision(decisionId, chosenOption) {
+      try {
+        await request(`/api/v1/decisions/${decisionId}/resolve`, {
+          method: "POST",
+          body: JSON.stringify({ chosen_option: chosenOption })
+        });
+        await loadDecisions();
+        await loadBoard();
+      } catch (error) {
+        alert(`处理决策失败：${error.message || error}`);
+      }
+    }
+
+    async function batchResolveDecisions() {
+      const count = pendingDecisions.filter(d => d.recommended && d.confidence >= 0.7).length;
+      if (!confirm(`将按推荐自动处理 ${count} 个决策（置信度 >= 70%），确认？`)) return;
+      try {
+        const data = await request("/api/v1/decisions/batch-resolve", {
+          method: "POST",
+          body: JSON.stringify({ mode: "recommended", min_confidence: 0.7 })
+        });
+        alert(`已处理 ${data.resolved_count} 个，跳过 ${data.skipped_count} 个`);
+        await loadDecisions();
+        await loadBoard();
+      } catch (error) {
+        alert(`批量处理失败：${error.message || error}`);
+      }
     }
 
     function projectSessionLiveEntries(session) {
@@ -1863,8 +2674,41 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           if (!revision) return null;
           return { item, revision };
         })
-        .filter(Boolean)
-        .sort((left, right) => String(left.revision.title || "").localeCompare(String(right.revision.title || ""), "zh-CN"));
+          .filter(Boolean)
+          .sort((left, right) => String(left.revision.title || "").localeCompare(String(right.revision.title || ""), "zh-CN"));
+    }
+
+    function feedbackConstraintsFromEntries(entries) {
+      const currentEntries = Array.isArray(entries) ? entries : [];
+      const learnedKeys = new Set(
+        currentEntries
+          .map(entry => String(entry?.item?.stable_key || ""))
+          .filter(key => key.startsWith("project_constraint/user-feedback-"))
+      );
+      const learned = EXPECTED_FEEDBACK_CONSTRAINTS.filter(item => learnedKeys.has(item.stableKey));
+      const missing = EXPECTED_FEEDBACK_CONSTRAINTS.filter(item => !learnedKeys.has(item.stableKey));
+      return {
+        total: EXPECTED_FEEDBACK_CONSTRAINTS.length,
+        learned,
+        missing
+      };
+    }
+
+    function looksCorruptedText(value) {
+      const text = String(value || "").trim();
+      if (!text) return false;
+      const questionMarks = (text.match(/\?/g) || []).length;
+      return questionMarks >= Math.max(3, Math.ceil(text.length * 0.3));
+    }
+
+    function displayConstraintTitle(entry) {
+      const title = String(entry?.revision?.title || "").trim();
+      return looksCorruptedText(title) ? "历史导入约束（标题待修复）" : title || "未命名约束";
+    }
+
+    function displayConstraintStableKey(entry) {
+      const stableKey = String(entry?.item?.stable_key || "").trim();
+      return looksCorruptedText(stableKey) ? "内部键已隐藏" : stableKey || "未命名约束";
     }
 
     function recentProjectTaskSummaries(projectId, limit = 4) {
@@ -1911,11 +2755,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         return;
       }
 
-      const scan = projectContext.latest_scan;
-      const workspace = projectContext.primary_workspace;
-      const pendingQuestions = pendingQuestionsForCurrentProject();
-      const constraints = activeProjectConstraints(project.id);
-      const taskSummaries = recentProjectTaskSummaries(project.id, 4);
+        const scan = projectContext.latest_scan;
+        const workspace = projectContext.primary_workspace;
+        const pendingQuestions = pendingQuestionsForCurrentProject();
+        const constraints = activeProjectConstraints(project.id);
+        const feedbackLearning = feedbackConstraintsFromEntries(constraints);
+        const taskSummaries = recentProjectTaskSummaries(project.id, 4);
       const scanBlock = scan ? `
         <div class="meta">
           <span class="pill">最近扫描 ${escapeHtml(formatUnixTime(scan.scanned_at))}</span>
@@ -1930,15 +2775,26 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="muted" style="margin-top:4px;">提示：${escapeHtml(scan.notes.join("；") || "暂无")}</div>
       ` : `<div class="muted">还没有项目扫描摘要。接入目录后可以直接扫描，用于后续项目问答和任务拆解。</div>`;
 
-      const constraintsBlock = `
-        <div class="detail-card" style="margin-top:12px; padding:12px;">
-          <div class="section-head">
-            <h4>当前有效项目约束</h4>
-            <span class="pill">${constraints.length} 条</span>
-          </div>
-          <div class="create-box" style="margin-bottom:12px;">
-            <input
-              placeholder="约束标题，例如：保留移动端入口"
+        const constraintsBlock = `
+          <div class="detail-card" style="margin-top:12px; padding:12px;">
+            <div class="section-head">
+              <h4>当前有效项目约束</h4>
+              <span class="pill">${constraints.length} 条</span>
+            </div>
+            <div class="state-panel ${feedbackLearning.missing.length ? "warn" : ""}" style="margin:0 0 12px;">
+              <div class="meta">
+                <span class="pill">用户反馈学习</span>
+                <span class="pill">${feedbackLearning.learned.length}/${feedbackLearning.total}</span>
+              </div>
+              <div class="status-reason">
+                ${escapeHtml(feedbackLearning.missing.length
+                  ? `已学会 ${feedbackLearning.learned.map(item => item.title).join("、") || "暂无"}；仍缺 ${feedbackLearning.missing.map(item => item.title).join("、")} 这几类长期规则。`
+                  : "三类关键用户反馈规则都已沉淀到长期约束，后续 client / agent 应默认带着这些规则工作。")}
+              </div>
+            </div>
+            <div class="create-box" style="margin-bottom:12px;">
+              <input
+                placeholder="约束标题，例如：保留移动端入口"
               value="${escapeHtml(constraintDraft.title)}"
               oninput="constraintDraft.title = this.value"
             />
@@ -1950,19 +2806,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <button class="secondary" onclick="saveProjectConstraint()">沉淀项目约束</button>
             </div>
           </div>
-          ${constraints.length ? constraints.map(entry => `
-            <article class="message" style="margin-bottom:8px;">
-              <div class="message-meta">
-                <strong>${escapeHtml(entry.revision.title)}</strong>
-                <span>${escapeHtml(formatUnixTime(entry.revision.created_at))}</span>
-              </div>
-              <div class="description">${escapeHtml(entry.revision.content)}</div>
-              <div class="meta">
-                <span class="pill">修订 ${escapeHtml(String(entry.revision.revision_no || 1))}</span>
-                <span class="pill">${escapeHtml(entry.item.stable_key || "未命名约束")}</span>
-              </div>
-            </article>
-          `).join("") : `<div class="muted">当前还没有沉淀到记忆层的长期项目约束。</div>`}
+            ${constraints.length ? constraints.map(entry => `
+              <article class="message" style="margin-bottom:8px;">
+                <div class="message-meta">
+                  <strong>${escapeHtml(displayConstraintTitle(entry))}</strong>
+                  <span>${escapeHtml(formatUnixTime(entry.revision.created_at))}</span>
+                </div>
+                <div class="description">${escapeHtml(entry.revision.content)}</div>
+                <div class="meta">
+                  <span class="pill">修订 ${escapeHtml(String(entry.revision.revision_no || 1))}</span>
+                  <span class="pill">${escapeHtml(displayConstraintStableKey(entry))}</span>
+                </div>
+              </article>
+            `).join("") : `<div class="muted">当前还没有沉淀到记忆层的长期项目约束。</div>`}
         </div>
       `;
 
@@ -2037,13 +2893,30 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       `;
     }
 
+    function sessionStatusLabel(status) {
+      return {
+        running: "运行中",
+        completed: "已完成",
+        failed: "失败",
+        paused: "已暂停"
+      }[status] || status || "未知状态";
+    }
+
+    function sessionModeLabel(mode) {
+      return {
+        planner: "规划器",
+        evaluator: "评估器",
+        general: "普通会话"
+      }[mode] || "普通会话";
+    }
+
     function renderProjectSessionCard() {
       const root = document.getElementById("projectSessionCard");
       const session = selectedProjectSession();
       const chatMessages = projectContext.chat_messages || [];
       const sessionOptions = projectContext.sessions.map(item => `
         <option value="${item.id}" ${item.id === selectedProjectSessionId ? "selected" : ""}>
-          ${escapeHtml(item.title)} / ${escapeHtml(sessionStatusLabel(item.status))}
+          ${escapeHtml(item.title)} / ${escapeHtml(sessionModeLabel(item.mode))} / ${escapeHtml(sessionStatusLabel(item.status))}
         </option>
       `).join("");
 
@@ -2051,7 +2924,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         ? session.messages.map(message => `
             <article class="message ${message.role === "user" ? "user" : "assistant"}">
               <div class="message-meta">
-                <strong>${escapeHtml(message.role === "user" ? "你" : "Agent")}</strong>
+                <strong>${escapeHtml(message.role === "user" ? "你" : sessionModeLabel(session.mode))}</strong>
                 <span>${escapeHtml(formatUnixTime(message.at))}</span>
               </div>
               <div class="description">${escapeHtml(message.content)}</div>
@@ -2097,13 +2970,16 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           </select>
         ` : ``}
         <div class="inline-actions" style="margin-bottom:12px;">
-          <button onclick="startProjectSession()">发起项目问答</button>
+          <button onclick="startProjectSession('general')">发起项目问答</button>
+          <button class="secondary" onclick="startProjectSession('planner')">启动规划器</button>
+          <button class="secondary" onclick="startProjectSession('evaluator')">启动评估器</button>
           <button class="secondary" onclick="continueProjectSession()" ${session ? "" : "disabled"}>
             继续追问
           </button>
         </div>
         ${session ? `
           <div class="meta" style="margin-bottom:8px;">
+            <span class="pill">${escapeHtml(sessionModeLabel(session.mode))}</span>
             <span class="pill">${escapeHtml(sessionStatusLabel(session.status))}</span>
             <span class="pill">${escapeHtml(session.workspace_path || "未绑定目录")}</span>
             ${session.last_error ? `<span class="pill">${escapeHtml(session.last_error)}</span>` : ``}
@@ -2134,17 +3010,22 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div class="muted" style="margin-top:4px;">${escapeHtml(workspace.path)}</div>
       `).join("");
+      const projectTaskCount = board.tasks.filter(task => task.project_id === project.id).length;
 
       root.innerHTML = `
         <h3>当前项目</h3>
         <select onchange="changeProject(this.value)">
           ${board.projects.map(projectItem => `
             <option value="${projectItem.id}" ${projectItem.id === selectedProjectId ? "selected" : ""}>
-              ${escapeHtml(projectItem.name)}
+              ${escapeHtml(projectItem.name)} · ${board.tasks.filter(task => task.project_id === projectItem.id).length} 个任务
             </option>
           `).join("")}
         </select>
         <p class="description" style="margin:10px 0 0;">${escapeHtml(project.description)}</p>
+        <div class="meta" style="margin-top:10px;">
+          <span class="pill">任务 ${projectTaskCount}</span>
+          <span class="pill">筛选 ${escapeHtml(taskStatusFilterLabel())}</span>
+        </div>
         <div style="margin-top:10px;">${workspaceLines}</div>
         <div class="toolbar" style="margin-top:12px;">
           <button onclick="exploreProject()">探索目录</button>
@@ -2156,11 +3037,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="toolbar" style="margin-top:8px;">
           <button class="secondary" onclick="createLocalBuildRestartTask()">本地编译重启</button>
           <button class="secondary" onclick="createCloudInstallRestartTask()">云端安装重启</button>
+          <button class="secondary" onclick="reassessProject()">项目全局评估</button>
         </div>
         <div class="muted" style="margin-top:10px;">
           ${project.is_spotlight_self
             ? "这是 Spotlight 自举项目，会自动从文档中生成版本任务；也可以直接生成本地编译或云端部署重启任务。"
-            : "这个项目目录可以是空的，也可以只有文档；点击“探索目录”会创建探索任务，也可以直接生成本地编译或云端部署重启任务。"}
+            : "这个项目目录可以是空的，也可以只有文档；点击\u{201c}探索目录\u{201d}会创建探索任务，也可以直接生成本地编译或云端部署重启任务。"}
         </div>
       `;
     }
@@ -2170,17 +3052,18 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const pendingQuestions = pendingQuestionsForCurrentProject();
       const summary = projectSummary?.project_id === selectedProjectId ? projectSummary : null;
       const governance = projectGovernanceMetrics(tasks, summary);
-      const counts = {
-        total: summary
-          ? summary.task_counts.open + summary.task_counts.claimed + summary.task_counts.running + summary.task_counts.paused + summary.task_counts.done + summary.task_counts.failed + summary.task_counts.canceled
-          : tasks.length,
-        open: summary ? summary.task_counts.open : tasks.filter(task => task.status === "OPEN").length,
-        active: summary
-          ? summary.task_counts.claimed + summary.task_counts.running + summary.task_counts.paused
-          : tasks.filter(task => ["CLAIMED", "RUNNING", "PAUSED"].includes(task.status)).length,
-        done: summary ? summary.task_counts.done : tasks.filter(task => task.status === "DONE").length,
-        canceled: summary ? summary.task_counts.canceled : tasks.filter(task => task.status === "CANCELED").length,
-        questions: summary ? summary.open_pending_question_count : pendingQuestions.length,
+        const counts = {
+          total: summary
+            ? summary.task_counts.open + summary.task_counts.claimed + summary.task_counts.running + summary.task_counts.paused + summary.task_counts.done + summary.task_counts.failed + summary.task_counts.canceled
+            : tasks.length,
+          open: summary ? summary.task_counts.open : tasks.filter(task => task.status === "OPEN").length,
+          active: summary
+            ? summary.task_counts.claimed + summary.task_counts.running
+            : tasks.filter(task => ["CLAIMED", "RUNNING"].includes(task.status)).length,
+          recoverable: summary ? summary.task_counts.paused : tasks.filter(task => task.status === "PAUSED").length,
+          done: summary ? summary.task_counts.done : tasks.filter(task => task.status === "DONE").length,
+          canceled: summary ? summary.task_counts.canceled : tasks.filter(task => task.status === "CANCELED").length,
+          questions: summary ? summary.open_pending_question_count : pendingQuestions.length,
         sessions: summary ? summary.session_summary.total : projectContext.sessions.length,
         agentsBusy: summary ? summary.agent_summary.busy : board.agents.filter(agent => agent.current_task_id).length,
         agentsAuto: summary ? summary.agent_summary.auto_mode_enabled : board.agents.filter(agent => agent.auto_mode).length
@@ -2192,29 +3075,100 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <small>${escapeHtml(metric.detail)}</small>
         </div>
       `).join("");
-      document.getElementById("summary").innerHTML = `
-        <div class="summary-box"><strong>${counts.total}</strong><span>任务总数</span></div>
-        <div class="summary-box"><strong>${counts.open}</strong><span>待处理</span></div>
-        <div class="summary-box"><strong>${counts.active}</strong><span>处理中</span></div>
-        <div class="summary-box"><strong>${counts.done}</strong><span>已完成</span></div>
-        <div class="summary-box"><strong>${counts.canceled}</strong><span>已撤销</span></div>
-        <div class="summary-box"><strong>${counts.questions}</strong><span>待回答问题</span></div>
+        document.getElementById("summary").innerHTML = `
+          <div class="summary-box"><strong>${counts.total}</strong><span>任务总数</span></div>
+          <div class="summary-box"><strong>${counts.open}</strong><span>待处理</span></div>
+          <div class="summary-box"><strong>${counts.active}</strong><span>处理中</span></div>
+          <div class="summary-box"><strong>${counts.recoverable}</strong><span>待恢复</span></div>
+          <div class="summary-box"><strong>${counts.done}</strong><span>已完成</span></div>
+          <div class="summary-box"><strong>${counts.canceled}</strong><span>已撤销</span></div>
+          <div class="summary-box"><strong>${counts.questions}</strong><span>待回答问题</span></div>
         <div class="summary-box"><strong>${counts.sessions}</strong><span>项目会话</span></div>
         <div class="summary-box"><strong>${counts.agentsBusy}/${counts.agentsAuto}</strong><span>忙碌 Agent / 自动模式</span></div>
         <div class="summary-box ${governanceTone(governance.overall)}">
           <strong>${percent(governance.overall)}%</strong>
           <span>自治指数</span>
-          <small>${escapeHtml(`${governance.overall_label}；待复核 ${governance.counts.attention} 个，裸 OPEN ${governance.counts.unmanaged_open} 个`)}</small>
+          <small>${escapeHtml(`${governance.overall_label}；待复核 ${governance.counts.attention} 个，裸 OPEN ${governance.counts.unmanaged_open} 个，已学会 ${governance.counts.learned_feedback}/3 条关键反馈规则`)}</small>
         </div>
         ${governanceBoxes}
       `;
     }
 
+    function renderTaskActionPanel() {
+      const root = document.getElementById("taskActionPanel");
+      if (!root) return;
+
+      const task = selectedTask();
+      if (!task || task.project_id !== selectedProjectId) {
+        root.innerHTML = `
+          <h4>当前任务操作</h4>
+          <div class="muted">先从下方任务列表里选择一个任务，这里再显示认领、开始、暂停和恢复操作。</div>
+        `;
+        return;
+      }
+
+      root.innerHTML = `
+        <div class="section-head">
+          <h4>当前任务操作</h4>
+          <span class="pill">${escapeHtml(statusLabel(task.status))}</span>
+        </div>
+        <div class="description" style="margin-bottom:8px;">${escapeHtml(task.title)}</div>
+        <div class="meta">
+          <span class="pill">${escapeHtml(taskPriorityLabel(task.priority))}</span>
+          <span class="pill">${escapeHtml(taskClaimLabel(task))}</span>
+          <span class="pill">${escapeHtml(taskExecutionPulse(task))}</span>
+        </div>
+        <div style="display:grid; gap:8px; margin-top:10px;">
+          <select id="agentSelect"></select>
+          <textarea id="promptBox" placeholder="启动任务时可选填提示词；恢复暂停任务时请补充恢复提示。"></textarea>
+          <div class="inline-actions">
+            <button onclick="claimSelected()">认领</button>
+            <button class="success" onclick="startSelected()">开始执行</button>
+            <button class="warn" onclick="pauseSelected()">暂停</button>
+            <button class="warn" onclick="cancelSelected()">撤销任务</button>
+            <button class="secondary" onclick="resumeSelected()">补充后恢复</button>
+            <button class="secondary" onclick="reassessSelected()">重新评估</button>
+          </div>
+          <button class="secondary" onclick="toggleSelectedAgentAutoMode()">切换当前 Agent 自动认领</button>
+        </div>
+      `;
+    }
+
     function renderTaskList() {
-      const tasks = tasksForCurrentProject();
+      syncTaskStatusFilterControl();
+      const project = selectedProject();
+      const allTasks = tasksForCurrentProject();
+      const tasks = filteredTasksForCurrentProject();
       const root = document.getElementById("tasks");
+      const hint = document.getElementById("taskListHint");
+
+      if (!project) {
+        if (hint) {
+          hint.textContent = "当前还没有可切换的项目。";
+        }
+        root.innerHTML = `<div class="detail-card muted">当前还没有项目，因此无法显示任务列表。</div>`;
+        return;
+      }
+
+      if (hint) {
+        const baseHint = allTasks.length
+          ? `当前筛选“${taskStatusFilterLabel()}”，显示 ${tasks.length}/${allTasks.length} 个任务。`
+          : "当前项目还没有任务，可以先创建任务或探索目录。";
+        const emptyWorkspaceHint = projectContext.latest_scan?.top_level_entries?.length === 0
+          ? " 当前项目目录看起来是空的也没关系，仍然可以先扫描目录、探索目录，或直接创建占位任务。"
+          : !project.workspace_roots.length
+            ? " 当前还没有接入目录；即使目录暂时为空，也可以先接入再扫描。"
+            : "";
+        hint.textContent = `${baseHint}${emptyWorkspaceHint}`;
+      }
+
+      if (!allTasks.length) {
+        root.innerHTML = `<div class="detail-card muted">当前项目还没有任务，可以手动创建，也可以先点击\u{201c}探索目录\u{201d}。即使项目目录暂时为空，也可以先接入目录并扫描。</div>`;
+        return;
+      }
+
       if (!tasks.length) {
-        root.innerHTML = `<div class="detail-card muted">当前项目还没有任务，可以手动创建，或先点击“探索目录”。</div>`;
+        root.innerHTML = `<div class="detail-card muted">当前项目共有 ${allTasks.length} 个任务，但没有符合“${escapeHtml(taskStatusFilterLabel())}”的任务。可以切换筛选，或回到“全部状态”继续查看。</div>`;
         return;
       }
       root.innerHTML = tasks.map(task => `
@@ -2269,6 +3223,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const lastEntry = taskLastRuntimeEntry(task);
       const lastActivity = lastInterestingActivity(task);
       const lastError = task.runtime?.last_error;
+      const primaryOutput = taskPrimaryOutput(task);
+      const freshness = taskFreshness(task);
+      const filteredLiveEntries = filterRuntimeEntries(liveEntries);
+      const filteredRuntimeEntries = filterRuntimeEntries(runtimeEntries);
+      const filteredFlowEntries = filterFlowEntries(flowEntries);
       const stateReason = taskStateReason(task) || "服务端尚未生成状态快照。";
       const stateEvidence = taskStateEvidence(task);
       const evaluatedAt = taskStateEvaluatedAt(task);
@@ -2313,7 +3272,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="insight-card ${lastError ? "error" : ""}">
             <div class="muted">最新脉冲</div>
             <strong>${escapeHtml(taskExecutionPulse(task))}</strong>
-            <div class="muted">${escapeHtml(lastEntry ? runtimeEntryLabel(lastEntry.kind) : lastActivity?.kind || "暂无")}</div>
+            <div class="muted">${escapeHtml(freshness.detail)}</div>
           </div>
           <div class="insight-card ${task.runtime?.active_turn_id ? "" : "warn"}">
             <div class="muted">长会话状态</div>
@@ -2328,50 +3287,72 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
       `;
 
-      runtimeStream.className = `stream-feed ${liveEntries.length ? "" : "muted"}`;
-      runtimeStream.innerHTML = liveEntries.length
-        ? liveEntries.map(item => `
-            <div class="stream-entry ${runtimeEntryTone(item.kind)}">
+      runtimeStream.className = `stream-feed ${filteredLiveEntries.length || primaryOutput ? "" : "muted"}`;
+      runtimeStream.innerHTML = `
+        <div class="output-summary ${freshness.tone}">
+          <div class="section-head">
+            <h4>${escapeHtml(freshness.label)}</h4>
+            <span class="pill">${escapeHtml(primaryOutput?.at ? formatTimestamp(primaryOutput.at) : "暂无时间")}</span>
+          </div>
+          <strong>${escapeHtml(primaryOutput ? `${primaryOutput.source}` : "当前没有关键输出")}</strong>
+          <div class="description">${escapeHtml(primaryOutput?.message || "先看状态依据和恢复建议；一旦出现新的回答、命令或错误，这里会优先显示。")}</div>
+          <div class="search-result-hint">
+            ${escapeHtml(detailSearchQuery
+              ? `搜索\u{201c}${detailSearchQuery}\u{201d}后，关键输出区下方显示 ${filteredLiveEntries.length}/${liveEntries.length} 条匹配记录。`
+              : "默认只展示最近且最重要的输出；更多原始日志请切到诊断模式。")}
+          </div>
+        </div>
+        ${filteredLiveEntries.length
+          ? filteredLiveEntries.map(item => `
+            <div class="stream-entry ${item.tone || runtimeEntryTone(item.kind)}">
               <div class="entry-head">
-                <span class="entry-title">${escapeHtml(runtimeEntryLabel(item.kind))}</span>
+                <span class="entry-title">${escapeHtml(item.label || runtimeEntryLabel(item.kind))}</span>
                 <span>${escapeHtml(formatTimestamp(item.at))}</span>
               </div>
               <div class="entry-body">${escapeHtml(item.message)}</div>
             </div>
           `).join("")
-        : "当前还没有实时输出。任务一旦开始产生回答、命令或错误，会优先显示在这里。";
+          : `<div class="muted">${escapeHtml(detailSearchQuery ? "当前搜索条件下没有匹配输出。" : "当前还没有实时输出。任务一旦开始产生回答、命令或错误，会优先显示在这里。")}</div>`}
+      `;
 
       setRuntimeLogText(
-        runtimeEntries.length ? formatRuntimeEntries(runtimeEntries) : "当前任务还没有会话日志。",
-        !runtimeEntries.length,
-        runtimeEntries.length > 0
+        filteredRuntimeEntries.length ? formatRuntimeEntries(filteredRuntimeEntries) : (detailSearchQuery ? "当前搜索条件下没有匹配日志。" : "当前任务还没有会话日志。"),
+        !filteredRuntimeEntries.length,
+        filteredRuntimeEntries.length > 0
       );
 
-      activityLog.innerHTML = flowEntries.length
-        ? flowEntries.map(item => `
+      activityLog.innerHTML = filteredFlowEntries.length
+        ? filteredFlowEntries.map(item => `
             <div class="flow-entry ${activityTone(item.kind)}">
               <div class="entry-head">
-                <span class="entry-title">${escapeHtml(item.kind)}</span>
+                <span class="entry-title">${escapeHtml(activityEntryLabel(item.kind))}</span>
                 <span>${escapeHtml(formatTimestamp(item.at))}</span>
               </div>
+              <div class="muted" style="margin-bottom:4px;">${escapeHtml(item.kind)}</div>
               <div class="entry-body">${escapeHtml(item.message)}</div>
             </div>
           `).join("")
-        : "暂无活动。";
-      activityLog.className = `log flow-log ${flowEntries.length ? "" : "muted"}`;
+        : (detailSearchQuery ? "当前搜索条件下没有匹配活动。" : "暂无活动。");
+      activityLog.className = `log flow-log ${filteredFlowEntries.length ? "" : "muted"}`;
     }
 
     function renderRunningTasksWindow() {
       const root = document.getElementById("runningTasksWindow");
       if (!root) return;
       const activeTasks = visibleActiveTasks();
+      const recoverableTasks = visibleRecoverableTasks();
       root.innerHTML = `
         <div class="section-head">
-          <h4>运行任务窗口</h4>
-          <span class="pill">${activeTasks.length} 条</span>
+          <h4>执行队列窗口</h4>
+          <span class="pill">处理中 ${activeTasks.length} / 待恢复 ${recoverableTasks.length}</span>
         </div>
-        <div class="muted">这里单独显示运行中、已认领、已暂停待恢复的任务。点一下可直接跳到详情。</div>
+        <div class="muted">这里只把真正运行中的任务算进处理中；暂停任务单独归到待恢复，不再混在一起造成像并行执行。</div>
         <div class="running-window-list">
+          <div class="detail-card" style="padding:10px 12px;">
+            <div class="section-head">
+              <h4>当前处理</h4>
+              <span class="pill">${activeTasks.length} 条</span>
+            </div>
           ${activeTasks.length ? activeTasks.map(task => `
             <article class="running-window-item ${task.id === selectedTaskId ? "active" : ""}" onclick="selectTask('${task.id}')">
               <strong>${escapeHtml(task.title)}</strong>
@@ -2388,21 +3369,47 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 ${escapeHtml(`状态依据：${previewText(taskStateReason(task) || "等待服务端生成状态快照", 72)}`)}
               </div>
             </article>
-          `).join("") : `<div class="muted">当前没有运行中的任务，系统会从等待队列自动接下一条。</div>`}
+          `).join("") : `<div class="muted">当前没有运行中的任务，系统应只保留 0 或 1 条真正处理中任务。</div>`}
+          </div>
+          <div class="detail-card" style="padding:10px 12px;">
+            <div class="section-head">
+              <h4>待恢复</h4>
+              <span class="pill">${recoverableTasks.length} 条</span>
+            </div>
+            ${recoverableTasks.length ? recoverableTasks.map(task => `
+              <article class="running-window-item ${task.id === selectedTaskId ? "active" : ""}" onclick="selectTask('${task.id}')">
+                <strong>${escapeHtml(task.title)}</strong>
+                <div class="meta">
+                  <span class="pill">${statusLabel(task.status)}</span>
+                  <span class="pill">${escapeHtml(taskPriorityLabel(task.priority))}</span>
+                  <span class="pill">${escapeHtml(projectById(task.project_id)?.name || "未知项目")}</span>
+                </div>
+                <div class="task-item-summary">
+                  <div>${escapeHtml(taskClaimLabel(task))}</div>
+                  <div>最近脉冲：${escapeHtml(taskExecutionPulse(task))}</div>
+                </div>
+                <div class="status-reason">
+                  ${escapeHtml(`恢复依据：${previewText(taskStateReason(task) || "等待服务端生成状态快照", 72)}`)}
+                </div>
+              </article>
+            `).join("") : `<div class="muted">当前没有待恢复任务。</div>`}
+          </div>
         </div>
       `;
     }
 
     function renderAgents() {
       const select = document.getElementById("agentSelect");
-      select.innerHTML = board.agents.map(agent => `
-        <option value="${agent.id}" data-name="${escapeHtml(agent.name)}" ${agent.id === selectedAgentIdState ? "selected" : ""}>
-          ${escapeHtml(agent.name)} / ${escapeHtml(agent.status)}
-        </option>
-      `).join("");
-      select.onchange = () => {
-        selectedAgentIdState = select.value;
-      };
+      if (select) {
+        select.innerHTML = board.agents.map(agent => `
+          <option value="${agent.id}" data-name="${escapeHtml(agent.name)}" ${agent.id === selectedAgentIdState ? "selected" : ""}>
+            ${escapeHtml(agent.name)} / ${escapeHtml(agent.status)}
+          </option>
+        `).join("");
+        select.onchange = () => {
+          selectedAgentIdState = select.value;
+        };
+      }
 
       const root = document.getElementById("agents");
       root.innerHTML = board.agents.map(agent => `
@@ -2427,22 +3434,33 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const focusState = captureEditableFocus();
       renderNotice();
       renderHeaderAuth();
+      renderDetailToolbar();
       renderProjectContextCard();
       renderProjectSessionCard();
       renderProjectCard();
       renderSummary();
+      renderDecisionInbox();
+      renderTaskActionPanel();
       renderTaskList();
       renderAgents();
       renderDetail();
       renderRunningTasksWindow();
+      applyDetailModeLayout();
       restoreEditableFocus(focusState);
     }
 
     async function changeProject(projectId) {
       selectedProjectId = projectId;
-      const tasks = tasksForCurrentProject();
-      selectedTaskId = tasks[0]?.id || null;
+      syncSelectedTaskForCurrentProject();
       await loadProjectContext(projectId);
+      persistFocusState();
+      render();
+    }
+
+    function changeTaskStatusFilter(value) {
+      selectedTaskStatusFilter = normalizeTaskStatusFilter(value);
+      persistTaskStatusFilter();
+      syncSelectedTaskForCurrentProject();
       persistFocusState();
       render();
     }
@@ -2505,6 +3523,17 @@ mod layout_regression_tests {
         assert!(INDEX_HTML.contains("id=\"projectChatInput\""));
         assert!(INDEX_HTML.contains("发起项目问答"));
     }
+
+    #[test]
+    fn agent_panel_uses_two_column_board_with_folded_secondary_sections() {
+        assert!(INDEX_HTML.contains("id=\"taskActionPanel\" class=\"task-action-card\""));
+        assert!(INDEX_HTML.contains("<summary>新增任务与补充输入</summary>"));
+        assert!(INDEX_HTML.contains("<summary>项目会话与聊天室</summary>"));
+        assert!(INDEX_HTML.contains("<summary>项目上下文与辅助配置</summary>"));
+        assert!(INDEX_HTML.contains("id=\"projectSessionPanel\" class=\"fold-panel\""));
+        assert!(INDEX_HTML.contains("class=\"stack-flow\""));
+        assert!(!INDEX_HTML.contains("class=\"detail-workbench\""));
+    }
 }
 
 #[cfg(test)]
@@ -2532,6 +3561,17 @@ mod tests {
     }
 
     #[test]
+    fn runtime_output_groups_stream_fragments_before_rendering() {
+        assert!(INDEX_HTML.contains("function joinRuntimeFragments(fragments)"));
+        assert!(INDEX_HTML.contains("function groupRuntimeEntries(entries, options = {})"));
+        assert!(INDEX_HTML.contains("连续输出（${labels.join(\" / \")}）"));
+        assert!(INDEX_HTML.contains("item.label || runtimeEntryLabel(item.kind)"));
+        assert!(INDEX_HTML.contains(
+            "groupRuntimeEntries(entries, { burstWindowMs: 12000, maxCharsPerGroup: 2400 })"
+        ));
+    }
+
+    #[test]
     fn project_card_includes_local_and_cloud_restart_actions() {
         assert!(INDEX_HTML.contains("createLocalBuildRestartTask()"));
         assert!(INDEX_HTML.contains("createCloudInstallRestartTask()"));
@@ -2548,13 +3588,17 @@ mod tests {
         assert!(INDEX_HTML.contains("preferredProjectId()"));
         assert!(INDEX_HTML.contains("registerWorkspaceRoot()"));
         assert!(INDEX_HTML.contains("scanCurrentProject()"));
-        assert!(INDEX_HTML.contains("startProjectSession()"));
+        assert!(INDEX_HTML.contains("startProjectSession(mode = \"general\")"));
         assert!(INDEX_HTML.contains("continueProjectSession()"));
         assert!(INDEX_HTML.contains("sendProjectChatMessage()"));
         assert!(INDEX_HTML.contains("answerPendingQuestion("));
         assert!(INDEX_HTML.contains("saveProjectConstraint()"));
         assert!(INDEX_HTML.contains("setNotice("));
         assert!(INDEX_HTML.contains("projectSessionLiveEntries(session)"));
+        assert!(INDEX_HTML.contains("function sessionModeLabel(mode)"));
+        assert!(INDEX_HTML.contains("mode: mode"));
+        assert!(INDEX_HTML.contains("启动规划器"));
+        assert!(INDEX_HTML.contains("启动评估器"));
     }
 
     #[test]
@@ -2563,11 +3607,34 @@ mod tests {
             "const emptyProjectMemory = () => ({ items: [], revisions: [], tags: [], edges: [] })"
         ));
         assert!(INDEX_HTML.contains("当前有效项目约束"));
+        assert!(INDEX_HTML.contains("用户反馈学习"));
         assert!(INDEX_HTML.contains("最近任务摘要"));
         assert!(INDEX_HTML.contains("project/${projectId}/active-constraints"));
         assert!(INDEX_HTML.contains("task/${item.scope_id}/latest-summary"));
         assert!(INDEX_HTML.contains("/memory/constraints"));
         assert!(INDEX_HTML.contains("项目约束已写入版本化记忆"));
+    }
+
+    #[test]
+    fn task_board_supports_status_filter_state_and_empty_project_hints() {
+        assert!(INDEX_HTML.contains("id=\"taskStatusFilter\""));
+        assert!(INDEX_HTML.contains("id=\"taskListHint\""));
+        assert!(INDEX_HTML.contains("<option value=\"APPROVAL_REQUESTED\">待审批</option>"));
+        assert!(INDEX_HTML.contains("<option value=\"PENDING_ACCEPTANCE\">待验收</option>"));
+        assert!(INDEX_HTML.contains("<option value=\"MANUAL_REVIEW\">人工复核</option>"));
+        assert!(INDEX_HTML
+            .contains("const UI_TASK_FILTER_STORAGE_KEY = \"spotlight.ui.task-status-filter.v1\""));
+        assert!(INDEX_HTML.contains("function normalizeTaskStatusFilter(value)"));
+        assert!(INDEX_HTML.contains("APPROVAL_REQUESTED"));
+        assert!(INDEX_HTML.contains("PENDING_ACCEPTANCE"));
+        assert!(INDEX_HTML.contains("MANUAL_REVIEW"));
+        assert!(INDEX_HTML.contains(
+            "function filteredTasksForCurrentProject(status = selectedTaskStatusFilter)"
+        ));
+        assert!(INDEX_HTML.contains("function syncSelectedTaskForCurrentProject()"));
+        assert!(INDEX_HTML.contains("function changeTaskStatusFilter(value)"));
+        assert!(INDEX_HTML.contains("当前项目目录看起来是空的也没关系"));
+        assert!(INDEX_HTML.contains("没有符合“${escapeHtml(taskStatusFilterLabel())}”的任务"));
     }
 
     #[test]
@@ -2601,7 +3668,8 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"runningTasksWindow\""));
         assert!(INDEX_HTML.contains("renderRunningTasksWindow()"));
         assert!(INDEX_HTML.contains("状态流转与活动"));
-        assert!(INDEX_HTML.contains("运行任务窗口"));
+        assert!(INDEX_HTML.contains("执行队列窗口"));
+        assert!(INDEX_HTML.contains("待恢复"));
     }
 
     #[test]
@@ -2609,7 +3677,18 @@ mod tests {
         assert!(INDEX_HTML.contains("function taskStateSnapshot(task)"));
         assert!(INDEX_HTML.contains("function projectGovernanceMetrics(tasks, summary)"));
         assert!(INDEX_HTML.contains("自治指数"));
+        assert!(INDEX_HTML.contains("反馈学习覆盖"));
         assert!(INDEX_HTML.contains("状态依据"));
         assert!(INDEX_HTML.contains("需复核"));
+        assert!(INDEX_HTML.contains("<span>处理中</span>"));
+        assert!(INDEX_HTML.contains("<span>待恢复</span>"));
+        assert!(INDEX_HTML.contains("setDetailMode('simple')"));
+        assert!(INDEX_HTML.contains("setDetailMode('diagnostic')"));
+        assert!(INDEX_HTML.contains("id=\"detailSearchInput\""));
+        assert!(INDEX_HTML.contains("默认只展示最近且最重要的输出"));
+        assert!(INDEX_HTML.contains("function activityEntryLabel(kind)"));
+        assert!(INDEX_HTML.contains("function importantFlowActivity(item)"));
+        assert!(INDEX_HTML.contains("\"task.runtime_session_lost\": \"运行会话已丢失\""));
+        assert!(INDEX_HTML.contains("\"task.done\": \"任务已完成\""));
     }
 }

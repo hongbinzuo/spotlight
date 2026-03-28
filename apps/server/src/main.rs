@@ -1,9 +1,33 @@
+mod automation;
+mod completion;
+mod git_ops;
+mod handlers;
+mod models;
+mod prompt;
 mod runtime;
+mod server;
+mod snapshot;
+mod state;
+mod task_ops;
 mod ui;
+
+use automation::{
+    reconcile_parallel_active_tasks, reconcile_watchdog_state, run_automation_cycle_once,
+    select_next_auto_resume_task_id, start_background_automation,
+};
+use completion::*;
+use git_ops::*;
+use models::*;
+#[cfg(test)]
+use server::{build_api_router, parse_server_port};
+use server::{build_app, server_listen_addr};
+use state::{
+    default_agents, default_projects, default_state, default_users, load_or_initialize_state,
+    normalize_persisted_state,
+};
 
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -13,29 +37,26 @@ use axum::{
     extract::{Json as ExtractJson, Path as AxumPath, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use platform_core::{
-    infer_task_priority, merge_unique_tasks, new_activity, new_runtime_entry,
-    seed_tasks_from_agents_markdown, seed_tasks_from_docs, Agent, AgentInvocationRequest,
-    AgentResumeRequest, BoardSnapshot, CreateTaskRequest, PendingQuestion, Project,
-    RuntimeLogEntry, Task, TaskActivity, TaskPriority, TaskRuntime, TaskStateSnapshot, TaskStatus,
-    User, WorkspaceRoot,
+    merge_unique_tasks, new_activity, new_runtime_entry, seed_tasks_from_agents_markdown,
+    seed_tasks_from_docs, Agent, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
+    CreateTaskRequest, DecisionCard, PendingQuestion, Project, RuntimeLogEntry, Task, TaskActivity,
+    TaskAssignmentMode, TaskPriority, TaskRunAttemptRecord, TaskRunRecord, TaskRuntime,
+    TaskStateSnapshot, TaskStatus, User, WorkspaceRoot,
 };
-use runtime::{CodexRuntimeSession, RuntimeEvent};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use runtime::{ProviderRuntimeSession, RuntimeEvent};
 use tokio::{
-    process::Command,
     sync::{mpsc, Mutex},
-    time::{sleep, Duration},
+    time::{timeout, Duration},
 };
 use uuid::Uuid;
 
 type AppResult<T> = Result<T, (StatusCode, String)>;
 const AUTO_MAINTENANCE_INTERVAL_SECS: u64 = 5;
 const TASK_STALE_TIMEOUT_SECS: u64 = 300;
+const RUNTIME_OPERATION_TIMEOUT_SECS: u64 = 25;
 const BOARD_TASK_ACTIVITY_LIMIT: usize = 24;
 const BOARD_TASK_RUNTIME_LOG_LIMIT: usize = 24;
 const BOARD_MESSAGE_CHAR_LIMIT: usize = 2_000;
@@ -44,7 +65,7 @@ const BOARD_MESSAGE_CHAR_LIMIT: usize = 2_000;
 struct AppState {
     inner: Arc<Mutex<BoardState>>,
     runtime_mode: RuntimeMode,
-    runtime_sessions: Arc<Mutex<HashMap<Uuid, Arc<CodexRuntimeSession>>>>,
+    runtime_sessions: Arc<Mutex<HashMap<Uuid, Arc<ProviderRuntimeSession>>>>,
     store_path: PathBuf,
 }
 
@@ -54,6 +75,7 @@ struct BoardState {
     projects: Vec<Project>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
+    task_run_history: HashMap<Uuid, Vec<TaskRunRecord>>,
     pending_questions: Vec<PendingQuestion>,
     project_scans: HashMap<Uuid, ProjectScanSummary>,
     project_sessions: Vec<ProjectSession>,
@@ -62,381 +84,14 @@ struct BoardState {
     memory_revisions: Vec<MemoryRevision>,
     memory_tags: Vec<MemoryTag>,
     memory_edges: Vec<MemoryEdge>,
-}
-
-#[derive(Clone)]
-struct TaskExecutionContext {
-    workspace_root: PathBuf,
-    prompt: String,
-}
-
-struct ResolvedRuntimeSession {
-    session: Arc<CodexRuntimeSession>,
-    thread_id: String,
-    event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CloudInstallRestartTaskRequest {
-    host: String,
-    port: Option<u16>,
-    username: String,
-    auth_method: Option<String>,
-    credential_hint: Option<String>,
-    deploy_path: Option<String>,
-    service_hint: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct StackDetection {
-    stacks: Vec<&'static str>,
-    evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectScanSummary {
-    project_id: Uuid,
-    workspace_id: Uuid,
-    workspace_label: String,
-    workspace_path: String,
-    scanned_at: String,
-    stack_summary: String,
-    detected_stacks: Vec<String>,
-    top_level_entries: Vec<String>,
-    key_files: Vec<String>,
-    document_files: Vec<String>,
-    notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectSessionMessage {
-    role: String,
-    content: String,
-    at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectChatMessage {
-    id: Uuid,
-    project_id: Uuid,
-    user_id: Option<Uuid>,
-    user_display_name: String,
-    content: String,
-    at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectSession {
-    id: Uuid,
-    project_id: Uuid,
-    title: String,
-    status: String,
-    workspace_path: Option<String>,
-    thread_id: Option<String>,
-    active_turn_id: Option<String>,
-    messages: Vec<ProjectSessionMessage>,
-    log: Vec<RuntimeLogEntry>,
-    last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryItem {
-    id: Uuid,
-    scope_kind: String,
-    scope_id: Uuid,
-    memory_kind: String,
-    stable_key: String,
-    created_at: String,
-    created_by: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryRevision {
-    id: Uuid,
-    memory_item_id: Uuid,
-    revision_no: u32,
-    status: String,
-    title: String,
-    content: String,
-    #[serde(default)]
-    structured_payload: Option<Value>,
-    source_kind: String,
-    #[serde(default)]
-    source_id: Option<String>,
-    #[serde(default)]
-    confidence: Option<f32>,
-    #[serde(default)]
-    supersedes_revision_id: Option<Uuid>,
-    created_at: String,
-    #[serde(default)]
-    created_by: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryTag {
-    id: Uuid,
-    memory_item_id: Uuid,
-    tag: String,
-    target_revision_id: Uuid,
-    updated_at: String,
-    #[serde(default)]
-    updated_by: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryEdge {
-    id: Uuid,
-    from_revision_id: Uuid,
-    to_revision_id: Uuid,
-    edge_kind: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct GitTaskBranchPlan {
-    base_branch: String,
-    task_branch: String,
-    remote_name: Option<String>,
-}
-
-struct GitPrepareResult {
-    activities: Vec<(String, String)>,
-    auto_merge_enabled: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedState {
-    users: Vec<User>,
-    projects: Vec<Project>,
-    tasks: Vec<Task>,
-    agents: Vec<Agent>,
-    #[serde(default)]
-    pending_questions: Vec<PendingQuestion>,
-    #[serde(default)]
-    project_scans: HashMap<Uuid, ProjectScanSummary>,
-    #[serde(default)]
-    project_sessions: Vec<ProjectSession>,
-    #[serde(default)]
-    project_chat_messages: Vec<ProjectChatMessage>,
-    #[serde(default)]
-    memory_items: Vec<MemoryItem>,
-    #[serde(default)]
-    memory_revisions: Vec<MemoryRevision>,
-    #[serde(default)]
-    memory_tags: Vec<MemoryTag>,
-    #[serde(default)]
-    memory_edges: Vec<MemoryEdge>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginRequest {
-    username: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ListProjectTasksQuery {
-    status: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AuthSnapshot {
-    current_user: Option<User>,
-    users: Vec<User>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PullNextResponse {
-    task: Option<Task>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ProjectContextSnapshot {
-    project_id: Uuid,
-    primary_workspace: Option<WorkspaceRoot>,
-    latest_scan: Option<ProjectScanSummary>,
-    sessions: Vec<ProjectSession>,
-    #[serde(default)]
-    chat_messages: Vec<ProjectChatMessage>,
-    memory: ProjectMemorySnapshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectSummarySnapshot {
-    project_id: Uuid,
-    project_name: String,
-    generated_at: String,
-    primary_workspace: Option<WorkspaceRoot>,
-    latest_scan: Option<ProjectScanSummary>,
-    task_counts: ProjectTaskStatusCounts,
-    agent_summary: ProjectAgentSummary,
-    session_summary: ProjectSessionSummary,
-    open_pending_question_count: usize,
-    pending_questions: Vec<ProjectPendingQuestionDigest>,
-    active_constraints: Vec<ProjectConstraintDigest>,
-    recent_task_summaries: Vec<ProjectTaskSummaryDigest>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProjectTaskStatusCounts {
-    open: usize,
-    claimed: usize,
-    running: usize,
-    paused: usize,
-    done: usize,
-    failed: usize,
-    canceled: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProjectAgentSummary {
-    total: usize,
-    auto_mode_enabled: usize,
-    busy: usize,
-    idle: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProjectSessionSummary {
-    total: usize,
-    running: usize,
-    paused: usize,
-    completed: usize,
-    failed: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectPendingQuestionDigest {
-    id: Uuid,
-    source_task_id: Uuid,
-    source_task_title: String,
-    question: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectConstraintDigest {
-    stable_key: String,
-    title: String,
-    content: String,
-    revision_no: u32,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectTaskSummaryDigest {
-    task_id: Uuid,
-    task_title: String,
-    summary: String,
-    created_at: String,
-    source_kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProjectMemorySnapshot {
-    #[serde(default)]
-    items: Vec<MemoryItem>,
-    #[serde(default)]
-    revisions: Vec<MemoryRevision>,
-    #[serde(default)]
-    tags: Vec<MemoryTag>,
-    #[serde(default)]
-    edges: Vec<MemoryEdge>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RegisterWorkspaceRequest {
-    label: String,
-    path: String,
-    is_primary_default: Option<bool>,
-    is_writable: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StartProjectSessionRequest {
-    title: Option<String>,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContinueProjectSessionRequest {
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnswerPendingQuestionRequest {
-    answer: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CancelTaskRequest {
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProjectChatRequest {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpsertProjectConstraintRequest {
-    stable_key: Option<String>,
-    title: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskCompletionReport {
-    #[serde(default)]
-    result: Option<String>,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    questions: Vec<TaskCompletionQuestion>,
-    #[serde(default)]
-    follow_ups: Vec<TaskCompletionFollowUp>,
-    #[serde(default)]
-    risks: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum TaskCompletionQuestion {
-    Text(String),
-    Detailed {
-        question: String,
-        #[serde(default)]
-        context: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct TaskCompletionFollowUp {
-    #[serde(default)]
-    kind: Option<String>,
-    title: String,
-    description: String,
-    #[serde(default)]
-    priority: Option<String>,
-    #[serde(default)]
-    can_auto_create_task: Option<bool>,
-    #[serde(default)]
-    can_auto_apply: Option<bool>,
-}
-
-#[derive(Clone, Copy)]
-enum RuntimeMode {
-    RealCodex,
-    Stub,
+    decisions: Vec<DecisionCard>,
 }
 
 #[tokio::main]
 async fn main() {
     let workspace_root = std::env::current_dir().expect("failed to resolve current directory");
     let app = build_app(RuntimeMode::RealCodex, workspace_root);
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = server_listen_addr();
 
     println!("Spotlight server listening on http://{addr}");
 
@@ -448,729 +103,98 @@ async fn main() {
         .expect("failed to run axum server");
 }
 
-fn build_app(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> Router {
-    let state = default_state(runtime_mode, workspace_root);
-    start_background_automation(state.clone());
-
-    let api = build_api_router();
-
-    Router::new()
-        .route("/", get(index))
-        .nest("/api", api.clone())
-        .nest("/api/v1", api)
-        .with_state(state)
+ fn runtime_operation_timeout_secs() -> u64 {
+     std::env::var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS")
+         .ok()
+         .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(RUNTIME_OPERATION_TIMEOUT_SECS)
 }
 
-fn build_api_router() -> Router<AppState> {
-    Router::new()
-        .route("/me", get(get_me))
-        .route("/auth/login", post(login))
-        .route("/board", get(get_board))
-        .route("/projects", get(list_projects))
-        .route("/projects/{project_id}/tasks", get(list_project_tasks))
-        .route("/agents", get(list_agents))
-        .route(
-            "/questions/{question_id}/answer",
-            post(answer_pending_question),
-        )
-        .route("/projects/{project_id}/summary", get(get_project_summary))
-        .route("/projects/{project_id}/context", get(get_project_context))
-        .route("/projects/{project_id}/memory", get(get_project_memory))
-        .route(
-            "/projects/{project_id}/chat",
-            post(post_project_chat_message),
-        )
-        .route(
-            "/projects/{project_id}/memory/constraints",
-            post(upsert_project_constraint),
-        )
-        .route(
-            "/projects/{project_id}/workspaces",
-            post(register_project_workspace),
-        )
-        .route("/projects/{project_id}/scan", post(scan_project))
-        .route(
-            "/projects/{project_id}/sessions",
-            post(start_project_session),
-        )
-        .route(
-            "/project-sessions/{session_id}/turns",
-            post(continue_project_session),
-        )
-        .route("/tasks", post(create_task))
-        .route(
-            "/projects/{project_id}/tasks/bootstrap",
-            post(bootstrap_tasks),
-        )
-        .route(
-            "/projects/{project_id}/tasks/seed-docs",
-            post(seed_doc_tasks),
-        )
-        .route(
-            "/projects/{project_id}/tasks/local-build-restart",
-            post(create_local_build_restart_task),
-        )
-        .route(
-            "/projects/{project_id}/tasks/cloud-install-restart",
-            post(create_cloud_install_restart_task),
-        )
-        .route("/projects/{project_id}/explore", post(explore_project))
-        .route(
-            "/agents/{agent_id}/auto-mode/toggle",
-            post(toggle_agent_auto_mode),
-        )
-        .route("/agents/{agent_id}/pull-next", post(pull_next_task))
-        .route("/tasks/{task_id}/claim/{agent_id}", post(claim_task))
-        .route("/tasks/{task_id}/start/{agent_id}", post(start_task))
-        .route("/tasks/{task_id}/pause", post(pause_task))
-        .route("/tasks/{task_id}/cancel", post(cancel_task))
-        .route("/tasks/{task_id}/resume/{agent_id}", post(resume_task))
-}
-
-fn default_state(runtime_mode: RuntimeMode, workspace_root: PathBuf) -> AppState {
-    let store_path = state_store_path(&workspace_root);
-    let persisted = load_or_initialize_state(&workspace_root, &store_path);
-
-    AppState {
-        inner: Arc::new(Mutex::new(BoardState {
-            users: persisted.users,
-            projects: persisted.projects,
-            tasks: persisted.tasks,
-            agents: persisted.agents,
-            pending_questions: persisted.pending_questions,
-            project_scans: persisted.project_scans,
-            project_sessions: persisted.project_sessions,
-            project_chat_messages: persisted.project_chat_messages,
-            memory_items: persisted.memory_items,
-            memory_revisions: persisted.memory_revisions,
-            memory_tags: persisted.memory_tags,
-            memory_edges: persisted.memory_edges,
-        })),
-        runtime_mode,
-        runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
-        store_path,
-    }
-}
-
-fn start_background_automation(state: AppState) {
-    if !matches!(state.runtime_mode, RuntimeMode::RealCodex) {
-        return;
-    }
-
-    tokio::spawn(async move {
-        loop {
-            if let Err((_, message)) = run_automation_cycle_once(&state).await {
-                eprintln!("background automation cycle failed: {message}");
-            }
-            sleep(Duration::from_secs(AUTO_MAINTENANCE_INTERVAL_SECS)).await;
-        }
-    });
-}
-
-async fn run_automation_cycle_once(state: &AppState) -> AppResult<()> {
-    let mut sessions_to_stop = recover_stale_runtime_tasks(state).await?;
-    let parallel_sessions_to_stop = recover_parallel_active_tasks(state).await?;
-    sessions_to_stop.extend(parallel_sessions_to_stop);
-    stop_runtime_sessions(state, &sessions_to_stop).await;
-    drive_auto_mode_agents(state).await;
-    Ok(())
-}
-
-async fn recover_stale_runtime_tasks(state: &AppState) -> AppResult<Vec<Uuid>> {
-    let active_runtime_task_ids = {
-        let sessions = state.runtime_sessions.lock().await;
-        sessions.keys().copied().collect::<HashSet<_>>()
-    };
-    let now_nanos = current_time_nanos();
-
-    let sessions_to_stop = {
-        let mut guard = state.inner.lock().await;
-        reconcile_watchdog_state(&mut guard, &active_runtime_task_ids, now_nanos)
-    };
-
-    if !sessions_to_stop.is_empty() {
-        persist_state(state).await?;
-    }
-
-    Ok(sessions_to_stop)
-}
-
-async fn recover_parallel_active_tasks(state: &AppState) -> AppResult<Vec<Uuid>> {
-    let sessions_to_stop = {
-        let mut guard = state.inner.lock().await;
-        reconcile_parallel_active_tasks(&mut guard)
-    };
-
-    if !sessions_to_stop.is_empty() {
-        persist_state(state).await?;
-    }
-
-    Ok(sessions_to_stop)
-}
-
-async fn stop_runtime_sessions(state: &AppState, task_ids: &[Uuid]) {
-    for task_id in task_ids {
-        let session = {
-            let mut sessions = state.runtime_sessions.lock().await;
-            sessions.remove(task_id)
-        };
-        if let Some(session) = session {
-            session.shutdown().await;
-        }
-    }
-}
-
-async fn drive_auto_mode_agents(state: &AppState) {
-    let has_active_task = {
-        let guard = state.inner.lock().await;
-        active_task_conflict(&guard.tasks, None).is_some()
-    };
-    if has_active_task {
-        return;
-    }
-
-    let auto_agents = {
-        let guard = state.inner.lock().await;
-        guard
-            .agents
-            .iter()
-            .filter(|agent| agent.auto_mode && agent.current_task_id.is_none())
-            .map(|agent| (agent.id, agent.name.clone(), agent.owner_user_id))
-            .collect::<Vec<_>>()
-    };
-
-    for (agent_id, agent_name, owner_user_id) in auto_agents {
-        if let Some(task_id) = {
-            let guard = state.inner.lock().await;
-            select_next_auto_resume_task_id(&guard.tasks, owner_user_id)
-        } {
-            if let Err((_, message)) = auto_resume_task(state, task_id, agent_id, &agent_name).await
-            {
-                let _ = reopen_task_for_auto_retry(state, task_id, agent_id, &message).await;
-            }
-            return;
-        }
-
-        let claimed_task = {
-            let mut guard = state.inner.lock().await;
-            let claimed = auto_claim_next_task(&mut guard, agent_id).ok().flatten();
-            claimed
-        };
-        if claimed_task.is_some() {
-            let _ = persist_state(state).await;
-        }
-
-        if let Some(task) = claimed_task {
-            if let Err((_, message)) = auto_start_task(state, task.id, agent_id, &agent_name).await
-            {
-                let _ = reopen_task_for_auto_retry(state, task.id, agent_id, &message).await;
-            }
-            return;
-        } else {
-            let _ = owner_user_id;
-        }
-    }
-}
-
-fn reconcile_watchdog_state(
-    state: &mut BoardState,
-    active_runtime_task_ids: &HashSet<Uuid>,
-    now_nanos: u128,
-) -> Vec<Uuid> {
-    let mut sessions_to_stop = Vec::new();
-
-    for task in &mut state.tasks {
-        let has_session = active_runtime_task_ids.contains(&task.id);
-        let Some(reason) = stale_task_recovery_reason(task, has_session, now_nanos) else {
-            continue;
-        };
-
-        if let Some(runtime) = task.runtime.as_mut() {
-            runtime.active_turn_id = None;
-            runtime.last_error = Some(reason.clone());
-            runtime.log.push(new_runtime_entry(
-                "watchdog",
-                format!("检测到运行卡住，已自动回收：{reason}"),
-            ));
-        }
-
-        task.status = TaskStatus::Paused;
-        task.claimed_by = None;
-
-        task.activities.push(new_activity(
-            "task.watchdog_recovered",
-            format!("系统检测到任务长时间无进展，已自动回收：{reason}"),
-        ));
-
-        if has_session {
-            sessions_to_stop.push(task.id);
-        }
-    }
-
-    for agent in &mut state.agents {
-        let should_release = agent.current_task_id.is_some_and(|task_id| {
-            state
-                .tasks
-                .iter()
-                .find(|task| task.id == task_id)
-                .map(|task| {
-                    !matches!(task.status, TaskStatus::Running | TaskStatus::Claimed)
-                        || task.claimed_by != Some(agent.id)
-                })
-                .unwrap_or(true)
-        });
-
-        if should_release {
-            agent.current_task_id = None;
-            agent.status = "空闲".into();
-            agent.last_action = "已自动释放失效占用，等待继续执行".into();
-        }
-    }
-
-    sessions_to_stop.sort_unstable();
-    sessions_to_stop.dedup();
-    sessions_to_stop
-}
-
-fn active_task_keep_order(task: &Task, index: usize) -> (u8, u8, u128, u128, usize) {
-    let status_order = match task.status {
-        TaskStatus::Running => 0,
-        TaskStatus::Claimed => 1,
-        _ => 2,
-    };
-    let last_touch_order = u128::MAX - task_last_touch_nanos(task).unwrap_or_default();
+fn runtime_operation_timeout_error(action: &str) -> (StatusCode, String) {
     (
-        status_order,
-        task_priority_order(task.priority),
-        last_touch_order,
-        task_created_order(task),
-        index,
+        StatusCode::GATEWAY_TIMEOUT,
+        format!(
+            "{action}超过 {} 秒仍未完成",
+            runtime_operation_timeout_secs()
+        ),
     )
 }
 
-fn reconcile_parallel_active_tasks(state: &mut BoardState) -> Vec<Uuid> {
-    let active_task_ids = state
-        .tasks
-        .iter()
-        .filter(|task| task_is_serialized_active(task))
-        .map(|task| task.id)
-        .collect::<Vec<_>>();
-    if active_task_ids.len() <= 1 {
-        return Vec::new();
-    }
-
-    let Some(keep_task_id) = state
-        .tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, task)| task_is_serialized_active(task))
-        .min_by_key(|(index, task)| active_task_keep_order(task, *index))
-        .map(|(_, task)| task.id)
-    else {
-        return Vec::new();
-    };
-
-    let keep_task_title = state
-        .tasks
-        .iter()
-        .find(|task| task.id == keep_task_id)
-        .map(|task| task.title.clone())
-        .unwrap_or_else(|| "当前保留任务".into());
-
-    let mut requeued_titles = Vec::new();
-    let mut sessions_to_stop = Vec::new();
-    for task_id in active_task_ids {
-        if task_id == keep_task_id {
-            continue;
-        }
-
-        let task_title = {
-            let task = find_task_mut(state, task_id).expect("parallel active task should exist");
-            let task_title = task.title.clone();
-            task.status = TaskStatus::Open;
-            task.claimed_by = None;
-            if let Some(runtime) = task.runtime.as_mut() {
-                runtime.active_turn_id = None;
-                runtime.log.push(new_runtime_entry(
-                    "system",
-                    format!(
-                        "系统检测到同时存在多个进行中任务，已自动回收到等待队列；当前保留执行的是《{}》。",
-                        keep_task_title
-                    ),
-                ));
-            }
-            task.activities.push(new_activity(
-                "task.parallel_requeued",
-                format!(
-                    "系统检测到同时存在多个进行中任务，为保证串行执行，已将该任务回收到等待队列；当前保留执行的是《{}》。",
-                    keep_task_title
-                ),
-            ));
-            task_title
-        };
-
-        requeued_titles.push(task_title);
-        reset_agent_if_needed(state, task_id, "检测到并行执行，已回收到等待队列");
-        sessions_to_stop.push(task_id);
-    }
-
-    if !requeued_titles.is_empty() {
-        let keep_task = find_task_mut(state, keep_task_id).expect("keep task should exist");
-        keep_task.activities.push(new_activity(
-            "task.parallel_serialized",
-            format!(
-                "系统检测到此前存在并行执行，已保留当前任务继续推进；回收到等待队列的任务：{}",
-                requeued_titles.join("、")
-            ),
-        ));
-    }
-
-    sessions_to_stop.sort_unstable();
-    sessions_to_stop.dedup();
-    sessions_to_stop
-}
-
-fn stale_task_recovery_reason(task: &Task, has_session: bool, now_nanos: u128) -> Option<String> {
-    match task.status {
-        TaskStatus::Running => {
-            let runtime = task.runtime.as_ref()?;
-            if runtime.active_turn_id.is_none() {
-                return Some("运行中任务缺少活动 turn".into());
-            }
-            if !has_session {
-                return Some("本地运行会话已丢失，无法继续流式执行".into());
-            }
-            let last_touch = task_last_touch_nanos(task)?;
-            if now_nanos.saturating_sub(last_touch) > stale_timeout_nanos() {
-                return Some(format!(
-                    "超过 {} 秒没有新的日志或事件输出",
-                    TASK_STALE_TIMEOUT_SECS
-                ));
-            }
-            None
-        }
-        TaskStatus::Claimed => {
-            let last_touch = task_last_touch_nanos(task)?;
-            (now_nanos.saturating_sub(last_touch) > stale_timeout_nanos()).then_some(format!(
-                "任务被认领后超过 {} 秒仍未启动",
-                TASK_STALE_TIMEOUT_SECS
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn select_next_auto_resume_task_id(tasks: &[Task], owner_user_id: Option<Uuid>) -> Option<Uuid> {
-    tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, task)| is_auto_resumable_task(task, owner_user_id))
-        .min_by_key(|(index, task)| {
-            (
-                task_priority_order(task.priority),
-                task_created_order(task),
-                *index,
-            )
-        })
-        .map(|(_, task)| task.id)
-}
-
-fn is_auto_resumable_task(task: &Task, owner_user_id: Option<Uuid>) -> bool {
-    if !matches!(task.status, TaskStatus::Paused) {
-        return false;
-    }
-
-    let Some(runtime) = task.runtime.as_ref() else {
-        return false;
-    };
-    if runtime.thread_id.is_none() {
-        return false;
-    }
-    if runtime
-        .last_error
-        .as_deref()
-        .is_some_and(is_non_resumable_thread_error)
+async fn spawn_runtime_session_with_timeout(
+    workspace_root: PathBuf,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    action: &str,
+) -> AppResult<Arc<ProviderRuntimeSession>> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        ProviderRuntimeSession::spawn(workspace_root, event_tx),
+    )
+    .await
     {
-        return false;
-    }
-
-    let Some(last_activity) = task.activities.last() else {
-        return false;
-    };
-    if !matches!(
-        last_activity.kind.as_str(),
-        "task.watchdog_recovered" | "task.runtime_session_lost"
-    ) {
-        return false;
-    }
-
-    match owner_user_id {
-        Some(owner_user_id) => task.assignee_user_id == Some(owner_user_id),
-        None => task.assignee_user_id.is_none(),
+        Ok(result) => result,
+        Err(_) => Err(runtime_operation_timeout_error(action)),
     }
 }
 
-fn is_non_resumable_thread_error(message: &str) -> bool {
-    message.to_ascii_lowercase().contains("thread not found")
-}
-
-async fn auto_start_task(
-    state: &AppState,
-    task_id: Uuid,
-    agent_id: Uuid,
-    agent_name: &str,
-) -> AppResult<()> {
+async fn start_runtime_thread_with_timeout(
+    session: &Arc<ProviderRuntimeSession>,
+    cwd: &Path,
+    developer_instructions: &str,
+    action: &str,
+) -> AppResult<String> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        session.start_thread(cwd, developer_instructions),
+    )
+    .await
     {
-        let mut guard = state.inner.lock().await;
-        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
-            return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
-        }
-        let task = find_task_mut(&mut guard, task_id)?;
-        if matches!(task.status, TaskStatus::Canceled) {
-            return Err((StatusCode::CONFLICT, "已撤销任务不能自动启动".into()));
-        }
-    }
-
-    let context = resolve_task_execution_context(state, task_id, None).await?;
-    let _ = std::fs::create_dir_all(&context.workspace_root);
-    let mut git_auto_merge_enabled = false;
-    if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
-        let git_prepare = prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await?;
-        git_auto_merge_enabled = git_prepare.auto_merge_enabled;
-        for (kind, message) in git_prepare.activities {
-            record_task_activity(state, task_id, kind, message).await;
-        }
-        apply_git_snapshot(&context.workspace_root, task_id, state).await;
-    }
-
-    match state.runtime_mode {
-        RuntimeMode::Stub => {
-            let mut guard = state.inner.lock().await;
-            mark_task_running(
-                &mut guard,
-                task_id,
-                agent_id,
-                agent_name,
-                &context.prompt,
-                Some("stub-thread".into()),
-                Some("stub-turn".into()),
-                false,
-            )?;
-            if let Ok(task) = find_task_mut(&mut guard, task_id) {
-                task.activities.push(new_activity(
-                    "task.auto_started",
-                    "系统检测到空闲 Agent，已自动开始执行该任务",
-                ));
-            }
-            drop(guard);
-            persist_state(state).await?;
-            Ok(())
-        }
-        RuntimeMode::RealCodex => {
-            let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let session =
-                CodexRuntimeSession::spawn(context.workspace_root.clone(), event_tx).await?;
-            let thread_id = session
-                .start_thread(&context.workspace_root, &task_developer_instructions())
-                .await?;
-            let turn_id = session
-                .start_turn(&context.workspace_root, &thread_id, &context.prompt)
-                .await?;
-            {
-                let mut guard = state.inner.lock().await;
-                mark_task_running(
-                    &mut guard,
-                    task_id,
-                    agent_id,
-                    agent_name,
-                    &context.prompt,
-                    Some(thread_id),
-                    Some(turn_id),
-                    git_auto_merge_enabled,
-                )?;
-                if let Ok(task) = find_task_mut(&mut guard, task_id) {
-                    task.activities.push(new_activity(
-                        "task.auto_started",
-                        "系统检测到空闲 Agent，已自动开始执行该任务",
-                    ));
-                }
-            }
-            state.runtime_sessions.lock().await.insert(task_id, session);
-            tokio::spawn(runtime_event_loop(
-                state.clone(),
-                task_id,
-                agent_id,
-                event_rx,
-            ));
-            persist_state(state).await?;
-            Ok(())
+        Ok(result) => result,
+        Err(_) => {
+            session.shutdown().await;
+            Err(runtime_operation_timeout_error(action))
         }
     }
 }
 
-async fn auto_resume_task(
-    state: &AppState,
-    task_id: Uuid,
-    agent_id: Uuid,
-    agent_name: &str,
-) -> AppResult<()> {
-    let workspace_root = resolve_workspace_for_task(state, task_id).await?;
-    let prompt = auto_resume_prompt(state, task_id).await?;
-    let (thread_id, git_auto_merge_enabled) = {
-        let mut guard = state.inner.lock().await;
-        let task = find_task_mut(&mut guard, task_id)?;
-        if matches!(task.status, TaskStatus::Canceled) {
-            return Err((StatusCode::CONFLICT, "已撤销任务不能自动恢复".into()));
-        }
-        let runtime = task
-            .runtime
-            .as_ref()
-            .ok_or_else(|| (StatusCode::CONFLICT, "缺少可恢复的运行时上下文".into()))?;
-        (
-            runtime
-                .thread_id
-                .clone()
-                .ok_or_else(|| (StatusCode::CONFLICT, "缺少 thread_id，无法自动恢复".into()))?,
-            runtime.git_auto_merge_enabled,
-        )
-    };
-
-    match state.runtime_mode {
-        RuntimeMode::Stub => {
-            let mut guard = state.inner.lock().await;
-            let task = find_task_mut(&mut guard, task_id)?;
-            task.status = TaskStatus::Done;
-            task.claimed_by = Some(agent_id);
-            task.activities.push(new_activity(
-                "task.auto_resumed",
-                "系统检测到上次运行中断，已自动恢复并完成该任务",
-            ));
-            let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
-                provider: "stub-codex".into(),
-                thread_id: Some("stub-thread".into()),
-                active_turn_id: Some("stub-turn-auto-resume".into()),
-                git_auto_merge_enabled: false,
-                log: Vec::new(),
-                last_error: None,
-            });
-            runtime.last_error = None;
-            runtime.log.push(new_runtime_entry("user", prompt));
-            runtime
-                .log
-                .push(new_runtime_entry("assistant", "Stub 自动恢复后已完成任务"));
-            runtime.active_turn_id = None;
-            process_task_completion_outputs(&mut guard, task_id);
-            reset_agent_if_needed(&mut guard, task_id, "最近一次任务已自动恢复完成");
-            drop(guard);
-            persist_state(state).await?;
-            Ok(())
-        }
-        RuntimeMode::RealCodex => {
-            let resolved_session = resolve_task_runtime_session(
-                state,
-                task_id,
-                agent_id,
-                workspace_root.clone(),
-                &thread_id,
-            )
-            .await?;
-
-            let turn_id = match resolved_session
-                .session
-                .start_turn(&workspace_root, &resolved_session.thread_id, &prompt)
-                .await
-            {
-                Ok(turn_id) => turn_id,
-                Err(error) => {
-                    if resolved_session.event_rx.is_some() {
-                        resolved_session.session.shutdown().await;
-                    }
-                    return Err(error);
-                }
-            };
-
-            register_task_runtime_session(
-                state,
-                task_id,
-                agent_id,
-                resolved_session.session.clone(),
-                resolved_session.event_rx,
-            )
-            .await;
-
-            {
-                let mut guard = state.inner.lock().await;
-                let task = find_task_mut(&mut guard, task_id)?;
-                task.status = TaskStatus::Running;
-                task.claimed_by = Some(agent_id);
-                task.activities.push(new_activity(
-                    "task.auto_resumed",
-                    "系统检测到上次运行中断，已自动恢复该任务",
-                ));
-                let runtime = task
-                    .runtime
-                    .as_mut()
-                    .ok_or_else(|| (StatusCode::CONFLICT, "缺少可恢复的运行时上下文".into()))?;
-                runtime.thread_id = Some(resolved_session.thread_id);
-                runtime.active_turn_id = Some(turn_id);
-                runtime.git_auto_merge_enabled = git_auto_merge_enabled;
-                runtime.last_error = None;
-                runtime.log.push(new_runtime_entry("user", prompt));
-                let task_title = task.title.clone();
-                assign_agent_running(
-                    &mut guard,
-                    agent_id,
-                    task_id,
-                    format!("正在自动恢复任务：{task_title}"),
-                );
-            }
-
-            persist_state(state).await?;
-            let _ = agent_name;
-            Ok(())
+async fn resume_runtime_thread_with_timeout(
+    session: &Arc<ProviderRuntimeSession>,
+    thread_id: &str,
+    action: &str,
+) -> AppResult<String> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        session.resume_thread(thread_id),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            session.shutdown().await;
+            Err(runtime_operation_timeout_error(action))
         }
     }
 }
 
-async fn reopen_task_for_auto_retry(
-    state: &AppState,
-    task_id: Uuid,
-    agent_id: Uuid,
-    reason: &str,
-) -> AppResult<()> {
-    let mut guard = state.inner.lock().await;
-    let task = find_task_mut(&mut guard, task_id)?;
-    task.status = TaskStatus::Paused;
-    task.claimed_by = None;
-    task.activities.push(new_activity(
-        "task.auto_retry_queued",
-        format!("自动恢复失败，已重新放回等待队列：{reason}"),
-    ));
-    if let Some(runtime) = task.runtime.as_mut() {
-        runtime.active_turn_id = None;
-        runtime.last_error = Some(reason.to_string());
-        runtime.log.push(new_runtime_entry(
-            "watchdog",
-            format!("自动恢复失败，已重新排队等待继续执行：{reason}"),
-        ));
+async fn start_runtime_turn_with_timeout(
+    session: &Arc<ProviderRuntimeSession>,
+    cwd: &Path,
+    thread_id: &str,
+    prompt: &str,
+    action: &str,
+) -> AppResult<String> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        session.start_turn(cwd, thread_id, prompt),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            session.shutdown().await;
+            Err(runtime_operation_timeout_error(action))
+        }
     }
-    reset_agent_if_needed(&mut guard, task_id, "自动恢复失败，已重新排队");
-    drop(guard);
-    let _ = agent_id;
-    persist_state(state).await
-}
-
-async fn auto_resume_prompt(state: &AppState, task_id: Uuid) -> AppResult<String> {
-    let guard = state.inner.lock().await;
-    let task = guard
-        .tasks
-        .iter()
-        .find(|task| task.id == task_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
-    Ok(format!(
-        "系统自动恢复：任务《{}》在本地运行中断或长时间无输出后被自动接管。请先快速回顾当前进展和工作区，再继续推进；如果现场已经变化，请直接基于现状收敛并继续完成。",
-        task.title
-    ))
 }
 
 fn current_time_nanos() -> u128 {
@@ -1200,10 +224,15 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Open => "待处理",
         TaskStatus::Claimed => "已认领",
+        TaskStatus::ApprovalRequested => "待审批",
+        TaskStatus::Approved => "已审批",
         TaskStatus::Running => "运行中",
         TaskStatus::Paused => "已暂停",
+        TaskStatus::PendingAcceptance => "待验收",
+        TaskStatus::Accepted => "已验收",
         TaskStatus::Done => "已完成",
         TaskStatus::Failed => "失败",
+        TaskStatus::ManualReview => "人工复核",
         TaskStatus::Canceled => "已撤销",
     }
 }
@@ -1212,290 +241,55 @@ fn task_is_serialized_active(task: &Task) -> bool {
     matches!(task.status, TaskStatus::Claimed | TaskStatus::Running)
 }
 
-fn active_task_conflict(tasks: &[Task], exclude_task_id: Option<Uuid>) -> Option<&Task> {
+fn normalize_serialization_workspace_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn task_serialization_lane_key(projects: &[Project], task: &Task) -> String {
+    if let Some(workspace_path) = projects
+        .iter()
+        .find(|project| project.id == task.project_id)
+        .and_then(Project::primary_workspace)
+        .map(|workspace| normalize_serialization_workspace_path(&workspace.path))
+    {
+        return format!("workspace:{workspace_path}");
+    }
+
+    format!("project:{}", task.project_id)
+}
+
+fn tasks_share_serialization_lane(projects: &[Project], left: &Task, right: &Task) -> bool {
+    task_serialization_lane_key(projects, left) == task_serialization_lane_key(projects, right)
+}
+
+fn active_task_conflict<'a>(
+    projects: &[Project],
+    tasks: &'a [Task],
+    task_id: Uuid,
+    exclude_task_id: Option<Uuid>,
+) -> Option<&'a Task> {
+    let target_task = tasks.iter().find(|task| task.id == task_id)?;
     tasks.iter().find(|task| {
-        task_is_serialized_active(task) && exclude_task_id.is_none_or(|task_id| task.id != task_id)
+        task_is_serialized_active(task)
+            && exclude_task_id.is_none_or(|excluded_task_id| task.id != excluded_task_id)
+            && tasks_share_serialization_lane(projects, target_task, task)
     })
 }
 
 fn active_task_conflict_message(task: &Task) -> String {
     format!(
-        "当前已有任务《{}》处于{}，系统当前只允许一个任务同时执行",
+        "任务《{}》当前已在同一工作区处于{}，同一工作区一次只允许一个活跃任务",
         task.title,
         task_status_label(task.status)
     )
 }
 
-fn default_projects(workspace_root: &Path) -> Vec<Project> {
-    let public_workspace = workspace_root.join("tmp").join("public-project-example");
-    let _ = std::fs::create_dir_all(&public_workspace);
-
-    vec![
-        Project {
-            id: Uuid::new_v4(),
-            name: "客户项目示例".into(),
-            description: "默认展示一个普通项目目录。它可能为空，也可能只有文档、Word、表格或杂项资料，不假设它一定是代码仓库。".into(),
-            workspace_roots: vec![WorkspaceRoot {
-                id: Uuid::new_v4(),
-                label: "默认工作目录".into(),
-                path: public_workspace.to_string_lossy().into_owned(),
-                writable: true,
-            }],
-            is_spotlight_self: false,
-        },
-        Project {
-            id: Uuid::new_v4(),
-            name: "Spotlight 平台自身".into(),
-            description: "用于自举 Spotlight 平台本身，默认从 docs 和 AGENTS.md 中补种任务。".into(),
-            workspace_roots: vec![WorkspaceRoot {
-                id: Uuid::new_v4(),
-                label: "Spotlight 主工作区".into(),
-                path: workspace_root.to_string_lossy().into_owned(),
-                writable: true,
-            }],
-            is_spotlight_self: true,
-        },
-    ]
-}
-
-fn default_users() -> Vec<User> {
-    let username = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "spotlight".into());
-
-    vec![
-        User {
-            id: Uuid::new_v4(),
-            username: username.clone(),
-            display_name: username,
-            role: "admin".into(),
-        },
-        User {
-            id: Uuid::new_v4(),
-            username: "reviewer".into(),
-            display_name: "评审用户".into(),
-            role: "member".into(),
-        },
-    ]
-}
-
-fn default_agents(users: &[User]) -> Vec<Agent> {
-    let primary_user_id = users.first().map(|user| user.id);
-    let reviewer_user_id = users.get(1).map(|user| user.id).or(primary_user_id);
-
-    vec![
-        Agent {
-            id: Uuid::new_v4(),
-            owner_user_id: primary_user_id,
-            name: "本地 Codex Agent".into(),
-            provider: "codex".into(),
-            status: "空闲".into(),
-            auto_mode: true,
-            current_task_id: None,
-            last_action: "等待认领或自动执行任务".into(),
-        },
-        Agent {
-            id: Uuid::new_v4(),
-            owner_user_id: reviewer_user_id,
-            name: "评审助理".into(),
-            provider: "codex".into(),
-            status: "空闲".into(),
-            auto_mode: true,
-            current_task_id: None,
-            last_action: "等待补充提示词、验收说明或人工协作".into(),
-        },
-    ]
-}
-
-fn state_store_path(workspace_root: &Path) -> PathBuf {
-    #[cfg(test)]
-    {
-        let _ = workspace_root;
-        return std::env::temp_dir()
-            .join(format!("spotlight-server-state-{}.json", Uuid::new_v4()));
-    }
-
-    #[cfg(not(test))]
-    workspace_root.join(".spotlight").join("server-state.json")
-}
-
-fn load_or_initialize_state(workspace_root: &Path, store_path: &Path) -> PersistedState {
-    if let Ok(content) = std::fs::read_to_string(store_path) {
-        if let Ok(mut state) = serde_json::from_str::<PersistedState>(&content) {
-            if normalize_persisted_state(&mut state) {
-                let _ = persist_state_to_path(store_path, &state);
-            }
-            return state;
-        }
-    }
-
-    let users = default_users();
-    let projects = default_projects(workspace_root);
-    let mut tasks = Vec::new();
-    if let Some(spotlight_project) = projects.iter().find(|project| project.is_spotlight_self) {
-        merge_unique_tasks(&mut tasks, seed_tasks_from_docs(spotlight_project.id));
-        merge_unique_tasks(&mut tasks, seed_tasks_from_agents_file(spotlight_project));
-    }
-    let primary_user_id = users.first().map(|user| user.id);
-    for task in &mut tasks {
-        task.creator_user_id = primary_user_id;
-    }
-
-    let state = PersistedState {
-        users: users.clone(),
-        projects,
-        tasks,
-        agents: default_agents(&users),
-        pending_questions: Vec::new(),
-        project_scans: HashMap::new(),
-        project_sessions: Vec::new(),
-        project_chat_messages: Vec::new(),
-        memory_items: Vec::new(),
-        memory_revisions: Vec::new(),
-        memory_tags: Vec::new(),
-        memory_edges: Vec::new(),
-    };
-    let mut state = state;
-    let _ = normalize_persisted_state(&mut state);
-    let _ = persist_state_to_path(store_path, &state);
-    state
-}
-
-fn normalize_persisted_state(state: &mut PersistedState) -> bool {
-    let mut changed = false;
-
-    for task in &mut state.tasks {
-        if task.priority.is_none() {
-            if let Some(priority) = infer_task_priority(&task.title) {
-                task.priority = Some(priority);
-                task.activities.push(new_activity(
-                    "task.priority_inferred",
-                    format!("系统按版本阶段补齐默认优先级：{}", priority_label(priority)),
-                ));
-                changed = true;
-            }
-        }
-
-        if should_recover_active_task_as_paused(task) {
-            task.status = TaskStatus::Paused;
-            task.claimed_by = None;
-            if let Some(runtime) = task.runtime.as_mut() {
-                runtime.active_turn_id = None;
-                runtime.last_error.get_or_insert_with(|| {
-                    "服务端启动时发现任务仍被标记为执行中，但本地运行会话不存在，已转为可恢复状态。"
-                        .into()
-                });
-            }
-            task.activities.push(new_activity(
-                "task.state_normalized",
-                "服务端启动时发现任务仍被标记为执行中，但本地运行会话不存在，已自动归一化为 PAUSED，等待恢复或人工处理。",
-            ));
-            changed = true;
-        }
-
-        if should_recover_task_as_done(task) {
-            task.status = TaskStatus::Done;
-            task.claimed_by = None;
-            if let Some(runtime) = task.runtime.as_mut() {
-                runtime.active_turn_id = None;
-                if runtime
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|message| message.contains("thread not found"))
-                {
-                    runtime.last_error = None;
-                }
-            }
-            task.activities.push(new_activity(
-                "task.state_normalized",
-                "服务端启动时检测到明确完成证据，但任务状态未落到 DONE，已自动归一化为 DONE。",
-            ));
-            changed = true;
-        }
-
-        if should_clear_inactive_turn(task) {
-            if let Some(runtime) = task.runtime.as_mut() {
-                runtime.active_turn_id = None;
-            }
-            task.activities.push(new_activity(
-                "task.state_normalized",
-                "服务端启动时检测到任务已不在 RUNNING，但仍残留 active_turn_id，已自动清理。",
-            ));
-            changed = true;
-        }
-
-        if should_recover_open_task_as_paused(task) {
-            task.status = TaskStatus::Paused;
-            task.claimed_by = None;
-            if let Some(runtime) = task.runtime.as_mut() {
-                runtime.last_error.get_or_insert_with(|| {
-                    "服务端启动时检测到任务已有运行痕迹却回退为 OPEN，已自动归一化为 PAUSED。"
-                        .into()
-                });
-            }
-            task.activities.push(new_activity(
-                "task.state_normalized",
-                "服务端启动时检测到任务已有运行痕迹却回退为 OPEN，已自动归一化为 PAUSED，等待恢复或人工处理。",
-            ));
-            changed = true;
-        }
-
-        if task_state_snapshot_needs_refresh(task) {
-            refresh_task_state_snapshot(task, "server.load.normalize");
-            changed = true;
-        }
-    }
-
-    let active_task_ids = state
-        .tasks
-        .iter()
-        .filter(|task| matches!(task.status, TaskStatus::Claimed | TaskStatus::Running))
-        .map(|task| task.id)
-        .collect::<HashSet<_>>();
-
-    for agent in &mut state.agents {
-        if let Some(task_id) = agent.current_task_id {
-            if !active_task_ids.contains(&task_id) {
-                agent.current_task_id = None;
-                agent.status = "空闲".into();
-                agent.last_action = "服务启动时释放了失效的任务占用".into();
-                changed = true;
-            }
-        }
-    }
-
-    changed
-}
-
-fn should_recover_active_task_as_paused(task: &Task) -> bool {
-    matches!(task.status, TaskStatus::Running | TaskStatus::Claimed)
-        && task.claimed_by.is_some()
-        && task_has_progress_evidence(task)
-}
-
-fn should_recover_task_as_done(task: &Task) -> bool {
-    !matches!(task.status, TaskStatus::Done | TaskStatus::Canceled)
-        && task_has_completion_evidence(task)
-}
-
-fn should_clear_inactive_turn(task: &Task) -> bool {
-    !matches!(task.status, TaskStatus::Running)
-        && task
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.active_turn_id.as_deref())
-            .is_some()
-}
-
-fn should_recover_open_task_as_paused(task: &Task) -> bool {
-    if !matches!(task.status, TaskStatus::Open) || task.claimed_by.is_some() {
-        return false;
-    }
-
-    task_has_progress_evidence(task)
-}
-
-fn task_has_progress_evidence(task: &Task) -> bool {
+pub(crate) fn task_has_progress_evidence(task: &Task) -> bool {
     let has_runtime_log = task
         .runtime
         .as_ref()
@@ -1516,7 +310,7 @@ fn task_has_progress_evidence(task: &Task) -> bool {
     has_runtime_log || has_progress_activity
 }
 
-fn task_has_completion_evidence(task: &Task) -> bool {
+pub(crate) fn task_has_completion_evidence(task: &Task) -> bool {
     task.activities.iter().rev().any(|activity| {
         activity.kind == "task.done"
             || (activity.kind == "runtime.turn_completed" && activity.message.contains("completed"))
@@ -1571,6 +365,8 @@ fn evaluate_task_state_snapshot(task: &Task, evaluator: &str) -> TaskStateSnapsh
                 "任务已被认领，等待正式启动。".to_string()
             }
         }
+        TaskStatus::ApprovalRequested => "任务正在等待审批确认。".to_string(),
+        TaskStatus::Approved => "任务已通过审批，等待启动执行。".to_string(),
         TaskStatus::Running => {
             if running_without_turn {
                 "任务被标记为 RUNNING，但缺少活跃 turn，状态需要继续校正。".to_string()
@@ -1605,6 +401,9 @@ fn evaluate_task_state_snapshot(task: &Task, evaluator: &str) -> TaskStateSnapsh
             .as_ref()
             .and_then(|runtime| runtime.last_error.clone())
             .unwrap_or_else(|| "任务执行失败，需要人工处理。".to_string()),
+        TaskStatus::PendingAcceptance => "任务已执行完成，等待验收确认。".to_string(),
+        TaskStatus::Accepted => "任务已通过验收。".to_string(),
+        TaskStatus::ManualReview => "任务需要人工复核后决定下一步。".to_string(),
         TaskStatus::Canceled => "任务已取消。".to_string(),
     };
 
@@ -1777,19 +576,12 @@ async fn list_agents(State(state): State<AppState>) -> Json<Vec<Agent>> {
 }
 
 fn parse_task_status(raw: &str) -> AppResult<TaskStatus> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "OPEN" => Ok(TaskStatus::Open),
-        "CLAIMED" => Ok(TaskStatus::Claimed),
-        "RUNNING" => Ok(TaskStatus::Running),
-        "PAUSED" => Ok(TaskStatus::Paused),
-        "DONE" => Ok(TaskStatus::Done),
-        "FAILED" => Ok(TaskStatus::Failed),
-        "CANCELED" => Ok(TaskStatus::Canceled),
-        _ => Err((
+    TaskStatus::parse_filter(raw).ok_or_else(|| {
+        (
             StatusCode::BAD_REQUEST,
             format!("不支持的任务状态筛选：{raw}"),
-        )),
-    }
+        )
+    })
 }
 
 async fn answer_pending_question(
@@ -2058,13 +850,21 @@ async fn start_project_session(
     }
 
     let session_id = Uuid::new_v4();
+    let mode = normalize_project_session_mode(request.mode.as_deref()).to_string();
     let title = request
         .title
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| truncate_title(prompt));
+        .unwrap_or_else(|| {
+            let preview = truncate_title(prompt);
+            if mode == "general" {
+                preview
+            } else {
+                format!("{}：{preview}", project_session_mode_label(&mode))
+            }
+        });
     let workspace_path = workspace_root
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
@@ -2083,6 +883,7 @@ async fn start_project_session(
                 id: session_id,
                 project_id,
                 title,
+                mode: mode.clone(),
                 status: "running".into(),
                 workspace_path,
                 thread_id: None,
@@ -2105,6 +906,7 @@ async fn start_project_session(
                 session_id,
                 &project,
                 latest_scan.as_ref(),
+                &mode,
                 prompt,
             )
             .await?;
@@ -2121,9 +923,20 @@ async fn start_project_session(
         )
     })?;
 
-    let composed_prompt = compose_project_session_prompt(&project, latest_scan.as_ref(), prompt);
+    let composed_prompt = prompt::compose_project_session_prompt_for_mode(
+        &project,
+        latest_scan.as_ref(),
+        prompt,
+        &mode,
+    );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let session = match CodexRuntimeSession::spawn(workspace_root.clone(), event_tx).await {
+    let session = match spawn_runtime_session_with_timeout(
+        workspace_root.clone(),
+        event_tx,
+        "启动项目会话时创建运行时会话",
+    )
+    .await
+    {
         Ok(session) => session,
         Err(error) => {
             mark_project_session_failed(&state, session_id, &error.1).await;
@@ -2131,9 +944,13 @@ async fn start_project_session(
             return Err(error);
         }
     };
-    let thread_id = match session
-        .start_thread(&workspace_root, &project_session_developer_instructions())
-        .await
+    let thread_id = match start_runtime_thread_with_timeout(
+        &session,
+        &workspace_root,
+        &prompt::project_session_developer_instructions_for_mode(&mode),
+        "启动项目会话时创建线程",
+    )
+    .await
     {
         Ok(thread_id) => thread_id,
         Err(error) => {
@@ -2142,9 +959,14 @@ async fn start_project_session(
             return Err(error);
         }
     };
-    let turn_id = match session
-        .start_turn(&workspace_root, &thread_id, &composed_prompt)
-        .await
+    let turn_id = match start_runtime_turn_with_timeout(
+        &session,
+        &workspace_root,
+        &thread_id,
+        &composed_prompt,
+        "启动项目会话时启动会话轮次",
+    )
+    .await
     {
         Ok(turn_id) => turn_id,
         Err(error) => {
@@ -2187,9 +1009,9 @@ async fn continue_project_session(
         return Err((StatusCode::BAD_REQUEST, "补充提问不能为空".into()));
     }
 
-    let (project_id, project, latest_scan, thread_id, workspace_root) = {
+    let (project_id, project, latest_scan, thread_id, workspace_root, mode) = {
         let mut guard = state.inner.lock().await;
-        let (project_id, thread_id) = {
+        let (project_id, thread_id, mode) = {
             let project_session = find_project_session_mut(&mut guard, session_id)
                 .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到项目会话".into()))?;
             if project_session.active_turn_id.is_some() {
@@ -2198,6 +1020,8 @@ async fn continue_project_session(
                     "当前项目会话仍在运行，请稍后再试".into(),
                 ));
             }
+            let mode = normalize_project_session_mode(Some(&project_session.mode)).to_string();
+            project_session.mode = mode.clone();
             project_session.status = "running".into();
             project_session.last_error = None;
             project_session.messages.push(ProjectSessionMessage {
@@ -2212,6 +1036,7 @@ async fn continue_project_session(
             (
                 project_session.project_id,
                 project_session.thread_id.clone(),
+                mode,
             )
         };
 
@@ -2220,7 +1045,14 @@ async fn continue_project_session(
         let workspace_root = project
             .primary_workspace()
             .map(|workspace| PathBuf::from(&workspace.path));
-        (project_id, project, latest_scan, thread_id, workspace_root)
+        (
+            project_id,
+            project,
+            latest_scan,
+            thread_id,
+            workspace_root,
+            mode,
+        )
     };
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) && workspace_root.is_none() {
         mark_project_session_failed(&state, session_id, "项目会话需要先为当前项目配置主工作目录")
@@ -2253,6 +1085,7 @@ async fn continue_project_session(
                 session_id,
                 &project,
                 latest_scan.as_ref(),
+                &mode,
                 prompt,
             )
             .await?;
@@ -2274,20 +1107,25 @@ async fn continue_project_session(
             "项目会话需要先为当前项目配置主工作目录".into(),
         )
     })?;
-    let composed_prompt = compose_project_session_prompt(&project, latest_scan.as_ref(), prompt);
+    let composed_prompt = prompt::compose_project_session_prompt_for_mode(
+        &project,
+        latest_scan.as_ref(),
+        prompt,
+        &mode,
+    );
 
     let resolved_session =
         resolve_project_runtime_session(&state, session_id, workspace_root.clone(), &thread_id)
             .await?;
 
-    let turn_id = match resolved_session
-        .session
-        .start_turn(
-            &workspace_root,
-            &resolved_session.thread_id,
-            &composed_prompt,
-        )
-        .await
+    let turn_id = match start_runtime_turn_with_timeout(
+        &resolved_session.session,
+        &workspace_root,
+        &resolved_session.thread_id,
+        &composed_prompt,
+        "恢复项目会话时启动会话轮次",
+    )
+    .await
     {
         Ok(turn_id) => turn_id,
         Err(error) => {
@@ -2345,13 +1183,20 @@ async fn create_task(
         labels: request.labels,
         creator_user_id: current_user.as_ref().map(|user| user.id),
         assignee_user_id: None,
+        assignment_mode: TaskAssignmentMode::PublicQueue,
+        requested_agent_id: None,
         source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.created",
-            format!("任务由界面创建，并归属到项目“{}”", project.name),
+            format!(
+                "任务由界面创建，并归属到项目\u{201c}{}\u{201d}",
+                project.name
+            ),
         )],
         runtime: None,
+        approval: Default::default(),
+        acceptance: Default::default(),
         state_snapshot: TaskStateSnapshot::default(),
     };
     guard.tasks.insert(0, task.clone());
@@ -2496,7 +1341,9 @@ async fn claim_task(
     State(state): State<AppState>,
 ) -> AppResult<Json<BoardSnapshot>> {
     let mut guard = state.inner.lock().await;
-    if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+    if let Some(conflict) =
+        active_task_conflict(&guard.projects, &guard.tasks, task_id, Some(task_id))
+    {
         return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
     }
     let (agent_name, owner_user_id) = guard
@@ -2544,7 +1391,9 @@ async fn start_task(
 ) -> AppResult<Json<BoardSnapshot>> {
     {
         let mut guard = state.inner.lock().await;
-        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+        if let Some(conflict) =
+            active_task_conflict(&guard.projects, &guard.tasks, task_id, Some(task_id))
+        {
             return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
         }
         let task = find_task_mut(&mut guard, task_id)?;
@@ -2553,7 +1402,8 @@ async fn start_task(
         }
     }
 
-    let context = resolve_task_execution_context(&state, task_id, request.prompt.clone()).await?;
+    let context = prompt::resolve_task_execution_context(&state, task_id, request.prompt.clone())
+        .await?;
     let _ = std::fs::create_dir_all(&context.workspace_root);
     let mut git_auto_merge_enabled = false;
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
@@ -2573,11 +1423,23 @@ async fn start_task(
                 task_id,
                 agent_id,
                 &request.agent_name_hint,
+                "stub-codex",
                 &context.prompt,
                 Some("stub-thread".into()),
                 Some("stub-turn".into()),
                 false,
             )?;
+            record_task_run_start(
+                &mut guard,
+                task_id,
+                agent_id,
+                "stub-codex",
+                &context.prompt,
+                Some(context.workspace_root.display().to_string()),
+                Some("stub-thread".into()),
+                Some("stub-turn".into()),
+                "start",
+            );
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
             persist_state(&state).await?;
@@ -2585,14 +1447,30 @@ async fn start_task(
         }
         RuntimeMode::RealCodex => {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let session =
-                CodexRuntimeSession::spawn(context.workspace_root.clone(), event_tx).await?;
-            let thread_id = session
-                .start_thread(&context.workspace_root, &task_developer_instructions())
+            let session = spawn_runtime_session_with_timeout(
+                context.workspace_root.clone(),
+                event_tx,
+                "启动任务时创建运行时会话",
+            )
+            .await?;
+            let provider_id = session.provider_id().to_string();
+                let thread_id = start_runtime_thread_with_timeout(
+                    &session,
+                    &context.workspace_root,
+                    &prompt::task_developer_instructions(),
+                    "启动任务时创建线程",
+                )
                 .await?;
-            let turn_id = session
-                .start_turn(&context.workspace_root, &thread_id, &context.prompt)
-                .await?;
+            let turn_id = start_runtime_turn_with_timeout(
+                &session,
+                &context.workspace_root,
+                &thread_id,
+                &context.prompt,
+                "启动任务时启动会话轮次",
+            )
+            .await?;
+            let run_thread_id = thread_id.clone();
+            let run_turn_id = turn_id.clone();
             {
                 let mut guard = state.inner.lock().await;
                 mark_task_running(
@@ -2600,11 +1478,23 @@ async fn start_task(
                     task_id,
                     agent_id,
                     &request.agent_name_hint,
+                    &provider_id,
                     &context.prompt,
                     Some(thread_id),
                     Some(turn_id),
                     git_auto_merge_enabled,
                 )?;
+                record_task_run_start(
+                    &mut guard,
+                    task_id,
+                    agent_id,
+                    &provider_id,
+                    &context.prompt,
+                    Some(context.workspace_root.display().to_string()),
+                    Some(run_thread_id),
+                    Some(run_turn_id),
+                    "start",
+                );
             }
             state.runtime_sessions.lock().await.insert(task_id, session);
             tokio::spawn(runtime_event_loop(
@@ -2612,6 +1502,7 @@ async fn start_task(
                 task_id,
                 agent_id,
                 event_rx,
+                provider_id,
             ));
             let guard = state.inner.lock().await;
             let snapshot = snapshot_from_state(&guard);
@@ -2640,6 +1531,14 @@ async fn pause_task(
                         .push(new_runtime_entry("system", "已暂停当前任务"));
                 }
             }
+            record_task_run_transition(
+                &mut guard,
+                task_id,
+                "interrupted",
+                Some("task paused by user"),
+                None,
+                None,
+            );
             reset_agent_if_needed(&mut guard, task_id, "任务已暂停，等待恢复");
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
@@ -2677,6 +1576,14 @@ async fn pause_task(
                     .push(new_runtime_entry("system", "已暂停当前任务"));
             }
         }
+        record_task_run_transition(
+            &mut guard,
+            task_id,
+            "interrupted",
+            Some("task paused by user"),
+            Some(&thread_id),
+            Some(&turn_id),
+        );
         reset_agent_if_needed(&mut guard, task_id, "任务已暂停，等待恢复");
         snapshot_from_state(&guard)
     };
@@ -2730,6 +1637,7 @@ async fn cancel_task(
             "task.canceled",
             format!("任务已撤销。操作人: {current_user_label}；原因: {reason}"),
         ));
+        record_task_run_transition(&mut guard, task_id, "aborted", Some(reason), None, None);
         reset_agent_if_needed(&mut guard, task_id, "最近一次任务已撤销");
     }
 
@@ -2751,7 +1659,9 @@ async fn resume_task(
 
     {
         let mut guard = state.inner.lock().await;
-        if let Some(conflict) = active_task_conflict(&guard.tasks, Some(task_id)) {
+        if let Some(conflict) =
+            active_task_conflict(&guard.projects, &guard.tasks, task_id, Some(task_id))
+        {
             return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
         }
         let task = find_task_mut(&mut guard, task_id)?;
@@ -2763,6 +1673,7 @@ async fn resume_task(
     match state.runtime_mode {
         RuntimeMode::Stub => {
             let mut guard = state.inner.lock().await;
+            let prompt_for_history = request.prompt.trim().to_string();
             {
                 let task = find_task_mut(&mut guard, task_id)?;
                 task.status = TaskStatus::Done;
@@ -2786,7 +1697,27 @@ async fn resume_task(
                     .log
                     .push(new_runtime_entry("assistant", "Stub 会话已完成任务"));
                 runtime.active_turn_id = None;
+                runtime.last_error = None;
             }
+            record_task_run_start(
+                &mut guard,
+                task_id,
+                agent_id,
+                "stub-codex",
+                &prompt_for_history,
+                None,
+                Some("stub-thread".into()),
+                Some("stub-turn-2".into()),
+                "resume",
+            );
+            record_task_run_transition(
+                &mut guard,
+                task_id,
+                "completed",
+                Some("stub resume completed"),
+                Some("stub-thread"),
+                Some("stub-turn-2"),
+            );
             process_task_completion_outputs(&mut guard, task_id);
             reset_agent_if_needed(&mut guard, task_id, "最近一次任务已完成");
             let snapshot = snapshot_from_state(&guard);
@@ -2813,14 +1744,14 @@ async fn resume_task(
     )
     .await?;
 
-    let turn_id = match resolved_session
-        .session
-        .start_turn(
-            &workspace_root,
-            &resolved_session.thread_id,
-            request.prompt.trim(),
-        )
-        .await
+    let turn_id = match start_runtime_turn_with_timeout(
+        &resolved_session.session,
+        &workspace_root,
+        &resolved_session.thread_id,
+        request.prompt.trim(),
+        "恢复任务时启动会话轮次",
+    )
+    .await
     {
         Ok(turn_id) => turn_id,
         Err(error) => {
@@ -2854,10 +1785,22 @@ async fn resume_task(
                 runtime
                     .log
                     .push(new_runtime_entry("user", request.prompt.trim().to_string()));
-                runtime.thread_id = Some(resolved_session.thread_id);
-                runtime.active_turn_id = Some(turn_id);
+                runtime.provider = resolved_session.session.provider_id().to_string();
+                runtime.thread_id = Some(resolved_session.thread_id.clone());
+                runtime.active_turn_id = Some(turn_id.clone());
             }
         }
+        record_task_run_start(
+            &mut guard,
+            task_id,
+            agent_id,
+            resolved_session.session.provider_id(),
+            request.prompt.trim(),
+            Some(workspace_root.display().to_string()),
+            Some(resolved_session.thread_id.clone()),
+            Some(turn_id.clone()),
+            "resume",
+        );
         assign_agent_running(&mut guard, agent_id, task_id, "继续执行当前任务".into());
         snapshot_from_state(&guard)
     };
@@ -2871,14 +1814,14 @@ async fn resolve_task_runtime_session(
     agent_id: Uuid,
     workspace_root: PathBuf,
     thread_id: &str,
-) -> AppResult<ResolvedRuntimeSession> {
+) -> AppResult<ResolvedProviderRuntimeSession> {
     let existing_session = {
         let sessions = state.runtime_sessions.lock().await;
         sessions.get(&task_id).cloned()
     };
 
     if let Some(session) = existing_session {
-        return Ok(ResolvedRuntimeSession {
+        return Ok(ResolvedProviderRuntimeSession {
             session,
             thread_id: thread_id.to_string(),
             event_rx: None,
@@ -2886,17 +1829,21 @@ async fn resolve_task_runtime_session(
     }
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let session = CodexRuntimeSession::spawn(workspace_root, event_tx).await?;
-    let resumed_thread_id = match session.resume_thread(thread_id).await {
-        Ok(thread_id) => thread_id,
-        Err(error) => {
-            session.shutdown().await;
-            return Err(error);
-        }
-    };
+    let session =
+        spawn_runtime_session_with_timeout(workspace_root, event_tx, "恢复任务时创建运行时会话")
+            .await?;
+    let resumed_thread_id =
+        match resume_runtime_thread_with_timeout(&session, thread_id, "恢复任务时恢复线程").await
+        {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                session.shutdown().await;
+                return Err(error);
+            }
+        };
 
     let _ = agent_id;
-    Ok(ResolvedRuntimeSession {
+    Ok(ResolvedProviderRuntimeSession {
         session,
         thread_id: resumed_thread_id,
         event_rx: Some(event_rx),
@@ -2907,19 +1854,21 @@ async fn register_task_runtime_session(
     state: &AppState,
     task_id: Uuid,
     agent_id: Uuid,
-    session: Arc<CodexRuntimeSession>,
+    session: Arc<ProviderRuntimeSession>,
     event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
 ) {
     let Some(event_rx) = event_rx else {
         return;
     };
 
+    let provider_id = session.provider_id().to_string();
     state.runtime_sessions.lock().await.insert(task_id, session);
     tokio::spawn(runtime_event_loop(
         state.clone(),
         task_id,
         agent_id,
         event_rx,
+        provider_id,
     ));
 }
 
@@ -2928,14 +1877,14 @@ async fn resolve_project_runtime_session(
     session_id: Uuid,
     workspace_root: PathBuf,
     thread_id: &str,
-) -> AppResult<ResolvedRuntimeSession> {
+) -> AppResult<ResolvedProviderRuntimeSession> {
     let existing_session = {
         let sessions = state.runtime_sessions.lock().await;
         sessions.get(&session_id).cloned()
     };
 
     if let Some(session) = existing_session {
-        return Ok(ResolvedRuntimeSession {
+        return Ok(ResolvedProviderRuntimeSession {
             session,
             thread_id: thread_id.to_string(),
             event_rx: None,
@@ -2943,16 +1892,24 @@ async fn resolve_project_runtime_session(
     }
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let session = CodexRuntimeSession::spawn(workspace_root, event_tx).await?;
-    let resumed_thread_id = match session.resume_thread(thread_id).await {
-        Ok(thread_id) => thread_id,
-        Err(error) => {
-            session.shutdown().await;
-            return Err(error);
-        }
-    };
+    let session = spawn_runtime_session_with_timeout(
+        workspace_root,
+        event_tx,
+        "恢复项目会话时创建运行时会话",
+    )
+    .await?;
+    let resumed_thread_id =
+        match resume_runtime_thread_with_timeout(&session, thread_id, "恢复项目会话时恢复线程")
+            .await
+        {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                session.shutdown().await;
+                return Err(error);
+            }
+        };
 
-    Ok(ResolvedRuntimeSession {
+    Ok(ResolvedProviderRuntimeSession {
         session,
         thread_id: resumed_thread_id,
         event_rx: Some(event_rx),
@@ -2962,7 +1919,7 @@ async fn resolve_project_runtime_session(
 async fn register_project_runtime_session(
     state: &AppState,
     session_id: Uuid,
-    session: Arc<CodexRuntimeSession>,
+    session: Arc<ProviderRuntimeSession>,
     event_rx: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
 ) {
     let Some(event_rx) = event_rx else {
@@ -2986,6 +1943,7 @@ async fn runtime_event_loop(
     task_id: Uuid,
     agent_id: Uuid,
     mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    provider_id: String,
 ) {
     while let Some(event) = event_rx.recv().await {
         let mut guard = state.inner.lock().await;
@@ -3002,7 +1960,7 @@ async fn runtime_event_loop(
         {
             let task = &mut guard.tasks[task_index];
             let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
-                provider: "codex".into(),
+                provider: provider_id.clone(),
                 thread_id: None,
                 active_turn_id: None,
                 git_auto_merge_enabled: false,
@@ -3167,12 +2125,16 @@ fn snapshot_from_state(state: &BoardState) -> BoardSnapshot {
 }
 
 fn snapshot_from_state_with_user(state: &BoardState, current_user: Option<User>) -> BoardSnapshot {
+    let mut task_run_history = state.task_run_history.clone();
+    let _ = normalize_task_run_history_entries(&state.tasks, &mut task_run_history);
+
     BoardSnapshot {
         current_user,
         users: state.users.clone(),
         projects: state.projects.clone(),
         tasks: state.tasks.iter().map(board_snapshot_task).collect(),
         agents: state.agents.clone(),
+        task_run_history,
         pending_questions: state.pending_questions.clone(),
     }
 }
@@ -3269,6 +2231,7 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
                 projects: guard.projects.clone(),
                 tasks: guard.tasks.clone(),
                 agents: guard.agents.clone(),
+                task_run_history: guard.task_run_history.clone(),
                 pending_questions: guard.pending_questions.clone(),
                 project_scans: guard.project_scans.clone(),
                 project_sessions: guard.project_sessions.clone(),
@@ -3277,6 +2240,7 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
                 memory_revisions: guard.memory_revisions.clone(),
                 memory_tags: guard.memory_tags.clone(),
                 memory_edges: guard.memory_edges.clone(),
+                decisions: guard.decisions.clone(),
             },
             state.store_path.clone(),
         )
@@ -3285,6 +2249,7 @@ async fn persist_state(state: &AppState) -> AppResult<()> {
     for task in &mut persisted.tasks {
         refresh_task_state_snapshot(task, "server.persist");
     }
+    let _ = normalize_task_run_history(&mut persisted);
 
     persist_state_to_path(&store_path, &persisted)
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
@@ -3382,6 +2347,7 @@ fn project_task_status_counts(tasks: &[&Task]) -> ProjectTaskStatusCounts {
             TaskStatus::Done => counts.done += 1,
             TaskStatus::Failed => counts.failed += 1,
             TaskStatus::Canceled => counts.canceled += 1,
+            _ => {}
         }
     }
     counts
@@ -3505,21 +2471,6 @@ fn recent_task_summary_digests(
     entries.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     entries.truncate(limit);
     entries
-}
-
-struct MemoryWriteSpec {
-    scope_kind: &'static str,
-    scope_id: Uuid,
-    memory_kind: &'static str,
-    stable_key: String,
-    tag: String,
-    title: String,
-    content: String,
-    structured_payload: Option<Value>,
-    source_kind: &'static str,
-    source_id: Option<String>,
-    confidence: Option<f32>,
-    created_by: Option<Uuid>,
 }
 
 fn project_memory_snapshot(state: &BoardState, project_id: Uuid) -> ProjectMemorySnapshot {
@@ -3830,99 +2781,86 @@ fn is_document_file(path: &Path) -> bool {
     )
 }
 
-fn compose_project_session_prompt(
-    project: &Project,
-    latest_scan: Option<&ProjectScanSummary>,
-    user_prompt: &str,
-) -> String {
-    let workspace_list = project
-        .workspace_roots
-        .iter()
-        .map(|workspace| {
-            format!(
-                "- {}: {}（{}）",
-                workspace.label,
-                workspace.path,
-                if workspace.writable {
-                    "可写"
-                } else {
-                    "只读"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let scan_summary = latest_scan
-        .map(|scan| {
-            format!(
-                "最近扫描摘要：{}\n顶层目录：{}\n关键文件：{}\n文档文件：{}\n提示：{}",
-                scan.stack_summary,
-                if scan.top_level_entries.is_empty() {
-                    "无".into()
-                } else {
-                    scan.top_level_entries.join("、")
-                },
-                if scan.key_files.is_empty() {
-                    "无".into()
-                } else {
-                    scan.key_files.join("、")
-                },
-                if scan.document_files.is_empty() {
-                    "无".into()
-                } else {
-                    scan.document_files.join("、")
-                },
-                if scan.notes.is_empty() {
-                    "无".into()
-                } else {
-                    scan.notes.join("；")
-                }
-            )
-        })
-        .unwrap_or_else(|| "最近还没有项目扫描摘要；如果需要判断目录结构、文档和构建入口，请先建议用户执行项目扫描。".into());
-
-    format!(
-        "你正在进行 Spotlight 的项目级问答会话，而不是直接执行一个任务。\n\
-项目名称：{}\n\
-项目说明：{}\n\
-可见工作目录：\n{}\n\
-{}\n\
-\n\
-当前用户问题：{}\n\
-\n\
-回答要求：\n\
-1. 优先用中文回答。\n\
-2. 先基于目录结构、代码和文档做判断，不要臆造未读取到的内容。\n\
-3. 如果信息不足，要明确指出缺口，并给出下一步建议。\n\
-4. 如果适合拆成任务，请顺手给出建议任务标题和说明。\n\
-5. 若涉及实际改动，先说明影响范围和风险，再给方案。",
-        project.name, project.description, workspace_list, scan_summary, user_prompt
-    )
-}
-
-fn project_session_developer_instructions() -> String {
-    [
-        "你是 Spotlight 的项目协作 Agent。",
-        "当前会话的目标是帮助用户理解项目目录、文档、代码结构和下一步改动方向。",
-        "默认优先做分析、解释、风险提示和任务拆解，而不是直接执行破坏性修改。",
-        "当需要代码改动时，要先说清楚影响范围、依赖条件和建议步骤。",
-        "回答尽量用中文，结构清晰，可读性高。",
-    ]
-    .join(" ")
-}
-
 fn build_stub_project_session_reply(
     project: &Project,
     latest_scan: Option<&ProjectScanSummary>,
+    mode: &str,
     prompt: &str,
 ) -> String {
     let scan_line = latest_scan
         .map(|scan| format!("最近扫描结果：{}。", scan.stack_summary))
         .unwrap_or_else(|| "当前还没有扫描摘要，建议先对项目目录做一次扫描。".into());
 
-    format!(
-        "这是项目会话的本地 Stub 回复。\n\
+    match normalize_project_session_mode(Some(mode)) {
+        "planner" => format!(
+            "这是规划器会话的本地 Stub 回复。\n\
+项目：{}\n\
+{}\n\
+用户目标：{}\n\
+\n\
+建议先形成最小规格、里程碑和验收口径，再让生成器沿着同一目标推进。\n\
+```json\n\
+{{\n\
+  \"result\": \"plan_ready\",\n\
+  \"summary\": \"已整理出最小可用规划，建议先补规划与验收基线，再进入实现。\",\n\
+  \"questions\": [\n\
+    {{\n\
+      \"question\": \"是否先把桌面端客户端稳定性作为第一优先级？\",\n\
+      \"context\": \"当前用户更关注客户端真实可用，而不是纯后端能力堆叠\"\n\
+    }}\n\
+  ],\n\
+  \"follow_ups\": [\n\
+    {{\n\
+      \"kind\": \"follow_up_task\",\n\
+      \"title\": \"梳理客户端 Harness 最小闭环规格\",\n\
+      \"description\": \"明确 planner / generator / evaluator 在当前版本中的最小落地点、入口和验收标准。\",\n\
+      \"priority\": \"P1\",\n\
+      \"can_auto_create_task\": true,\n\
+      \"can_auto_apply\": false\n\
+    }},\n\
+    {{\n\
+      \"kind\": \"test_gap\",\n\
+      \"title\": \"补项目会话模式回归测试\",\n\
+      \"description\": \"覆盖 planner / evaluator 会话完成后自动沉淀记忆和拆任务的行为。\",\n\
+      \"priority\": \"P1\",\n\
+      \"can_auto_create_task\": true,\n\
+      \"can_auto_apply\": false\n\
+    }}\n\
+  ],\n\
+  \"risks\": [\"如果没有统一验收标准，后续多轮会话容易继续碎片化推进\"]\n\
+}}\n\
+```",
+            project.name, scan_line, prompt
+        ),
+        "evaluator" => format!(
+            "这是评估器会话的本地 Stub 回复。\n\
+项目：{}\n\
+{}\n\
+当前评估目标：{}\n\
+\n\
+初步判断：需要优先检查客户端是否真的能看到运行中任务、实时日志和失败原因。\n\
+```json\n\
+{{\n\
+  \"result\": \"needs_fix\",\n\
+  \"summary\": \"发现客户端可观测性仍是主阻塞，建议先修日志和状态可见性。\",\n\
+  \"questions\": [],\n\
+  \"follow_ups\": [\n\
+    {{\n\
+      \"kind\": \"bug_fix\",\n\
+      \"title\": \"修复项目会话与任务运行日志可见性\",\n\
+      \"description\": \"确保客户端能稳定看到运行中任务、Agent 输出和 failed to fetch 的真实原因。\",\n\
+      \"priority\": \"P1\",\n\
+      \"can_auto_create_task\": true,\n\
+      \"can_auto_apply\": false\n\
+    }}\n\
+  ],\n\
+  \"risks\": [\"如果评估只停留在状态字段而没有真实输出链路，客户端仍会表现为像死了一样\"]\n\
+}}\n\
+```",
+            project.name, scan_line, prompt
+        ),
+        _ => format!(
+            "这是项目会话的本地 Stub 回复。\n\
 项目：{}\n\
 {}\n\
 你刚刚的问题：{}\n\
@@ -3931,8 +2869,9 @@ fn build_stub_project_session_reply(
 1. 先确认项目目录和关键 workspace 是否已经接入。\n\
 2. 如果需要判断代码入口、文档分布或构建方式，先执行项目扫描。\n\
 3. 如果已经足够明确，就把结论继续追问，或拆成正式任务推进。",
-        project.name, scan_line, prompt
-    )
+            project.name, scan_line, prompt
+        ),
+    }
 }
 
 async fn complete_stub_project_session(
@@ -3940,9 +2879,10 @@ async fn complete_stub_project_session(
     session_id: Uuid,
     project: &Project,
     latest_scan: Option<&ProjectScanSummary>,
+    mode: &str,
     prompt: &str,
 ) -> AppResult<()> {
-    let reply = build_stub_project_session_reply(project, latest_scan, prompt);
+    let reply = build_stub_project_session_reply(project, latest_scan, mode, prompt);
     let mut guard = state.inner.lock().await;
     let Some(project_session) = find_project_session_mut(&mut guard, session_id) else {
         return Err((StatusCode::NOT_FOUND, "未找到项目会话".into()));
@@ -3960,6 +2900,7 @@ async fn complete_stub_project_session(
     project_session
         .log
         .push(new_runtime_entry("assistant", reply));
+    process_project_session_completion_outputs(&mut guard, session_id);
     drop(guard);
     persist_state(state).await
 }
@@ -3986,6 +2927,7 @@ async fn project_session_event_loop(
 
     while let Some(event) = event_rx.recv().await {
         let mut remove_runtime = false;
+        let mut should_process_completion_outputs = false;
         {
             let mut guard = state.inner.lock().await;
             let Some(project_session) = find_project_session_mut(&mut guard, session_id) else {
@@ -4044,6 +2986,7 @@ async fn project_session_event_loop(
                         "project.session.turn_completed",
                         format!("项目会话轮次结束：{status}"),
                     ));
+                    should_process_completion_outputs = status == "completed";
                 }
                 RuntimeEvent::Error { message } => {
                     project_session.active_turn_id = None;
@@ -4077,6 +3020,11 @@ async fn project_session_event_loop(
             }
         }
 
+        if should_process_completion_outputs {
+            let mut guard = state.inner.lock().await;
+            process_project_session_completion_outputs(&mut guard, session_id);
+        }
+
         let _ = persist_state(&state).await;
 
         if remove_runtime {
@@ -4108,331 +3056,6 @@ async fn reconcile_project_session_runtime_lost(state: &AppState, session_id: Uu
         .push(new_runtime_entry("project.session.runtime_lost", message));
     drop(guard);
     let _ = persist_state(state).await;
-}
-
-fn process_task_completion_outputs(state: &mut BoardState, task_id: Uuid) -> bool {
-    let Some(source_task) = state.tasks.iter().find(|task| task.id == task_id).cloned() else {
-        return false;
-    };
-    let Some(runtime) = source_task.runtime.as_ref() else {
-        return false;
-    };
-    let Some(report) = extract_task_completion_report(&runtime.log) else {
-        return false;
-    };
-    let summary_text = report
-        .summary
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    let mut auto_created_task_count = 0;
-    let mut pending_question_count = 0;
-    let mut risk_count = 0;
-
-    for follow_up in &report.follow_ups {
-        if !should_auto_create_follow_up_task(follow_up) {
-            continue;
-        }
-
-        let title = follow_up.title.trim();
-        let description = follow_up.description.trim();
-        if title.is_empty() || description.is_empty() {
-            continue;
-        }
-
-        let already_exists = state.tasks.iter().any(|task| {
-            task.project_id == source_task.project_id
-                && task.source_task_id == Some(source_task.id)
-                && task.title == title
-        });
-        if already_exists {
-            continue;
-        }
-
-        state.tasks.insert(
-            0,
-            Task {
-                id: Uuid::new_v4(),
-                project_id: source_task.project_id,
-                title: title.to_string(),
-                description: compose_follow_up_task_description(&source_task, follow_up),
-                status: TaskStatus::Open,
-                priority: parse_follow_up_priority(follow_up.priority.as_deref()),
-                labels: Vec::new(),
-                creator_user_id: source_task.creator_user_id,
-                assignee_user_id: None,
-                source_task_id: Some(source_task.id),
-                claimed_by: None,
-                activities: vec![new_activity(
-                    "task.auto_created_from_completion",
-                    format!("该任务由“{}”完成后的结构化建议自动生成", source_task.title),
-                )],
-                runtime: None,
-                state_snapshot: TaskStateSnapshot::default(),
-            },
-        );
-        auto_created_task_count += 1;
-    }
-
-    for question in &report.questions {
-        let Some((question_text, context)) = normalize_completion_question(question) else {
-            continue;
-        };
-        let already_exists = state.pending_questions.iter().any(|item| {
-            item.source_task_id == source_task.id
-                && item.question == question_text
-                && item.status != "answered"
-        });
-        if already_exists {
-            continue;
-        }
-
-        state.pending_questions.push(PendingQuestion {
-            id: Uuid::new_v4(),
-            project_id: source_task.project_id,
-            source_task_id: source_task.id,
-            source_task_title: source_task.title.clone(),
-            question: question_text,
-            context,
-            status: "open".into(),
-            answer: None,
-            created_at: timestamp_string(),
-            answered_at: None,
-        });
-        pending_question_count += 1;
-    }
-
-    if let Some(summary) = summary_text.as_ref() {
-        write_memory_revision(
-            state,
-            MemoryWriteSpec {
-                scope_kind: "task",
-                scope_id: source_task.id,
-                memory_kind: "task_summary",
-                stable_key: format!("task_summary/{}", source_task.id),
-                tag: format!("task/{}/latest-summary", source_task.id),
-                title: format!("任务摘要：{}", source_task.title),
-                content: summary.clone(),
-                structured_payload: Some(serde_json::json!({
-                    "taskId": source_task.id,
-                    "projectId": source_task.project_id,
-                    "result": report.result.clone(),
-                    "summary": summary,
-                    "questions": report.questions.len(),
-                    "followUps": report.follow_ups.len(),
-                    "risks": report.risks.clone(),
-                })),
-                source_kind: "task_completion_report",
-                source_id: Some(source_task.id.to_string()),
-                confidence: Some(0.9),
-                created_by: source_task.creator_user_id,
-            },
-        );
-    }
-
-    if let Some(task) = state.tasks.iter_mut().find(|task| task.id == task_id) {
-        if let Some(summary) = summary_text.as_deref() {
-            task.activities.push(new_activity(
-                "task.completion_summary",
-                format!("任务完成总结：{summary}"),
-            ));
-        }
-        if auto_created_task_count > 0 {
-            task.activities.push(new_activity(
-                "task.follow_ups_created",
-                format!(
-                    "已根据 Agent 建议自动创建 {} 个后续任务",
-                    auto_created_task_count
-                ),
-            ));
-        }
-        if pending_question_count > 0 {
-            task.activities.push(new_activity(
-                "task.questions_captured",
-                format!("已统一收口 {} 个待回答问题", pending_question_count),
-            ));
-        }
-        if !report.risks.is_empty() {
-            for risk in report
-                .risks
-                .iter()
-                .map(|risk| risk.trim())
-                .filter(|risk| !risk.is_empty())
-            {
-                task.activities.push(new_activity(
-                    "task.completion_risk",
-                    format!("完成后风险提示：{risk}"),
-                ));
-                risk_count += 1;
-            }
-        }
-    }
-
-    let _ = risk_count;
-    true
-}
-
-fn extract_task_completion_report(log: &[RuntimeLogEntry]) -> Option<TaskCompletionReport> {
-    for entry in log.iter().rev() {
-        if entry.kind != "assistant" {
-            continue;
-        }
-        if let Some(report) = parse_task_completion_report_text(&entry.message) {
-            let has_content = report
-                .result
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-                || report
-                    .summary
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_some()
-                || !report.questions.is_empty()
-                || !report.follow_ups.is_empty()
-                || !report.risks.is_empty();
-            if has_content {
-                return Some(report);
-            }
-        }
-    }
-    None
-}
-
-fn parse_task_completion_report_text(text: &str) -> Option<TaskCompletionReport> {
-    for candidate in completion_json_candidates(text) {
-        if let Ok(report) = serde_json::from_str::<TaskCompletionReport>(&candidate) {
-            return Some(report);
-        }
-    }
-    None
-}
-
-fn completion_json_candidates(text: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for segment in text.rsplit("```") {
-        let trimmed = segment.trim();
-        let candidate = if let Some(rest) = trimmed.strip_prefix("json") {
-            rest.trim()
-        } else {
-            trimmed
-        };
-        if candidate.starts_with('{') && candidate.ends_with('}') && !candidate.is_empty() {
-            let owned = candidate.to_string();
-            if !candidates.contains(&owned) {
-                candidates.push(owned);
-            }
-        }
-    }
-
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if start < end {
-            let candidate = text[start..=end].trim().to_string();
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
-    }
-
-    candidates
-}
-
-fn normalize_completion_question(
-    question: &TaskCompletionQuestion,
-) -> Option<(String, Option<String>)> {
-    match question {
-        TaskCompletionQuestion::Text(question) => {
-            let trimmed = question.trim();
-            (!trimmed.is_empty()).then(|| (trimmed.to_string(), None))
-        }
-        TaskCompletionQuestion::Detailed { question, context } => {
-            let trimmed = question.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some((
-                    trimmed.to_string(),
-                    context
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToOwned::to_owned),
-                ))
-            }
-        }
-    }
-}
-
-fn should_auto_create_follow_up_task(follow_up: &TaskCompletionFollowUp) -> bool {
-    if follow_up.can_auto_apply == Some(true) {
-        return false;
-    }
-    if let Some(can_auto_create_task) = follow_up.can_auto_create_task {
-        return can_auto_create_task;
-    }
-
-    matches!(
-        follow_up.kind.as_deref().map(str::trim).map(str::to_ascii_lowercase),
-        Some(kind)
-            if matches!(
-                kind.as_str(),
-                "doc_update"
-                    | "documentation"
-                    | "docs"
-                    | "test_gap"
-                    | "test"
-                    | "cleanup"
-                    | "refactor_followup"
-                    | "follow_up_task"
-            )
-    )
-}
-
-fn parse_follow_up_priority(priority: Option<&str>) -> Option<TaskPriority> {
-    let priority = priority?.trim();
-    if priority.is_empty() {
-        return None;
-    }
-
-    let priority = priority.to_ascii_uppercase();
-    match priority.as_str() {
-        "P0" | "P1" | "HIGH" | "URGENT" | "CRITICAL" => Some(TaskPriority::High),
-        "P2" | "MEDIUM" | "NORMAL" => Some(TaskPriority::Medium),
-        "P3" | "LOW" | "MINOR" => Some(TaskPriority::Low),
-        _ => None,
-    }
-}
-
-fn compose_follow_up_task_description(
-    source_task: &Task,
-    follow_up: &TaskCompletionFollowUp,
-) -> String {
-    let kind = follow_up
-        .kind
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("follow_up_task");
-    let priority = follow_up
-        .priority
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("未标注");
-
-    format!(
-        "该任务由已完成任务“{}”自动派生。\n\
-来源任务 ID：{}\n\
-建议类型：{}\n\
-建议优先级：{}\n\
-\n\
-建议说明：\n{}",
-        source_task.title, source_task.id, kind, priority, follow_up.description
-    )
 }
 
 fn resolve_project_for_new_task(
@@ -4526,42 +3149,6 @@ async fn resolve_workspace_for_task(state: &AppState, task_id: Uuid) -> AppResul
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
     let project = find_project(&guard, task.project_id)?;
     primary_workspace_path(project)
-}
-
-async fn resolve_task_execution_context(
-    state: &AppState,
-    task_id: Uuid,
-    prompt_override: Option<String>,
-) -> AppResult<TaskExecutionContext> {
-    let guard = state.inner.lock().await;
-    let task = guard
-        .tasks
-        .iter()
-        .find(|task| task.id == task_id)
-        .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
-    let project = find_project(&guard, task.project_id)?.clone();
-    let workspace_root = primary_workspace_path(&project)?;
-    let latest_scan = guard.project_scans.get(&task.project_id).cloned();
-    let project_constraints = active_project_constraint_lines(&guard, task.project_id);
-    let recent_task_summaries = recent_project_task_summary_lines(&guard, task.project_id, 4);
-    let pending_question_lines = open_pending_question_lines(&guard, task.project_id, 4);
-    let recent_project_chat =
-        recent_project_chat_messages(&guard.project_chat_messages, task.project_id, 8);
-    let prompt = compose_task_prompt(
-        &task,
-        &project,
-        latest_scan.as_ref(),
-        &project_constraints,
-        &recent_task_summaries,
-        &pending_question_lines,
-        &recent_project_chat,
-        prompt_override,
-    );
-    Ok(TaskExecutionContext {
-        workspace_root,
-        prompt,
-    })
 }
 
 fn prompt_timestamp_key(value: &str) -> u128 {
@@ -4844,6 +3431,71 @@ fn open_pending_question_lines(state: &BoardState, project_id: Uuid, limit: usiz
         .collect()
 }
 
+fn compose_task_context_snapshot(
+    task: &Task,
+    project: &Project,
+    latest_scan: Option<&ProjectScanSummary>,
+    project_constraint_lines: &[String],
+    recent_task_summary_lines: &[String],
+    pending_question_lines: &[String],
+    project_chat_messages: &[ProjectChatMessage],
+    recent_activity_lines: &[String],
+    recent_runtime_lines: &[String],
+    scope_signal_lines: &[String],
+) -> String {
+    let priority = task
+        .priority
+        .map(|priority| priority_label(priority).to_string())
+        .unwrap_or_else(|| "未设置".into());
+    let snapshot = serde_json::json!({
+        "project": {
+            "name": project.name,
+            "description": prompt_preview(&project.description, 160),
+            "workspace_roots": project.workspace_roots.iter().map(|workspace| serde_json::json!({
+                "label": workspace.label,
+                "path": workspace.path,
+                "writable": workspace.writable,
+            })).collect::<Vec<_>>(),
+        },
+        "task": {
+            "title": task.title,
+            "description": prompt_preview(&task.description, 240),
+            "status": task.status.as_str(),
+            "priority": priority,
+            "labels": task.labels,
+            "thread_id": task.runtime.as_ref().and_then(|runtime| runtime.thread_id.as_deref()),
+            "last_error": task.runtime.as_ref().and_then(|runtime| runtime.last_error.as_deref()),
+        },
+        "scan": latest_scan.map(|scan| serde_json::json!({
+            "stack_summary": scan.stack_summary,
+            "top_level_entries": scan.top_level_entries,
+            "key_files": scan.key_files,
+            "document_files": scan.document_files,
+            "notes": scan.notes,
+        })),
+        "constraints": project_constraint_lines,
+        "recent_task_summaries": recent_task_summary_lines,
+        "pending_questions": pending_question_lines,
+        "scope_signals": scope_signal_lines,
+        "recent_activity": recent_activity_lines,
+        "recent_runtime": recent_runtime_lines,
+        "recent_project_chat": project_chat_messages
+            .iter()
+            .map(|message| {
+                format!(
+                    "[{}] {}: {}",
+                    message.at,
+                    message.user_display_name,
+                    prompt_preview(&message.content, 120)
+                )
+            })
+            .collect::<Vec<_>>(),
+    });
+
+    serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".into())
+}
+
+#[allow(unreachable_code)]
 fn compose_task_prompt(
     task: &Task,
     project: &Project,
@@ -4854,6 +3506,17 @@ fn compose_task_prompt(
     project_chat_messages: &[ProjectChatMessage],
     prompt_override: Option<String>,
 ) -> String {
+    return crate::prompt::compose_task_prompt_with_snapshot(
+        task,
+        project,
+        latest_scan,
+        project_constraint_lines,
+        recent_task_summary_lines,
+        pending_question_lines,
+        project_chat_messages,
+        prompt_override.clone(),
+    );
+
     let workspace_list = project
         .workspace_roots
         .iter()
@@ -4872,12 +3535,12 @@ fn compose_task_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     let scan_summary = project_scan_summary_for_prompt(latest_scan);
-    let recent_activity_summary = prompt_section_or_default(
-        recent_task_activity_lines(task, 8),
-        "最近还没有任务活动记录。",
-    );
+    let recent_activity_lines = recent_task_activity_lines(task, 8);
+    let recent_activity_summary =
+        prompt_section_or_default(recent_activity_lines.clone(), "最近还没有任务活动记录。");
+    let recent_runtime_lines = recent_task_runtime_lines(task, 6);
     let recent_runtime_summary =
-        prompt_section_or_default(recent_task_runtime_lines(task, 6), "最近还没有运行输出。");
+        prompt_section_or_default(recent_runtime_lines.clone(), "最近还没有运行输出。");
     let recent_chat_summary = prompt_section_or_default(
         recent_project_chat_lines(project_chat_messages),
         "最近还没有项目聊天室消息。",
@@ -4903,6 +3566,18 @@ fn compose_task_prompt(
             scope_signal_lines.join("\n")
         )
     };
+    let context_snapshot = compose_task_context_snapshot(
+        task,
+        project,
+        latest_scan,
+        project_constraint_lines,
+        recent_task_summary_lines,
+        pending_question_lines,
+        project_chat_messages,
+        &recent_activity_lines,
+        &recent_runtime_lines,
+        &scope_signal_lines,
+    );
 
     let mut prompt = format!(
         "你正在执行 Spotlight 项目任务。\n\
@@ -4929,7 +3604,7 @@ fn compose_task_prompt(
 2. 不要假设当前目录一定是代码仓库；它可能为空，也可能只有 Word、PDF、表格、图片或其他资料。\n\
 3. 如果遇到 Office 或二进制文件，不要臆造内容，可以基于文件名、目录结构、相邻文本和可读元数据给出判断。\n\
 4. 修改前要先核对上面的最近活动、最近运行输出和项目聊天室，避免重复劳动或继续做过期需求。\n\
-5. 对“当前有效项目约束”要视为跨会话仍然有效的长期规则，除非有更新、更明确的近因决策覆盖它。\n\
+5. 对\u{201c}当前有效项目约束\u{201d}要视为跨会话仍然有效的长期规则，除非有更新、更明确的近因决策覆盖它。\n\
 6. 如果最近活动、运行输出或项目聊天表明某个子需求已撤销、先不做、去掉或删除，必须将其视为当前范围外，并在结论里说明你如何收敛范围。\n\
 7. 如果任务标题或旧描述与最近明确决策冲突，以时间更近、表达更明确的决策为准；必要时先做最小安全收口，再提出后续任务。\n\
 8. 项目外目录允许读取，但不要做破坏性修改。\n\
@@ -4952,6 +3627,8 @@ fn compose_task_prompt(
     prompt.push_str(&recent_task_summary);
     prompt.push_str("\n\n仍待回答的项目问题：\n");
     prompt.push_str(&pending_question_summary);
+    prompt.push_str("\n\n任务上下文快照（机器可读）：\n");
+    prompt.push_str(&context_snapshot);
 
     if let Some(extra_prompt) = prompt_override {
         let extra_prompt = extra_prompt.trim();
@@ -4962,23 +3639,6 @@ fn compose_task_prompt(
     }
 
     prompt
-}
-
-impl StackDetection {
-    fn summary(&self) -> String {
-        if self.stacks.is_empty() {
-            "未识别到常见构建清单；当前目录可能是文档目录、交付目录，或需要在更深层继续探索。"
-                .into()
-        } else if self.evidence.is_empty() {
-            format!("{}", self.stacks.join("、"))
-        } else {
-            format!(
-                "{}（线索：{}）",
-                self.stacks.join("、"),
-                self.evidence.join("，")
-            )
-        }
-    }
 }
 
 fn build_local_build_restart_task(project: &Project) -> Task {
@@ -4997,7 +3657,7 @@ fn build_local_build_restart_task(project: &Project) -> Task {
         project_id: project.id,
         title: "本地编译重启".into(),
         description: format!(
-            "请在当前项目工作目录中完成一次“本地编译重启”尝试，并输出中文结论。\n\
+            "请在当前项目工作目录中完成一次\u{201c}本地编译重启\u{201d}尝试，并输出中文结论。\n\
 主工作目录：{}\n\
 初步识别：{}\n\
 \n\
@@ -5027,13 +3687,17 @@ fn build_local_build_restart_task(project: &Project) -> Task {
         labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
+        assignment_mode: TaskAssignmentMode::PublicQueue,
+        requested_agent_id: None,
         source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.local_build_restart_created",
-            format!("已为项目“{}”创建本地编译重启任务", project.name),
+            format!("已为项目\u{201c}{}\u{201d}创建本地编译重启任务", project.name),
         )],
         runtime: None,
+        approval: Default::default(),
+        acceptance: Default::default(),
         state_snapshot: TaskStateSnapshot::default(),
     }
 }
@@ -5081,7 +3745,7 @@ fn build_cloud_install_restart_task(
         project_id: project.id,
         title: "云端安装重启".into(),
         description: format!(
-            "请为当前项目执行一次“云端安装重启”任务，并输出中文结论。\n\
+            "请为当前项目执行一次\u{201c}云端安装重启\u{201d}任务，并输出中文结论。\n\
 \n\
 远端信息：\n\
 - 主机/IP：{}\n\
@@ -5125,13 +3789,17 @@ fn build_cloud_install_restart_task(
         labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
+        assignment_mode: TaskAssignmentMode::PublicQueue,
+        requested_agent_id: None,
         source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.cloud_install_restart_created",
-            format!("已为项目“{}”创建云端安装重启任务", project.name),
+            format!("已为项目\u{201c}{}\u{201d}创建云端安装重启任务", project.name),
         )],
         runtime: None,
+        approval: Default::default(),
+        acceptance: Default::default(),
         state_snapshot: TaskStateSnapshot::default(),
     })
 }
@@ -5336,15 +4004,310 @@ fn build_exploration_task(project: &Project) -> Task {
         labels: Vec::new(),
         creator_user_id: None,
         assignee_user_id: None,
+        assignment_mode: TaskAssignmentMode::PublicQueue,
+        requested_agent_id: None,
         source_task_id: None,
         claimed_by: None,
         activities: vec![new_activity(
             "task.explore_created",
-            format!("已为项目“{}”创建探索任务", project.name),
+            format!("已为项目\u{201c}{}\u{201d}创建探索任务", project.name),
         )],
         runtime: None,
+        approval: Default::default(),
+        acceptance: Default::default(),
         state_snapshot: TaskStateSnapshot::default(),
     }
+}
+
+fn task_run_state_for_task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Done | TaskStatus::Accepted | TaskStatus::PendingAcceptance => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Canceled => "aborted",
+        TaskStatus::Running | TaskStatus::Claimed => "executing",
+        _ => "interrupted",
+    }
+}
+
+fn task_run_is_terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "aborted")
+}
+
+fn append_task_run_thread(run: &mut TaskRunRecord, thread_id: Option<&str>) {
+    let Some(thread_id) = thread_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if !run
+        .session_threads
+        .iter()
+        .any(|existing| existing == thread_id)
+    {
+        run.session_threads.push(thread_id.to_string());
+    }
+}
+
+fn build_legacy_task_run_record(task: &Task, run_number: u32) -> TaskRunRecord {
+    let started_at = task
+        .activities
+        .first()
+        .map(|activity| activity.at.clone())
+        .unwrap_or_else(timestamp_string);
+    let ended_at = (!matches!(task.status, TaskStatus::Running | TaskStatus::Claimed)).then(|| {
+        task.activities
+            .last()
+            .map(|activity| activity.at.clone())
+            .unwrap_or_else(timestamp_string)
+    });
+    let run_state = task_run_state_for_task_status(task.status).to_string();
+    let runtime = task.runtime.as_ref();
+    let thread_id = runtime.and_then(|item| item.thread_id.clone());
+    let turn_id = runtime.and_then(|item| item.active_turn_id.clone());
+    let last_error = runtime.and_then(|item| item.last_error.clone());
+
+    TaskRunRecord {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        run_number,
+        state: run_state.clone(),
+        provider: runtime
+            .map(|item| item.provider.clone())
+            .unwrap_or_else(|| "codex".into()),
+        started_by_agent_id: task.claimed_by,
+        started_at: started_at.clone(),
+        ended_at,
+        retry_count: 0,
+        primary_workspace_path: None,
+        session_threads: thread_id.iter().cloned().collect(),
+        attempts: vec![TaskRunAttemptRecord {
+            id: Uuid::new_v4(),
+            attempt_number: 1,
+            trigger_kind: "legacy_backfill".into(),
+            status: run_state,
+            prompt: task.description.clone(),
+            started_at,
+            ended_at: task
+                .activities
+                .last()
+                .map(|activity| activity.at.clone())
+                .or_else(|| Some(timestamp_string())),
+            thread_id,
+            turn_id,
+            error_summary: last_error.clone(),
+        }],
+        log: runtime.map(|item| item.log.clone()).unwrap_or_default(),
+        last_error,
+    }
+}
+
+fn record_task_run_start(
+    state: &mut BoardState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    provider_id: &str,
+    prompt: &str,
+    primary_workspace_path: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    trigger_kind: &str,
+) {
+    let runs = state.task_run_history.entry(task_id).or_default();
+    let now = timestamp_string();
+
+    if trigger_kind == "resume" {
+        if let Some(run) = runs
+            .last_mut()
+            .filter(|run| !task_run_is_terminal(&run.state))
+        {
+            run.state = "executing".into();
+            run.provider = provider_id.to_string();
+            run.started_by_agent_id = Some(agent_id);
+            if run.primary_workspace_path.is_none() {
+                run.primary_workspace_path = primary_workspace_path;
+            }
+            append_task_run_thread(run, thread_id.as_deref());
+            run.last_error = None;
+            run.retry_count = run.attempts.len() as u32;
+            run.attempts.push(TaskRunAttemptRecord {
+                id: Uuid::new_v4(),
+                attempt_number: run.attempts.len() as u32 + 1,
+                trigger_kind: trigger_kind.into(),
+                status: "executing".into(),
+                prompt: prompt.to_string(),
+                started_at: now.clone(),
+                ended_at: None,
+                thread_id,
+                turn_id,
+                error_summary: None,
+            });
+            run.log.push(new_runtime_entry(
+                "system",
+                format!("task run resumed via {trigger_kind}"),
+            ));
+            return;
+        }
+    }
+
+    let run_number = runs.last().map(|run| run.run_number + 1).unwrap_or(1);
+    let log_message = if trigger_kind == "resume" {
+        "task run created from resume"
+    } else {
+        "task run created"
+    };
+    runs.push(TaskRunRecord {
+        id: Uuid::new_v4(),
+        task_id,
+        run_number,
+        state: "executing".into(),
+        provider: provider_id.to_string(),
+        started_by_agent_id: Some(agent_id),
+        started_at: now.clone(),
+        ended_at: None,
+        retry_count: 0,
+        primary_workspace_path,
+        session_threads: thread_id.iter().cloned().collect(),
+        attempts: vec![TaskRunAttemptRecord {
+            id: Uuid::new_v4(),
+            attempt_number: 1,
+            trigger_kind: trigger_kind.into(),
+            status: "executing".into(),
+            prompt: prompt.to_string(),
+            started_at: now.clone(),
+            ended_at: None,
+            thread_id,
+            turn_id,
+            error_summary: None,
+        }],
+        log: vec![new_runtime_entry("system", log_message)],
+        last_error: None,
+    });
+}
+
+fn record_task_run_transition(
+    state: &mut BoardState,
+    task_id: Uuid,
+    next_state: &str,
+    detail: Option<&str>,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) {
+    let Some(run) = state
+        .task_run_history
+        .entry(task_id)
+        .or_default()
+        .last_mut()
+    else {
+        return;
+    };
+
+    let now = timestamp_string();
+    run.state = next_state.to_string();
+    append_task_run_thread(run, thread_id);
+    if task_run_is_terminal(next_state) {
+        run.ended_at = Some(now.clone());
+    }
+
+    if next_state == "completed" {
+        run.last_error = None;
+    } else if let Some(detail) = detail {
+        run.last_error = Some(detail.to_string());
+    }
+
+    if let Some(attempt) = run.attempts.last_mut() {
+        attempt.status = next_state.to_string();
+        if let Some(thread_id) = thread_id {
+            attempt.thread_id = Some(thread_id.to_string());
+        }
+        if let Some(turn_id) = turn_id {
+            attempt.turn_id = Some(turn_id.to_string());
+        }
+        if next_state != "executing" {
+            attempt.ended_at = Some(now.clone());
+        }
+        attempt.error_summary = match next_state {
+            "completed" => None,
+            _ => detail.map(ToOwned::to_owned),
+        };
+    }
+
+    run.retry_count = run.attempts.len().saturating_sub(1) as u32;
+    if let Some(detail) = detail {
+        run.log
+            .push(new_runtime_entry("system", detail.to_string()));
+    }
+}
+
+fn normalize_task_run_history_entries(
+    tasks: &[Task],
+    task_run_history: &mut HashMap<Uuid, Vec<TaskRunRecord>>,
+) -> bool {
+    let mut changed = false;
+    let tasks = tasks.to_vec();
+
+    for task in tasks {
+        let runs = task_run_history.entry(task.id).or_default();
+        if runs.is_empty() && task_has_progress_evidence(&task) {
+            runs.push(build_legacy_task_run_record(&task, 1));
+            changed = true;
+        }
+
+        let Some(run) = runs.last_mut() else {
+            continue;
+        };
+
+        let expected_state = task_run_state_for_task_status(task.status);
+        if run.state != expected_state {
+            run.state = expected_state.to_string();
+            changed = true;
+        }
+
+        let runtime = task.runtime.as_ref();
+        append_task_run_thread(run, runtime.and_then(|item| item.thread_id.as_deref()));
+        if runtime
+            .and_then(|item| item.thread_id.as_deref())
+            .is_some_and(|thread_id| !run.session_threads.iter().any(|item| item == thread_id))
+        {
+            changed = true;
+        }
+
+        if task_run_is_terminal(expected_state) && run.ended_at.is_none() {
+            run.ended_at = task.activities.last().map(|activity| activity.at.clone());
+            if run.ended_at.is_none() {
+                run.ended_at = Some(timestamp_string());
+            }
+            changed = true;
+        }
+
+        if let Some(attempt) = run.attempts.last_mut() {
+            if attempt.status != expected_state {
+                attempt.status = expected_state.to_string();
+                changed = true;
+            }
+            if let Some(runtime) = runtime {
+                if attempt.thread_id != runtime.thread_id {
+                    attempt.thread_id = runtime.thread_id.clone();
+                    changed = true;
+                }
+                if runtime.active_turn_id.is_some() && attempt.turn_id != runtime.active_turn_id {
+                    attempt.turn_id = runtime.active_turn_id.clone();
+                    changed = true;
+                }
+                if runtime.last_error.is_some() && attempt.error_summary != runtime.last_error {
+                    attempt.error_summary = runtime.last_error.clone();
+                    changed = true;
+                }
+            }
+            if task_run_is_terminal(expected_state) && attempt.ended_at.is_none() {
+                attempt.ended_at = run.ended_at.clone().or_else(|| Some(timestamp_string()));
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn normalize_task_run_history(state: &mut PersistedState) -> bool {
+    normalize_task_run_history_entries(&state.tasks, &mut state.task_run_history)
 }
 
 fn mark_task_running(
@@ -5352,6 +4315,7 @@ fn mark_task_running(
     task_id: Uuid,
     agent_id: Uuid,
     agent_name: &str,
+    provider_id: &str,
     prompt: &str,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -5378,13 +4342,14 @@ fn mark_task_running(
             format!("已由 {agent_name} 开始执行"),
         ));
         let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
-            provider: "codex".into(),
+            provider: provider_id.to_string(),
             thread_id: None,
             active_turn_id: None,
             git_auto_merge_enabled: false,
             log: Vec::new(),
             last_error: None,
         });
+        runtime.provider = provider_id.to_string();
         runtime.thread_id = thread_id;
         runtime.active_turn_id = turn_id;
         runtime.git_auto_merge_enabled = git_auto_merge_enabled;
@@ -5491,21 +4456,6 @@ fn push_runtime_delta(log: &mut Vec<RuntimeLogEntry>, kind: &str, delta: &str) {
     log.push(new_runtime_entry(kind, delta.to_string()));
 }
 
-fn task_developer_instructions() -> String {
-    [
-        "你是 Spotlight 的本地工程 Agent。",
-        "你需要在当前工作目录内完成软件任务，并保持结果可回顾。",
-        "优先输出清晰的计划、执行过程、命令结果、风险判断和最终结论。",
-        "如果用户暂停后补充提示词，要在同一线程里继续推进，不要丢失上下文。",
-        "执行前必须综合最近任务活动、最近运行输出、项目聊天室和目录扫描摘要；如果出现撤销、不做、去掉、删除、放弃等新决策，要按最新决策收缩范围，不要继续实现已取消子需求。",
-        "平台会在任务启动前自动从主分支切出任务分支，并在任务完成后尝试按门禁规则合并回主分支。",
-        "除非任务明确要求，不要自行执行危险 Git 历史改写，也不要跳过测试就声称可以合并。",
-        "任务完成时，请在回复末尾附加一个可机读的 JSON 代码块，例如包含 result、summary、questions、follow_ups、risks。",
-        "questions 用于放仍需用户回答的澄清问题；follow_ups 用于放建议自动生成的后续任务，字段建议包含 kind、title、description、priority、can_auto_create_task、can_auto_apply。",
-    ]
-    .join(" ")
-}
-
 async fn record_task_activity(
     state: &AppState,
     task_id: Uuid,
@@ -5518,728 +4468,19 @@ async fn record_task_activity(
     }
 }
 
-async fn git_command_output(
-    workspace_root: &Path,
-    args: &[&str],
-) -> Result<std::process::Output, String> {
-    Command::new("git")
-        .args(args)
-        .current_dir(workspace_root)
-        .output()
-        .await
-        .map_err(|error| format!("执行 git {:?} 失败：{error}", args))
-}
-
-fn git_stderr_message(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !stdout.is_empty() {
-        return stdout;
-    }
-
-    "git 命令失败，但没有返回详细输出".into()
-}
-
-async fn git_stdout_trimmed(workspace_root: &Path, args: &[&str]) -> Option<String> {
-    let output = git_command_output(workspace_root, args).await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!stdout.is_empty()).then_some(stdout)
-}
-
-async fn git_ref_exists(workspace_root: &Path, reference: &str) -> bool {
-    git_command_output(
-        workspace_root,
-        &["show-ref", "--verify", "--quiet", reference],
-    )
-    .await
-    .map(|output| output.status.success())
-    .unwrap_or(false)
-}
-
-async fn is_git_repo(workspace_root: &Path) -> bool {
-    git_command_output(workspace_root, &["rev-parse", "--is-inside-work-tree"])
-        .await
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-async fn git_worktree_dirty(workspace_root: &Path) -> Result<bool, String> {
-    let output = git_command_output(workspace_root, &["status", "--porcelain"]).await?;
-    if !output.status.success() {
-        return Err(git_stderr_message(&output));
-    }
-
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
-async fn detect_primary_remote(workspace_root: &Path) -> Option<String> {
-    if git_command_output(workspace_root, &["remote", "get-url", "origin"])
-        .await
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-    {
-        return Some("origin".into());
-    }
-
-    git_stdout_trimmed(workspace_root, &["remote"])
-        .await
-        .and_then(|stdout| {
-            stdout
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(str::to_string)
-        })
-}
-
-async fn detect_base_branch(workspace_root: &Path, remote_name: Option<&str>) -> String {
-    if let Some(remote) = remote_name {
-        let remote_head = format!("refs/remotes/{remote}/HEAD");
-        if let Some(symbolic_ref) =
-            git_stdout_trimmed(workspace_root, &["symbolic-ref", &remote_head]).await
-        {
-            if let Some((_, branch)) = symbolic_ref.rsplit_once('/') {
-                if !branch.trim().is_empty() {
-                    return branch.trim().to_string();
-                }
-            }
-        }
-    }
-
-    for candidate in ["main", "master"] {
-        let local_ref = format!("refs/heads/{candidate}");
-        if git_ref_exists(workspace_root, &local_ref).await {
-            return candidate.to_string();
-        }
-    }
-
-    git_stdout_trimmed(workspace_root, &["branch", "--show-current"])
-        .await
-        .filter(|branch| !branch.trim().is_empty())
-        .unwrap_or_else(|| "main".into())
-}
-
-async fn detect_git_task_branch_plan(workspace_root: &Path, task_id: Uuid) -> GitTaskBranchPlan {
-    let remote_name = detect_primary_remote(workspace_root).await;
-    let base_branch = detect_base_branch(workspace_root, remote_name.as_deref()).await;
-
-    GitTaskBranchPlan {
-        base_branch,
-        task_branch: format!("task/{task_id}"),
-        remote_name,
-    }
-}
-
-async fn prepare_git_task_branch_in_repo(
-    workspace_root: &Path,
-    task_id: Uuid,
-) -> AppResult<GitPrepareResult> {
-    let mut activities = Vec::new();
-
-    if !is_git_repo(workspace_root).await {
-        activities.push((
-            "git.branch_prepare_skipped".into(),
-            "当前工作目录不是 Git 仓库，跳过任务分支预处理。".into(),
-        ));
-        return Ok(GitPrepareResult {
-            activities,
-            auto_merge_enabled: false,
-        });
-    }
-
-    if git_worktree_dirty(workspace_root)
-        .await
-        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message.clone()))?
-    {
-        let _message =
-            "任务启动前检测到 Git 工作区存在未提交改动，已阻止自动切换主分支并创建任务分支。"
-                .to_string();
-        activities.push((
-            "git.branch_prepare_skipped".into(),
-            "任务启动前检测到 Git 工作区存在未提交改动，本次跳过自动切换主分支、任务分支创建和后续自动合并；任务仍会继续执行。".into(),
-        ));
-        return Ok(GitPrepareResult {
-            activities,
-            auto_merge_enabled: false,
-        });
-    }
-
-    let plan = detect_git_task_branch_plan(workspace_root, task_id).await;
-    activities.push((
-        "git.branch_plan".into(),
-        format!(
-            "任务 Git 计划：主分支={}，任务分支={}，远端={}",
-            plan.base_branch,
-            plan.task_branch,
-            plan.remote_name.as_deref().unwrap_or("无")
-        ),
-    ));
-
-    if let Some(remote) = plan.remote_name.as_deref() {
-        let fetch = git_command_output(workspace_root, &["fetch", remote]).await;
-        match fetch {
-            Ok(output) if output.status.success() => activities.push((
-                "git.remote_fetched".into(),
-                format!("已获取远端 {remote} 的最新引用。"),
-            )),
-            Ok(output) => {
-                let message = format!("获取远端 {remote} 失败：{}", git_stderr_message(&output));
-                activities.push(("git.branch_prepare_failed".into(), message.clone()));
-                return Err((StatusCode::BAD_GATEWAY, message));
-            }
-            Err(error) => {
-                activities.push(("git.branch_prepare_failed".into(), error.clone()));
-                return Err((StatusCode::BAD_GATEWAY, error));
-            }
-        }
-    }
-
-    let checkout_base = git_command_output(workspace_root, &["checkout", &plan.base_branch]).await;
-    match checkout_base {
-        Ok(output) if output.status.success() => activities.push((
-            "git.base_checked_out".into(),
-            format!("已切换到主分支 {}。", plan.base_branch),
-        )),
-        Ok(output) => {
-            let message = format!(
-                "切换到主分支 {} 失败：{}",
-                plan.base_branch,
-                git_stderr_message(&output)
-            );
-            activities.push(("git.branch_prepare_failed".into(), message.clone()));
-            return Err((StatusCode::CONFLICT, message));
-        }
-        Err(error) => {
-            activities.push(("git.branch_prepare_failed".into(), error.clone()));
-            return Err((StatusCode::CONFLICT, error));
-        }
-    }
-
-    if let Some(remote) = plan.remote_name.as_deref() {
-        let remote_branch_ref = format!("refs/remotes/{remote}/{}", plan.base_branch);
-        if git_ref_exists(workspace_root, &remote_branch_ref).await {
-            let upstream = format!("{remote}/{}", plan.base_branch);
-            let update_main =
-                git_command_output(workspace_root, &["merge", "--ff-only", &upstream]).await;
-            match update_main {
-                Ok(output) if output.status.success() => activities.push((
-                    "git.base_updated".into(),
-                    format!("已使用 {upstream} 快进更新本地主分支。"),
-                )),
-                Ok(output) => {
-                    let message = format!(
-                        "主分支在任务启动前无法快进到 {upstream}：{}",
-                        git_stderr_message(&output)
-                    );
-                    activities.push(("git.branch_prepare_failed".into(), message.clone()));
-                    return Err((StatusCode::CONFLICT, message));
-                }
-                Err(error) => {
-                    activities.push(("git.branch_prepare_failed".into(), error.clone()));
-                    return Err((StatusCode::CONFLICT, error));
-                }
-            }
-        } else {
-            activities.push((
-                "git.base_update_skipped".into(),
-                format!(
-                    "远端 {remote} 上未找到 {}/{}，跳过主分支快进。",
-                    remote, plan.base_branch
-                ),
-            ));
-        }
-    }
-
-    let task_branch_ref = format!("refs/heads/{}", plan.task_branch);
-    let branch_exists = git_ref_exists(workspace_root, &task_branch_ref).await;
-    let checkout_task_args = if branch_exists {
-        vec!["checkout", plan.task_branch.as_str()]
-    } else {
-        vec!["checkout", "-b", plan.task_branch.as_str()]
-    };
-    let checkout_task = git_command_output(workspace_root, &checkout_task_args).await;
-    match checkout_task {
-        Ok(output) if output.status.success() => activities.push((
-            if branch_exists {
-                "git.task_branch_reused".into()
-            } else {
-                "git.task_branch_created".into()
-            },
-            if branch_exists {
-                format!("已切换到已存在的任务分支 {}。", plan.task_branch)
-            } else {
-                format!(
-                    "已基于主分支 {} 创建任务分支 {}。",
-                    plan.base_branch, plan.task_branch
-                )
-            },
-        )),
-        Ok(output) => {
-            let message = format!(
-                "切换到任务分支 {} 失败：{}",
-                plan.task_branch,
-                git_stderr_message(&output)
-            );
-            activities.push(("git.branch_prepare_failed".into(), message.clone()));
-            return Err((StatusCode::CONFLICT, message));
-        }
-        Err(error) => {
-            activities.push(("git.branch_prepare_failed".into(), error.clone()));
-            return Err((StatusCode::CONFLICT, error));
-        }
-    }
-
-    Ok(GitPrepareResult {
-        activities,
-        auto_merge_enabled: true,
-    })
-}
-
-fn auto_claim_next_task(state: &mut BoardState, agent_id: Uuid) -> AppResult<Option<Task>> {
-    let (agent_name, owner_user_id, auto_mode_enabled, agent_busy) = state
-        .agents
-        .iter()
-        .find(|agent| agent.id == agent_id)
-        .map(|agent| {
-            (
-                agent.name.clone(),
-                agent.owner_user_id,
-                agent.auto_mode,
-                agent.current_task_id.is_some(),
-            )
-        })
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到 Agent".into()))?;
-
-    if !auto_mode_enabled || agent_busy {
-        return Ok(None);
-    }
-
-    if active_task_conflict(&state.tasks, None).is_some() {
-        return Ok(None);
-    }
-
-    let Some(task_index) = select_next_auto_claim_task_index(&state.tasks, owner_user_id) else {
-        return Ok(None);
-    };
-
-    let claimed_task = {
-        let task = &mut state.tasks[task_index];
-        task.claimed_by = Some(agent_id);
-        task.assignee_user_id = task.assignee_user_id.or(owner_user_id);
-        task.status = TaskStatus::Claimed;
-        task.activities.push(new_activity(
-            "task.auto_claimed",
-            format!("娴犺濮熷鑼暠 {} 閼奉亜濮╃拋銈夘暙", agent_name),
-        ));
-
-        task.activities.push(new_activity(
-            "task.auto_claim_reason",
-            auto_claim_selection_reason(task, owner_user_id),
-        ));
-
-        task.clone()
-    };
-    let task_title = claimed_task.title.clone();
-    assign_agent_claimed(
-        state,
-        agent_id,
-        claimed_task.id,
-        format!("auto claim acquired: {task_title}"),
-    );
-
-    Ok(Some(claimed_task))
-}
-
-fn select_next_auto_claim_task_index(tasks: &[Task], owner_user_id: Option<Uuid>) -> Option<usize> {
-    tasks
-        .iter()
-        .enumerate()
-        .filter(|(_, task)| matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none())
-        .filter(|(_, task)| {
-            task.assignee_user_id.is_none() || task.assignee_user_id == owner_user_id
-        })
-        .min_by_key(|(index, task)| {
-            (
-                task_priority_order(task.priority),
-                task_assignment_order(task, owner_user_id),
-                task_created_order(task),
-                *index,
-            )
-        })
-        .map(|(index, _)| index)
-}
-
-fn task_priority_order(priority: Option<TaskPriority>) -> u8 {
-    match priority {
-        Some(TaskPriority::High) => 0,
-        Some(TaskPriority::Medium) => 1,
-        Some(TaskPriority::Low) => 2,
-        None => 3,
-    }
-}
-
-fn task_assignment_order(task: &Task, owner_user_id: Option<Uuid>) -> u8 {
-    match owner_user_id {
-        Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => 0,
-        _ => 1,
-    }
-}
-
-fn auto_claim_selection_reason(task: &Task, owner_user_id: Option<Uuid>) -> String {
-    let queue_scope = match owner_user_id {
-        Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => "本人待办队列",
-        _ => "共享待办队列",
-    };
-    let priority_basis = match task.priority {
-        Some(TaskPriority::High) => "高优先级",
-        Some(TaskPriority::Medium) => "中优先级",
-        Some(TaskPriority::Low) => "低优先级",
-        None => "时间顺序",
-    };
-
-    format!("选择依据：{} / {}", queue_scope, priority_basis)
-}
-
-fn task_created_order(task: &Task) -> u128 {
-    task.activities
-        .first()
-        .and_then(|activity| activity.at.parse::<u128>().ok())
-        .unwrap_or(u128::MAX)
-}
-
-async fn finalize_git_task_branch_in_repo(
-    workspace_root: &Path,
-    task_id: Uuid,
-) -> Vec<(String, String)> {
-    let mut activities = Vec::new();
-
-    if !is_git_repo(workspace_root).await {
-        activities.push((
-            "git.merge_skipped".into(),
-            "当前工作目录不是 Git 仓库，跳过任务完成后的自动合并。".into(),
-        ));
-        return activities;
-    }
-
-    let plan = detect_git_task_branch_plan(workspace_root, task_id).await;
-    activities.push((
-        "git.merge_plan".into(),
-        format!(
-            "任务完成后的 Git 合并计划：主分支={}，任务分支={}，远端={}",
-            plan.base_branch,
-            plan.task_branch,
-            plan.remote_name.as_deref().unwrap_or("无")
-        ),
-    ));
-
-    let current_branch = git_stdout_trimmed(workspace_root, &["branch", "--show-current"])
-        .await
-        .unwrap_or_default();
-    if current_branch.trim() != plan.task_branch {
-        let task_branch_ref = format!("refs/heads/{}", plan.task_branch);
-        if !git_ref_exists(workspace_root, &task_branch_ref).await {
-            activities.push((
-                "git.merge_skipped".into(),
-                format!("未找到任务分支 {}，跳过自动合并。", plan.task_branch),
-            ));
-            return activities;
-        }
-
-        match git_command_output(workspace_root, &["checkout", &plan.task_branch]).await {
-            Ok(output) if output.status.success() => activities.push((
-                "git.task_branch_checked_out".into(),
-                format!("自动合并前已切换回任务分支 {}。", plan.task_branch),
-            )),
-            Ok(output) => {
-                activities.push((
-                    "git.merge_blocked".into(),
-                    format!(
-                        "自动合并前无法切换到任务分支 {}：{}",
-                        plan.task_branch,
-                        git_stderr_message(&output)
-                    ),
-                ));
-                return activities;
-            }
-            Err(error) => {
-                activities.push(("git.merge_blocked".into(), error));
-                return activities;
-            }
-        }
-    }
-
-    match git_worktree_dirty(workspace_root).await {
-        Ok(true) => {
-            match git_command_output(workspace_root, &["add", "-A"]).await {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => {
-                    activities.push((
-                        "git.merge_blocked".into(),
-                        format!(
-                            "自动提交前执行 git add -A 失败：{}",
-                            git_stderr_message(&output)
-                        ),
-                    ));
-                    return activities;
-                }
-                Err(error) => {
-                    activities.push(("git.merge_blocked".into(), error));
-                    return activities;
-                }
-            }
-
-            let cached_clean = git_command_output(
-                workspace_root,
-                &["diff", "--cached", "--quiet", "--exit-code"],
-            )
-            .await;
-            let needs_commit = match cached_clean {
-                Ok(output) => !output.status.success(),
-                Err(error) => {
-                    activities.push(("git.merge_blocked".into(), error));
-                    return activities;
-                }
-            };
-
-            if needs_commit {
-                let commit_message = format!("chore(task): 完成任务 {task_id}");
-                match git_command_output(workspace_root, &["commit", "-m", commit_message.as_str()])
-                    .await
-                {
-                    Ok(output) if output.status.success() => activities.push((
-                        "git.task_branch_committed".into(),
-                        format!("已自动提交任务分支 {} 上的改动。", plan.task_branch),
-                    )),
-                    Ok(output) => {
-                        activities.push((
-                            "git.merge_blocked".into(),
-                            format!(
-                                "任务分支自动提交失败，已保留分支 {}：{}",
-                                plan.task_branch,
-                                git_stderr_message(&output)
-                            ),
-                        ));
-                        return activities;
-                    }
-                    Err(error) => {
-                        activities.push(("git.merge_blocked".into(), error));
-                        return activities;
-                    }
-                }
-            }
-        }
-        Ok(false) => activities.push((
-            "git.task_branch_clean".into(),
-            format!("任务分支 {} 没有额外未提交改动。", plan.task_branch),
-        )),
-        Err(error) => {
-            activities.push(("git.merge_blocked".into(), error));
-            return activities;
-        }
-    }
-
-    if let Some(remote) = plan.remote_name.as_deref() {
-        match git_command_output(workspace_root, &["fetch", remote]).await {
-            Ok(output) if output.status.success() => activities.push((
-                "git.remote_refetched".into(),
-                format!("自动合并前已重新获取远端 {remote} 的最新引用。"),
-            )),
-            Ok(output) => {
-                activities.push((
-                    "git.merge_blocked".into(),
-                    format!(
-                        "自动合并前获取远端 {remote} 失败：{}",
-                        git_stderr_message(&output)
-                    ),
-                ));
-                return activities;
-            }
-            Err(error) => {
-                activities.push(("git.merge_blocked".into(), error));
-                return activities;
-            }
-        }
-    }
-
-    match git_command_output(workspace_root, &["checkout", &plan.base_branch]).await {
-        Ok(output) if output.status.success() => activities.push((
-            "git.base_checked_out".into(),
-            format!("自动合并前已切换回主分支 {}。", plan.base_branch),
-        )),
-        Ok(output) => {
-            activities.push((
-                "git.merge_blocked".into(),
-                format!(
-                    "自动合并前无法切换到主分支 {}：{}",
-                    plan.base_branch,
-                    git_stderr_message(&output)
-                ),
-            ));
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            return activities;
-        }
-        Err(error) => {
-            activities.push(("git.merge_blocked".into(), error));
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            return activities;
-        }
-    }
-
-    if let Some(remote) = plan.remote_name.as_deref() {
-        let remote_branch_ref = format!("refs/remotes/{remote}/{}", plan.base_branch);
-        if git_ref_exists(workspace_root, &remote_branch_ref).await {
-            let upstream = format!("{remote}/{}", plan.base_branch);
-            match git_command_output(workspace_root, &["merge", "--ff-only", &upstream]).await {
-                Ok(output) if output.status.success() => activities.push((
-                    "git.base_updated".into(),
-                    format!("自动合并前已使用 {upstream} 快进更新主分支。"),
-                )),
-                Ok(output) => {
-                    activities.push((
-                        "git.merge_blocked".into(),
-                        format!(
-                            "自动合并前无法先快进主分支到 {upstream}：{}",
-                            git_stderr_message(&output)
-                        ),
-                    ));
-                    let _ =
-                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-                    return activities;
-                }
-                Err(error) => {
-                    activities.push(("git.merge_blocked".into(), error));
-                    let _ =
-                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-                    return activities;
-                }
-            }
-        }
-    }
-
-    let merge_message = format!("merge task branch {} for {}", plan.task_branch, task_id);
-    match git_command_output(
-        workspace_root,
-        &[
-            "merge",
-            "--no-ff",
-            "-m",
-            merge_message.as_str(),
-            &plan.task_branch,
-        ],
-    )
-    .await
-    {
-        Ok(output) if output.status.success() => activities.push((
-            "git.merge_completed".into(),
-            format!(
-                "已将任务分支 {} 合并回主分支 {}。",
-                plan.task_branch, plan.base_branch
-            ),
-        )),
-        Ok(output) => {
-            let details = git_stderr_message(&output);
-            let _ = git_command_output(workspace_root, &["merge", "--abort"]).await;
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            activities.push((
-                "git.merge_blocked".into(),
-                format!(
-                    "任务分支 {} 未能自动合并回主分支 {}，已保留任务分支等待人工处理：{}",
-                    plan.task_branch, plan.base_branch, details
-                ),
-            ));
-        }
-        Err(error) => {
-            let _ = git_command_output(workspace_root, &["merge", "--abort"]).await;
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            activities.push((
-                "git.merge_blocked".into(),
-                format!(
-                    "任务分支 {} 自动合并失败，已保留任务分支：{}",
-                    plan.task_branch, error
-                ),
-            ));
-        }
-    }
-
-    activities
-}
-
-async fn apply_git_snapshot(workspace_root: &Path, task_id: Uuid, state: &AppState) {
-    let repo_check = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(workspace_root)
-        .output()
-        .await;
-    let Ok(repo_check) = repo_check else {
-        return;
-    };
-    if !repo_check.status.success() {
-        return;
-    }
-
-    let dirty = git_worktree_dirty(workspace_root).await.unwrap_or(false);
-    let branch = git_stdout_trimmed(workspace_root, &["branch", "--show-current"])
-        .await
-        .unwrap_or_else(|| "unknown".into());
-    let head = git_stdout_trimmed(workspace_root, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or_else(|| "unknown".into());
-
-    let tag = format!("task/{task_id}/pre-run/{}", timestamp_compact());
-    let result = Command::new("git")
-        .args(["tag", &tag])
-        .current_dir(workspace_root)
-        .output()
-        .await;
-
-    let message = match result {
-        Ok(output) if output.status.success() => {
-            format!("已创建预执行 tag：{tag}，branch={branch}，HEAD={head}，dirty={dirty}")
-        }
-        Ok(output) => format!(
-            "创建预执行 tag 失败：branch={branch}，HEAD={head}，dirty={dirty}，{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => {
-            format!("创建预执行 tag 失败：branch={branch}，HEAD={head}，dirty={dirty}，{error}")
-        }
-    };
-
-    let mut guard = state.inner.lock().await;
-    if let Ok(task) = find_task_mut(&mut guard, task_id) {
-        task.activities
-            .push(new_activity("git.pre_run_snapshot", message));
-    }
-}
-
-fn timestamp_compact() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_claim_next_task, build_api_router, build_app, default_agents, default_projects,
-        default_state, default_users, detect_project_stack, finalize_git_task_branch_in_repo,
-        mark_task_running, prepare_git_task_branch_in_repo, reconcile_watchdog_state,
-        run_automation_cycle_once, runtime_event_loop, sanitize_credential_hint,
-        select_next_auto_resume_task_id, write_memory_revision, AppState, BoardState,
-        MemoryWriteSpec, PersistedState, ProjectChatMessage, ProjectContextSnapshot,
-        ProjectMemorySnapshot, ProjectScanSummary, ProjectSummarySnapshot, PullNextResponse,
-        RuntimeEvent, RuntimeMode, BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT,
-        BOARD_TASK_RUNTIME_LOG_LIMIT, TASK_STALE_TIMEOUT_SECS,
+        active_task_conflict, auto_claim_next_task, build_api_router, build_app, default_agents,
+        default_projects, default_state, default_users, detect_project_stack,
+        finalize_git_task_branch_in_repo, mark_task_running, prepare_git_task_branch_in_repo,
+        reconcile_parallel_active_tasks, reconcile_watchdog_state, run_automation_cycle_once,
+        runtime_event_loop, sanitize_credential_hint, select_next_auto_resume_task_id,
+        write_memory_revision, AppState, BoardState, MemoryWriteSpec, PersistedState,
+        ProjectChatMessage, ProjectContextSnapshot, ProjectMemorySnapshot, ProjectScanSummary,
+        ProjectSession, ProjectSummarySnapshot, PullNextResponse, RuntimeEvent, RuntimeMode,
+        BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT,
+        TASK_STALE_TIMEOUT_SECS,
     };
     use axum::{
         body::Body,
@@ -6249,7 +4490,8 @@ mod tests {
     use platform_core::{
         new_activity, new_runtime_entry, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
         CreateTaskRequest, PendingQuestion, Project, RuntimeLogEntry, Task, TaskActivity,
-        TaskPriority, TaskRuntime, TaskStateSnapshot, TaskStatus, WorkspaceRoot,
+        TaskAssignmentMode, TaskPriority, TaskRuntime, TaskStateSnapshot, TaskStatus,
+        WorkspaceRoot,
     };
     use serde_json::Value;
     use std::{
@@ -6324,6 +4566,53 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
+    fn test_project(name: &str, workspace_path: PathBuf) -> Project {
+        Project {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            description: format!("{name} project"),
+            workspace_roots: vec![WorkspaceRoot {
+                id: Uuid::new_v4(),
+                label: format!("{name} workspace"),
+                path: workspace_path.to_string_lossy().into_owned(),
+                writable: true,
+            }],
+            is_spotlight_self: false,
+        }
+    }
+
+    fn test_task(
+        project_id: Uuid,
+        title: &str,
+        status: TaskStatus,
+        priority: Option<TaskPriority>,
+    ) -> Task {
+        Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: title.into(),
+            description: format!("{title} description"),
+            status,
+            priority,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.created".into(),
+                message: format!("{title} created"),
+                at: "1".into(),
+            }],
+            runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        }
+    }
+
     fn codex_stub_env_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -6334,10 +4623,19 @@ mod tests {
         log_path: PathBuf,
         original_path: Option<OsString>,
         original_log_path: Option<OsString>,
+        original_hang_method: Option<OsString>,
+        original_runtime_timeout_secs: Option<OsString>,
     }
 
     impl TestCodexStubEnvironment {
         fn install() -> Self {
+            Self::install_with_options(None, None)
+        }
+
+        fn install_with_options(
+            hang_method: Option<&str>,
+            runtime_timeout_secs: Option<&str>,
+        ) -> Self {
             let root = unique_temp_path("spotlight-codex-stub");
             fs::create_dir_all(&root).unwrap();
 
@@ -6355,6 +4653,7 @@ mod tests {
                 r#"const fs = require('fs');
 
 const logPath = process.env.SPOTLIGHT_CODEX_STUB_LOG;
+const hangMethod = process.env.SPOTLIGHT_CODEX_STUB_HANG_METHOD || '';
 let turnCounter = 0;
 let buffer = '';
 
@@ -6363,6 +4662,10 @@ function send(payload) {
 }
 
 function handleRequest(request) {
+  if (hangMethod && request.method === hangMethod) {
+    return;
+  }
+
   switch (request.method) {
     case 'initialize':
       send({ id: request.id, result: {} });
@@ -6421,6 +4724,9 @@ process.stdin.on('data', (chunk) => {
 
             let original_path = std::env::var_os("PATH");
             let original_log_path = std::env::var_os("SPOTLIGHT_CODEX_STUB_LOG");
+            let original_hang_method = std::env::var_os("SPOTLIGHT_CODEX_STUB_HANG_METHOD");
+            let original_runtime_timeout_secs =
+                std::env::var_os("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS");
             let mut updated_path = OsString::from(root.as_os_str());
             if let Some(path) = original_path.as_ref() {
                 updated_path.push(";");
@@ -6429,12 +4735,25 @@ process.stdin.on('data', (chunk) => {
 
             std::env::set_var("PATH", updated_path);
             std::env::set_var("SPOTLIGHT_CODEX_STUB_LOG", &log_path);
+            std::env::set_var("SPOTLIGHT_PROVIDER", "codex");
+            if let Some(hang_method) = hang_method {
+                std::env::set_var("SPOTLIGHT_CODEX_STUB_HANG_METHOD", hang_method);
+            } else {
+                std::env::remove_var("SPOTLIGHT_CODEX_STUB_HANG_METHOD");
+            }
+            if let Some(runtime_timeout_secs) = runtime_timeout_secs {
+                std::env::set_var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS", runtime_timeout_secs);
+            } else {
+                std::env::remove_var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS");
+            }
 
             Self {
                 root,
                 log_path,
                 original_path,
                 original_log_path,
+                original_hang_method,
+                original_runtime_timeout_secs,
             }
         }
 
@@ -6464,6 +4783,18 @@ process.stdin.on('data', (chunk) => {
             } else {
                 std::env::remove_var("SPOTLIGHT_CODEX_STUB_LOG");
             }
+            if let Some(hang_method) = self.original_hang_method.as_ref() {
+                std::env::set_var("SPOTLIGHT_CODEX_STUB_HANG_METHOD", hang_method);
+            } else {
+                std::env::remove_var("SPOTLIGHT_CODEX_STUB_HANG_METHOD");
+            }
+            if let Some(timeout_secs) = self.original_runtime_timeout_secs.as_ref() {
+                std::env::set_var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS", timeout_secs);
+            } else {
+                std::env::remove_var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS");
+            }
+
+            std::env::remove_var("SPOTLIGHT_PROVIDER");
 
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -6642,6 +4973,81 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[tokio::test]
+    async fn service_shell_exposes_0_1_0_core_surfaces() {
+        let app = test_app();
+
+        let index_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index_response.status(), StatusCode::OK);
+
+        let index_html = read_text(index_response).await;
+        assert!(index_html.contains("Spotlight"));
+        assert!(index_html.contains("const API_PREFIX = \"/api/v1\""));
+
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(board_response.status(), StatusCode::OK);
+        let board_snapshot = read_snapshot(board_response).await;
+        assert!(!board_snapshot.projects.is_empty());
+        assert!(!board_snapshot.agents.is_empty());
+
+        let project_id = board_snapshot.projects[0].id;
+
+        let projects_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(projects_response.status(), StatusCode::OK);
+        let projects: Vec<Project> = read_json(projects_response).await;
+        assert!(projects.iter().any(|project| project.id == project_id));
+
+        let agents_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agents_response.status(), StatusCode::OK);
+        let agents: Vec<platform_core::Agent> = read_json(agents_response).await;
+        assert!(!agents.is_empty());
+
+        let summary_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/{project_id}/summary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary_response.status(), StatusCode::OK);
+        let summary: ProjectSummarySnapshot = read_json(summary_response).await;
+        assert_eq!(summary.project_id, project_id);
+        assert_eq!(summary.agent_summary.total, agents.len());
+    }
+
+    #[tokio::test]
     async fn versioned_projects_route_returns_visible_projects() {
         let app = test_app();
         let response = app
@@ -6697,6 +5103,38 @@ process.stdin.on('data', (chunk) => {
         assert!(tasks
             .iter()
             .all(|task| task.project_id == project_id && task.status == TaskStatus::Open));
+    }
+
+    #[tokio::test]
+    async fn versioned_project_tasks_route_accepts_manual_review_status_filter() {
+        let workspace_root = unique_temp_path("spotlight-task-status-filter");
+        let (app, state) = test_app_with_state(RuntimeMode::Stub, workspace_root).await;
+
+        let (project_id, manual_review_task_id) = {
+            let mut guard = state.inner.lock().await;
+            let task = guard.tasks.first_mut().expect("expected task in board");
+            let project_id = task.project_id;
+            task.status = TaskStatus::ManualReview;
+            (project_id, task.id)
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/projects/{project_id}/tasks?status=manual_review"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let tasks: Vec<Task> = read_json(response).await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, manual_review_task_id);
+        assert_eq!(tasks[0].status, TaskStatus::ManualReview);
     }
 
     #[tokio::test]
@@ -6846,6 +5284,9 @@ process.stdin.on('data', (chunk) => {
             description: "把暂停恢复和长会话状态流转补到测试里。".into(),
             priority: None,
             labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
 
@@ -6946,6 +5387,9 @@ process.stdin.on('data', (chunk) => {
             description: "验证新建任务会记录当前用户".into(),
             priority: Some(TaskPriority::High),
             labels: vec!["backend".into(), "queue".into()],
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
 
@@ -7084,6 +5528,65 @@ process.stdin.on('data', (chunk) => {
             .key_files
             .iter()
             .any(|path| path.ends_with("Cargo.toml")));
+    }
+
+    #[tokio::test]
+    async fn scan_endpoint_reports_empty_workspace_hint() {
+        let app = test_app();
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+
+        let workspace_root = unique_temp_path("spotlight-empty-scan-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let register_payload = serde_json::json!({
+            "label": "empty-root",
+            "path": workspace_root.to_string_lossy(),
+            "isPrimaryDefault": true,
+            "isWritable": true
+        });
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/workspaces"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects/{project_id}/scan"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let context: ProjectContextSnapshot = read_json(response).await;
+        let scan = context.latest_scan.expect("expected latest scan summary");
+        assert!(scan.top_level_entries.is_empty());
+        assert!(scan
+            .notes
+            .iter()
+            .any(|note| note.contains("当前目录看起来几乎为空")));
     }
 
     #[tokio::test]
@@ -7314,10 +5817,14 @@ process.stdin.on('data', (chunk) => {
                     labels: vec!["summary-test".into()],
                     creator_user_id: None,
                     assignee_user_id: None,
+                    assignment_mode: TaskAssignmentMode::PublicQueue,
+                    requested_agent_id: None,
                     source_task_id: None,
                     claimed_by: None,
                     activities: Vec::new(),
                     runtime: None,
+                    approval: Default::default(),
+                    acceptance: Default::default(),
                     state_snapshot: TaskStateSnapshot::default(),
                 });
             }
@@ -7627,6 +6134,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7635,6 +6144,8 @@ process.stdin.on('data', (chunk) => {
                 at: "300".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let oldest_open = Task {
@@ -7647,6 +6158,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7655,6 +6168,8 @@ process.stdin.on('data', (chunk) => {
                 at: "200".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let oldest_done = Task {
@@ -7667,6 +6182,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7675,6 +6192,8 @@ process.stdin.on('data', (chunk) => {
                 at: "100".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -7683,6 +6202,7 @@ process.stdin.on('data', (chunk) => {
             projects,
             tasks: vec![newest_open.clone(), oldest_open.clone(), oldest_done],
             agents,
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -7691,6 +6211,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         let claimed = auto_claim_next_task(&mut state, agent.id)
@@ -7732,6 +6253,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7740,6 +6263,8 @@ process.stdin.on('data', (chunk) => {
                 at: "100".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let owner_medium = Task {
@@ -7752,6 +6277,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7760,6 +6287,8 @@ process.stdin.on('data', (chunk) => {
                 at: "200".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let shared_high = Task {
@@ -7772,6 +6301,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7780,6 +6311,8 @@ process.stdin.on('data', (chunk) => {
                 at: "300".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let other_users_high = Task {
@@ -7792,6 +6325,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(other_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7800,6 +6335,8 @@ process.stdin.on('data', (chunk) => {
                 at: "50".into(),
             }],
             runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -7813,6 +6350,7 @@ process.stdin.on('data', (chunk) => {
                 other_users_high,
             ],
             agents,
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -7821,6 +6359,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         let claimed = auto_claim_next_task(&mut state, agent.id)
@@ -7858,6 +6397,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![
@@ -7880,6 +6421,8 @@ process.stdin.on('data', (chunk) => {
                 log: Vec::new(),
                 last_error: None,
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let high_priority = Task {
@@ -7892,6 +6435,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![
@@ -7914,6 +6459,8 @@ process.stdin.on('data', (chunk) => {
                 log: Vec::new(),
                 last_error: None,
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -7924,6 +6471,236 @@ process.stdin.on('data', (chunk) => {
         .expect("expected paused task to be selected for auto resume");
 
         assert_eq!(selected, high_priority.id);
+    }
+
+    #[test]
+    fn active_task_conflict_only_blocks_same_workspace() {
+        let workspace_root = unique_temp_path("spotlight-workspace-serialization-lanes");
+        let project_a = test_project("alpha", workspace_root.join("alpha"));
+        let project_b = test_project("beta", workspace_root.join("beta"));
+
+        let active_alpha = test_task(project_a.id, "alpha-running", TaskStatus::Running, None);
+        let queued_alpha = test_task(project_a.id, "alpha-open", TaskStatus::Open, None);
+        let queued_beta = test_task(project_b.id, "beta-open", TaskStatus::Open, None);
+        let projects = vec![project_a, project_b];
+        let tasks = vec![
+            active_alpha.clone(),
+            queued_alpha.clone(),
+            queued_beta.clone(),
+        ];
+
+        let same_workspace_conflict =
+            active_task_conflict(&projects, &tasks, queued_alpha.id, Some(queued_alpha.id));
+        assert_eq!(
+            same_workspace_conflict.map(|task| task.id),
+            Some(active_alpha.id)
+        );
+
+        let other_workspace_conflict =
+            active_task_conflict(&projects, &tasks, queued_beta.id, Some(queued_beta.id));
+        assert!(other_workspace_conflict.is_none());
+    }
+
+    #[test]
+    fn active_task_conflict_blocks_projects_sharing_same_workspace() {
+        let workspace_root = unique_temp_path("spotlight-shared-workspace-lane");
+        let shared_workspace = workspace_root.join("shared");
+        let project_a = test_project("alpha", shared_workspace.clone());
+        let project_b = test_project("beta", shared_workspace);
+
+        let active_alpha = test_task(project_a.id, "alpha-running", TaskStatus::Running, None);
+        let queued_beta = test_task(project_b.id, "beta-open", TaskStatus::Open, None);
+        let projects = vec![project_a, project_b];
+        let tasks = vec![active_alpha.clone(), queued_beta.clone()];
+
+        let conflict =
+            active_task_conflict(&projects, &tasks, queued_beta.id, Some(queued_beta.id));
+        assert_eq!(conflict.map(|task| task.id), Some(active_alpha.id));
+    }
+
+    #[test]
+    fn auto_claim_next_task_skips_busy_workspace_and_claims_other_workspace() {
+        let workspace_root = unique_temp_path("spotlight-auto-claim-workspace-lanes");
+        let users = default_users();
+        let agents = default_agents(&users);
+        let agent = agents.first().unwrap().clone();
+
+        let project_a = test_project("alpha", workspace_root.join("alpha"));
+        let project_b = test_project("beta", workspace_root.join("beta"));
+
+        let mut active_alpha = test_task(
+            project_a.id,
+            "alpha-running",
+            TaskStatus::Running,
+            Some(TaskPriority::Low),
+        );
+        active_alpha.claimed_by = Some(Uuid::new_v4());
+
+        let queued_alpha = test_task(
+            project_a.id,
+            "alpha-open",
+            TaskStatus::Open,
+            Some(TaskPriority::High),
+        );
+        let queued_beta = test_task(
+            project_b.id,
+            "beta-open",
+            TaskStatus::Open,
+            Some(TaskPriority::Medium),
+        );
+
+        let mut state = BoardState {
+            users,
+            projects: vec![project_a, project_b],
+            tasks: vec![active_alpha, queued_alpha, queued_beta.clone()],
+            agents,
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+        if let Some(agent_state) = state.agents.iter_mut().find(|item| item.id == agent.id) {
+            agent_state.auto_mode = true;
+            agent_state.current_task_id = None;
+        }
+
+        let claimed = auto_claim_next_task(&mut state, agent.id)
+            .unwrap()
+            .expect("should claim a task from another workspace");
+
+        assert_eq!(claimed.id, queued_beta.id);
+        let queued_alpha_state = state
+            .tasks
+            .iter()
+            .find(|task| task.title == "alpha-open")
+            .expect("expected alpha open task");
+        assert_eq!(queued_alpha_state.status, TaskStatus::Open);
+    }
+
+    #[test]
+    fn reconcile_parallel_active_tasks_keeps_different_workspaces_running() {
+        let workspace_root = unique_temp_path("spotlight-parallel-reconcile-lanes");
+        let project_a = test_project("alpha", workspace_root.join("alpha"));
+        let project_b = test_project("beta", workspace_root.join("beta"));
+
+        let mut running_alpha = test_task(project_a.id, "alpha-running", TaskStatus::Running, None);
+        running_alpha.claimed_by = Some(Uuid::new_v4());
+        let mut running_beta = test_task(project_b.id, "beta-running", TaskStatus::Running, None);
+        running_beta.claimed_by = Some(Uuid::new_v4());
+
+        let users = default_users();
+        let mut state = BoardState {
+            users: users.clone(),
+            projects: vec![project_a, project_b],
+            tasks: vec![running_alpha.clone(), running_beta.clone()],
+            agents: default_agents(&users),
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        let sessions_to_stop = reconcile_parallel_active_tasks(&mut state);
+
+        assert!(sessions_to_stop.is_empty());
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .find(|task| task.id == running_alpha.id)
+                .map(|task| task.status),
+            Some(TaskStatus::Running)
+        );
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .find(|task| task.id == running_beta.id)
+                .map(|task| task.status),
+            Some(TaskStatus::Running)
+        );
+    }
+
+    #[test]
+    fn reconcile_parallel_active_tasks_requeues_only_conflicting_workspace() {
+        let workspace_root = unique_temp_path("spotlight-parallel-reconcile-same-workspace");
+        let shared_workspace = workspace_root.join("shared");
+        let isolated_workspace = workspace_root.join("isolated");
+        let project_a = test_project("alpha", shared_workspace.clone());
+        let project_b = test_project("beta", shared_workspace);
+        let project_c = test_project("gamma", isolated_workspace);
+
+        let mut running_alpha = test_task(project_a.id, "alpha-running", TaskStatus::Running, None);
+        running_alpha.claimed_by = Some(Uuid::new_v4());
+
+        let mut claimed_beta = test_task(project_b.id, "beta-claimed", TaskStatus::Claimed, None);
+        claimed_beta.claimed_by = Some(Uuid::new_v4());
+
+        let mut running_gamma = test_task(project_c.id, "gamma-running", TaskStatus::Running, None);
+        running_gamma.claimed_by = Some(Uuid::new_v4());
+
+        let users = default_users();
+        let mut state = BoardState {
+            users: users.clone(),
+            projects: vec![project_a, project_b, project_c],
+            tasks: vec![
+                running_alpha.clone(),
+                claimed_beta.clone(),
+                running_gamma.clone(),
+            ],
+            agents: default_agents(&users),
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        let sessions_to_stop = reconcile_parallel_active_tasks(&mut state);
+
+        assert_eq!(sessions_to_stop, vec![claimed_beta.id]);
+        let requeued_beta = state
+            .tasks
+            .iter()
+            .find(|task| task.id == claimed_beta.id)
+            .expect("expected claimed beta task");
+        assert_eq!(requeued_beta.status, TaskStatus::Open);
+        assert!(requeued_beta.claimed_by.is_none());
+        assert!(requeued_beta
+            .activities
+            .iter()
+            .any(|activity| activity.kind == "task.parallel_requeued"));
+
+        let kept_alpha = state
+            .tasks
+            .iter()
+            .find(|task| task.id == running_alpha.id)
+            .expect("expected alpha task");
+        assert_eq!(kept_alpha.status, TaskStatus::Running);
+
+        let untouched_gamma = state
+            .tasks
+            .iter()
+            .find(|task| task.id == running_gamma.id)
+            .expect("expected gamma task");
+        assert_eq!(untouched_gamma.status, TaskStatus::Running);
     }
 
     #[test]
@@ -7948,6 +6725,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -7963,6 +6742,58 @@ process.stdin.on('data', (chunk) => {
                 log: Vec::new(),
                 last_error: Some("thread not found: missing-thread".into()),
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        assert_eq!(
+            select_next_auto_resume_task_id(&[non_resumable], Some(owner_user_id)),
+            None
+        );
+    }
+
+    #[test]
+    fn select_next_auto_resume_task_skips_non_resumable_rollout_not_found_tasks() {
+        let workspace_root = unique_temp_path("spotlight-auto-resume-rollout-filter");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let agents = default_agents(&users);
+        let owner_user_id = agents
+            .first()
+            .and_then(|agent| agent.owner_user_id)
+            .expect("agent should have owner");
+        let project_id = projects.first().unwrap().id;
+
+        let non_resumable = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "paused-rollout-missing".into(),
+            description: "non resumable".into(),
+            status: TaskStatus::Paused,
+            priority: Some(TaskPriority::High),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![TaskActivity {
+                kind: "task.watchdog_recovered".into(),
+                message: "watchdog".into(),
+                at: "1".into(),
+            }],
+            runtime: Some(platform_core::TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("missing-rollout-thread".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: Some("no rollout found for thread id missing-rollout-thread".into()),
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -7995,6 +6826,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id: None,
             assignee_user_id: Some(owner_user_id),
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -8012,6 +6845,8 @@ process.stdin.on('data', (chunk) => {
                     "本地运行会话已断开，任务已转为可恢复状态，等待自动恢复或人工继续".into(),
                 ),
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -8037,6 +6872,7 @@ process.stdin.on('data', (chunk) => {
                 task_id,
                 agent_id,
                 "本地 Codex Agent",
+                "codex",
                 "继续执行当前任务",
                 Some("thread-1".into()),
                 Some("turn-1".into()),
@@ -8047,7 +6883,7 @@ process.stdin.on('data', (chunk) => {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         drop(event_tx);
-        runtime_event_loop(state.clone(), task_id, agent_id, event_rx).await;
+        runtime_event_loop(state.clone(), task_id, agent_id, event_rx, "codex".into()).await;
 
         let guard = state.inner.lock().await;
         let task = guard
@@ -8090,6 +6926,7 @@ process.stdin.on('data', (chunk) => {
                 task_id,
                 agent_id,
                 "本地 Codex Agent",
+                "codex",
                 "继续执行当前任务",
                 Some("thread-1".into()),
                 Some("turn-1".into()),
@@ -8105,7 +6942,7 @@ process.stdin.on('data', (chunk) => {
             })
             .expect("expected event to be delivered");
         drop(event_tx);
-        runtime_event_loop(state.clone(), task_id, agent_id, event_rx).await;
+        runtime_event_loop(state.clone(), task_id, agent_id, event_rx, "codex".into()).await;
 
         let guard = state.inner.lock().await;
         let task = guard
@@ -8144,6 +6981,8 @@ process.stdin.on('data', (chunk) => {
                 labels: Vec::new(),
                 creator_user_id: None,
                 assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
                 source_task_id: None,
                 claimed_by: Some(agent_id),
                 activities: vec![TaskActivity {
@@ -8163,9 +7002,12 @@ process.stdin.on('data', (chunk) => {
                     }],
                     last_error: None,
                 }),
+                approval: Default::default(),
+                acceptance: Default::default(),
                 state_snapshot: TaskStateSnapshot::default(),
             }],
             agents,
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -8174,6 +7016,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         let sessions_to_stop = reconcile_watchdog_state(
@@ -8224,6 +7067,8 @@ process.stdin.on('data', (chunk) => {
                 labels: Vec::new(),
                 creator_user_id: None,
                 assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
                 source_task_id: None,
                 claimed_by: None,
                 activities: vec![new_activity(
@@ -8238,9 +7083,12 @@ process.stdin.on('data', (chunk) => {
                     log: vec![new_runtime_entry("assistant", "已经产出过执行日志")],
                     last_error: None,
                 }),
+                approval: Default::default(),
+                acceptance: Default::default(),
                 state_snapshot: TaskStateSnapshot::default(),
             }],
             agents,
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -8249,6 +7097,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         assert!(super::normalize_persisted_state(&mut state));
@@ -8285,6 +7134,64 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[test]
+    fn normalize_persisted_state_keeps_reassessed_open_tasks_open() {
+        let workspace_root = unique_temp_path("spotlight-normalize-reopened");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+
+        let mut state = PersistedState {
+            users: users.clone(),
+            projects: projects.clone(),
+            tasks: vec![Task {
+                id: Uuid::new_v4(),
+                project_id: projects[1].id,
+                title: "[0.1.2.4] 真实 Codex 长会话接入".into(),
+                description: "已经被状态复核重新开放，不应在重启时再次压回暂停".into(),
+                status: TaskStatus::Open,
+                priority: None,
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: None,
+                activities: vec![
+                    new_activity("runtime.thread_started", "线程已启动，稍后失去上下文"),
+                    new_activity(
+                        "task.reassessed_reopened",
+                        "系统重新评估后将任务重新开放，等待再次认领",
+                    ),
+                ],
+                runtime: None,
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }],
+            agents: default_agents(&users),
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        assert!(super::normalize_persisted_state(&mut state));
+
+        let task = state.tasks.first().unwrap();
+        assert_eq!(task.status, TaskStatus::Open);
+        assert!(task
+            .activities
+            .iter()
+            .all(|item| item.kind != "task.state_normalized"));
+    }
+
+    #[test]
     fn normalize_persisted_state_marks_done_when_completion_report_exists() {
         let workspace_root = unique_temp_path("spotlight-normalize-done");
         let users = default_users();
@@ -8303,6 +7210,8 @@ process.stdin.on('data', (chunk) => {
                 labels: Vec::new(),
                 creator_user_id: None,
                 assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
                 source_task_id: None,
                 claimed_by: None,
                 activities: vec![new_activity("task.runtime_session_lost", "runtime lost")],
@@ -8317,9 +7226,12 @@ process.stdin.on('data', (chunk) => {
                     )],
                     last_error: Some("thread not found: thread-done".into()),
                 }),
+                approval: Default::default(),
+                acceptance: Default::default(),
                 state_snapshot: TaskStateSnapshot::default(),
             }],
             agents: default_agents(&users),
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -8328,6 +7240,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         assert!(super::normalize_persisted_state(&mut state));
@@ -8366,6 +7279,8 @@ process.stdin.on('data', (chunk) => {
                 labels: Vec::new(),
                 creator_user_id: None,
                 assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
                 source_task_id: None,
                 claimed_by: None,
                 activities: vec![new_activity("runtime.error", "runtime failed")],
@@ -8377,9 +7292,12 @@ process.stdin.on('data', (chunk) => {
                     log: Vec::new(),
                     last_error: Some("Reconnecting... 1/5".into()),
                 }),
+                approval: Default::default(),
+                acceptance: Default::default(),
                 state_snapshot: TaskStateSnapshot::default(),
             }],
             agents: default_agents(&default_users()),
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -8388,6 +7306,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         assert!(super::normalize_persisted_state(&mut state));
@@ -8404,6 +7323,69 @@ process.stdin.on('data', (chunk) => {
             .activities
             .iter()
             .any(|item| item.kind == "task.state_normalized"));
+    }
+
+    #[test]
+    fn normalize_persisted_state_restores_primary_auto_agent_when_all_agents_are_disabled() {
+        let workspace_root = unique_temp_path("spotlight-normalize-auto-mode");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let mut agents = default_agents(&users);
+        for agent in &mut agents {
+            agent.auto_mode = false;
+            agent.last_action = "手动关闭自动模式".into();
+        }
+
+        let mut state = PersistedState {
+            users,
+            projects: projects.clone(),
+            tasks: vec![Task {
+                id: Uuid::new_v4(),
+                project_id: projects[1].id,
+                title: "[0.1.2] 接通真实 Codex 长会话运行时".into(),
+                description: "等待自动执行恢复主流程".into(),
+                status: TaskStatus::Open,
+                priority: Some(TaskPriority::High),
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: None,
+                activities: vec![new_activity("task.created", "等待自动执行")],
+                runtime: None,
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }],
+            agents,
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        assert!(super::normalize_persisted_state(&mut state));
+        assert!(state.agents.iter().any(|agent| agent.auto_mode));
+        assert_eq!(state.agents[0].status, "空闲");
+        assert_eq!(
+            state.agents[0].last_action,
+            "服务启动时检测到无人自动执行，已恢复主 Agent 的自动模式"
+        );
+    }
+
+    #[test]
+    fn parse_server_port_falls_back_to_default_when_env_is_invalid() {
+        assert_eq!(super::parse_server_port(Some("3001")), 3001);
+        assert_eq!(super::parse_server_port(Some("not-a-port")), 3000);
+        assert_eq!(super::parse_server_port(None), 3000);
     }
 
     #[tokio::test]
@@ -8431,6 +7413,275 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[tokio::test]
+    async fn automation_cycle_auto_start_records_run_history() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("failed to resolve workspace root")
+            .to_path_buf();
+        let state = default_state(RuntimeMode::Stub, workspace_root);
+
+        run_automation_cycle_once(&state)
+            .await
+            .expect("automation cycle should succeed");
+
+        let guard = state.inner.lock().await;
+        let auto_started_task = guard
+            .tasks
+            .iter()
+            .find(|task| task.activities.iter().any(|item| item.kind == "task.auto_started"))
+            .expect("expected one auto started task");
+        let latest_run = guard
+            .task_run_history
+            .get(&auto_started_task.id)
+            .and_then(|runs| runs.last())
+            .expect("expected task run history for auto started task");
+
+        assert_eq!(latest_run.provider, "stub-codex");
+        assert_eq!(
+            latest_run
+                .attempts
+                .last()
+                .map(|attempt| attempt.trigger_kind.as_str()),
+            Some("auto_start")
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_cycle_auto_resume_records_run_history() {
+        let workspace_root = unique_temp_path("spotlight-auto-resume-history");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let state = default_state(RuntimeMode::Stub, workspace_root.clone());
+
+        let resumable_task_id = {
+            let mut guard = state.inner.lock().await;
+            let project_id = guard
+                .projects
+                .iter()
+                .find(|project| project.is_spotlight_self)
+                .map(|project| project.id)
+                .expect("expected spotlight project");
+            let owner_user_id = {
+                let agent = guard.agents.first_mut().expect("expected agent");
+                let owner_user_id = agent.owner_user_id.expect("agent should have owner");
+                agent.auto_mode = true;
+                agent.current_task_id = None;
+                owner_user_id
+            };
+            let resumable_task_id = Uuid::new_v4();
+            guard.tasks = vec![Task {
+                id: resumable_task_id,
+                project_id,
+                title: "可自动恢复任务".into(),
+                description: "验证 auto_resume 会留下 run history".into(),
+                status: TaskStatus::Paused,
+                priority: Some(TaskPriority::High),
+                labels: vec!["regression".into(), "auto-resume".into()],
+                creator_user_id: None,
+                assignee_user_id: Some(owner_user_id),
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: None,
+                activities: vec![new_activity("task.watchdog_recovered", "watchdog recovered")],
+                runtime: Some(TaskRuntime {
+                    provider: "codex".into(),
+                    thread_id: Some("resumable-thread".into()),
+                    active_turn_id: None,
+                    git_auto_merge_enabled: false,
+                    log: Vec::new(),
+                    last_error: None,
+                }),
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }];
+            resumable_task_id
+        };
+
+        run_automation_cycle_once(&state)
+            .await
+            .expect("automation cycle should resume paused task");
+
+        let guard = state.inner.lock().await;
+        let resumed_task = guard
+            .tasks
+            .iter()
+            .find(|task| task.id == resumable_task_id)
+            .expect("expected resumable task");
+        assert_eq!(resumed_task.status, TaskStatus::Done);
+
+        let latest_run = guard
+            .task_run_history
+            .get(&resumable_task_id)
+            .and_then(|runs| runs.last())
+            .expect("expected task run history for resumed task");
+
+        assert_eq!(latest_run.provider, "stub-codex");
+        assert_eq!(latest_run.state, "completed");
+        assert_eq!(
+            latest_run
+                .attempts
+                .last()
+                .map(|attempt| attempt.trigger_kind.as_str()),
+            Some("auto_resume")
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_cycle_skips_timed_out_auto_resume_and_moves_on_to_open_task() {
+        let _env_lock = codex_stub_env_lock().lock().await;
+        let stub_env =
+            TestCodexStubEnvironment::install_with_options(Some("thread/resume"), Some("1"));
+        let workspace_root = unique_temp_path("spotlight-auto-resume-timeout");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let state = default_state(RuntimeMode::RealCodex, workspace_root);
+
+        let (paused_task_id, open_task_id, agent_id) = {
+            let mut guard = state.inner.lock().await;
+            let project_id = guard
+                .projects
+                .iter()
+                .find(|project| project.is_spotlight_self)
+                .map(|project| project.id)
+                .expect("expected spotlight project");
+            let (agent_id, owner_user_id) = {
+                let agent = guard.agents.first_mut().expect("expected agent");
+                let owner_user_id = agent.owner_user_id.expect("agent should have owner");
+                agent.auto_mode = true;
+                agent.current_task_id = None;
+                (agent.id, owner_user_id)
+            };
+
+            let paused_task_id = Uuid::new_v4();
+            let open_task_id = Uuid::new_v4();
+            guard.tasks = vec![
+                Task {
+                    id: paused_task_id,
+                    project_id,
+                    title: "坏恢复任务".into(),
+                    description: "用于验证自动恢复超时不会堵住后续调度".into(),
+                    status: TaskStatus::Paused,
+                    priority: Some(TaskPriority::High),
+                    labels: vec!["regression".into(), "auto-resume".into()],
+                    creator_user_id: None,
+                    assignee_user_id: Some(owner_user_id),
+                    assignment_mode: TaskAssignmentMode::PublicQueue,
+                    requested_agent_id: None,
+                    source_task_id: None,
+                    claimed_by: None,
+                    activities: vec![new_activity("task.watchdog_recovered", "超时回收")],
+                    runtime: Some(TaskRuntime {
+                        provider: "codex".into(),
+                        thread_id: Some("stuck-thread".into()),
+                        active_turn_id: None,
+                        git_auto_merge_enabled: false,
+                        log: Vec::new(),
+                        last_error: None,
+                    }),
+                    approval: Default::default(),
+                    acceptance: Default::default(),
+                    state_snapshot: TaskStateSnapshot::default(),
+                },
+                Task {
+                    id: open_task_id,
+                    project_id,
+                    title: "后续开放任务".into(),
+                    description: "用于验证自动循环会继续拉起新的开放任务".into(),
+                    status: TaskStatus::Open,
+                    priority: Some(TaskPriority::Medium),
+                    labels: vec!["regression".into(), "auto-start".into()],
+                    creator_user_id: None,
+                    assignee_user_id: None,
+                    assignment_mode: TaskAssignmentMode::PublicQueue,
+                    requested_agent_id: None,
+                    source_task_id: None,
+                    claimed_by: None,
+                    activities: vec![new_activity("task.created", "等待自动执行")],
+                    runtime: None,
+                    approval: Default::default(),
+                    acceptance: Default::default(),
+                    state_snapshot: TaskStateSnapshot::default(),
+                },
+            ];
+
+            (paused_task_id, open_task_id, agent_id)
+        };
+
+        run_automation_cycle_once(&state)
+            .await
+            .expect("automation cycle should recover from timed out auto resume");
+
+        {
+            let guard = state.inner.lock().await;
+            let paused_task = guard
+                .tasks
+                .iter()
+                .find(|task| task.id == paused_task_id)
+                .expect("expected paused task");
+            assert_eq!(paused_task.status, TaskStatus::Paused);
+            assert_eq!(paused_task.claimed_by, None);
+            assert!(paused_task
+                .activities
+                .iter()
+                .any(|entry| entry.kind == "task.auto_retry_queued"));
+            assert!(paused_task.runtime.as_ref().is_some_and(|runtime| {
+                runtime.active_turn_id.is_none() && runtime.last_error.is_some()
+            }));
+            assert!(guard
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .is_some_and(|agent| agent.current_task_id.is_none()));
+        }
+        assert!(state.runtime_sessions.lock().await.is_empty());
+
+        std::env::remove_var("SPOTLIGHT_CODEX_STUB_HANG_METHOD");
+        run_automation_cycle_once(&state)
+            .await
+            .expect("next automation cycle should move on to open work");
+        sleep(Duration::from_millis(80)).await;
+
+        let guard = state.inner.lock().await;
+        let open_task = guard
+            .tasks
+            .iter()
+            .find(|task| task.id == open_task_id)
+            .expect("expected open task");
+        assert_ne!(open_task.status, TaskStatus::Open);
+        assert!(open_task
+            .activities
+            .iter()
+            .any(|entry| entry.kind == "task.auto_started"));
+        assert_eq!(
+            guard
+                .task_run_history
+                .get(&open_task_id)
+                .and_then(|runs| runs.last())
+                .and_then(|run| run.attempts.last())
+                .map(|attempt| attempt.trigger_kind.as_str()),
+            Some("auto_start")
+        );
+        drop(guard);
+
+        let requests = stub_env.read_requests();
+        assert!(requests.iter().any(|request| {
+            request.get("method").and_then(Value::as_str) == Some("thread/resume")
+                && request
+                    .get("params")
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    == Some("stuck-thread")
+        }));
+        assert!(requests
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("thread/start")));
+        assert!(requests
+            .iter()
+            .any(|request| request.get("method").and_then(Value::as_str) == Some("turn/start")));
+    }
+
+    #[tokio::test]
     async fn pull_next_route_returns_a_claimed_task() {
         let app = test_app();
         let board_response = app
@@ -8454,6 +7705,9 @@ process.stdin.on('data', (chunk) => {
                 description: format!("为 {title} 生成测试数据"),
                 priority: None,
                 labels: Vec::new(),
+                requested_agent_id: None,
+                approval_required: false,
+                acceptance_owner_user_id: None,
             })
             .unwrap();
 
@@ -8513,6 +7767,9 @@ process.stdin.on('data', (chunk) => {
             description: "pull-next 之后 Agent 应立即绑定当前任务".into(),
             priority: Some(TaskPriority::High),
             labels: vec!["claim".into()],
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -8607,6 +7864,9 @@ process.stdin.on('data', (chunk) => {
             description: "手动 claim 后不需要 start 也应反映为已绑定".into(),
             priority: Some(TaskPriority::Medium),
             labels: vec!["claim".into()],
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -8656,6 +7916,138 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[tokio::test]
+    async fn claim_route_allows_approved_tasks() {
+        let workspace_root = unique_temp_path("spotlight-claim-approved");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (app, state) = test_app_with_state(RuntimeMode::Stub, workspace_root).await;
+
+        let (project_id, agent) = {
+            let guard = state.inner.lock().await;
+            (
+                guard.projects.first().unwrap().id,
+                guard.agents.first().unwrap().clone(),
+            )
+        };
+        let task_id = Uuid::new_v4();
+        {
+            let mut guard = state.inner.lock().await;
+            guard.tasks.insert(
+                0,
+                Task {
+                    id: task_id,
+                    project_id,
+                    title: "审批通过后允许认领".into(),
+                    description: "验证 APPROVED 任务可被手动认领".into(),
+                    status: TaskStatus::Approved,
+                    priority: Some(TaskPriority::Medium),
+                    labels: vec!["claim".into()],
+                    creator_user_id: None,
+                    assignee_user_id: None,
+                    assignment_mode: TaskAssignmentMode::PublicQueue,
+                    requested_agent_id: None,
+                    source_task_id: None,
+                    claimed_by: None,
+                    activities: vec![new_activity("task.approved", "任务已通过审批，等待认领")],
+                    runtime: None,
+                    approval: Default::default(),
+                    acceptance: Default::default(),
+                    state_snapshot: TaskStateSnapshot::default(),
+                },
+            );
+        }
+
+        let claim_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/claim/{}", agent.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_response.status(), StatusCode::OK);
+
+        let claim_snapshot = read_snapshot(claim_response).await;
+        let updated_task = claim_snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(updated_task.status, TaskStatus::Claimed);
+        assert_eq!(updated_task.claimed_by, Some(agent.id));
+    }
+
+    #[tokio::test]
+    async fn claim_route_rejects_non_claimable_statuses() {
+        let cases = [
+            ("approval", TaskStatus::ApprovalRequested),
+            ("paused", TaskStatus::Paused),
+            ("acceptance", TaskStatus::PendingAcceptance),
+            ("manual-review", TaskStatus::ManualReview),
+            ("accepted", TaskStatus::Accepted),
+            ("failed", TaskStatus::Failed),
+        ];
+
+        for (suffix, status) in cases {
+            let workspace_root = unique_temp_path(&format!("spotlight-claim-blocked-{suffix}"));
+            fs::create_dir_all(&workspace_root).unwrap();
+            let (app, state) = test_app_with_state(RuntimeMode::Stub, workspace_root).await;
+
+            let (project_id, agent) = {
+                let guard = state.inner.lock().await;
+                (
+                    guard.projects.first().unwrap().id,
+                    guard.agents.first().unwrap().clone(),
+                )
+            };
+            let task_id = Uuid::new_v4();
+            {
+                let mut guard = state.inner.lock().await;
+                guard.tasks.insert(
+                    0,
+                    Task {
+                        id: task_id,
+                        project_id,
+                        title: format!("不可认领状态-{suffix}"),
+                        description: "验证手动认领只允许 OPEN 和 APPROVED".into(),
+                        status,
+                        priority: Some(TaskPriority::Medium),
+                        labels: vec!["claim".into()],
+                        creator_user_id: None,
+                        assignee_user_id: None,
+                        assignment_mode: TaskAssignmentMode::PublicQueue,
+                        requested_agent_id: None,
+                        source_task_id: None,
+                        claimed_by: None,
+                        activities: vec![new_activity("task.seeded", "测试任务")],
+                        runtime: None,
+                        approval: Default::default(),
+                        acceptance: Default::default(),
+                        state_snapshot: TaskStateSnapshot::default(),
+                    },
+                );
+            }
+
+            let claim_response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/tasks/{task_id}/claim/{}", agent.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                claim_response.status(),
+                StatusCode::CONFLICT,
+                "status {status:?} should not be claimable"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn claim_start_pause_resume_flow_works_in_stub_mode() {
         let app = test_app();
         let board_response = app
@@ -8678,6 +8070,9 @@ process.stdin.on('data', (chunk) => {
             description: "启动后暂停，再补充提示词并恢复，最后验证状态流转。".into(),
             priority: None,
             labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -8796,6 +8191,123 @@ process.stdin.on('data', (chunk) => {
             .find(|candidate| candidate.id == agent.id)
             .unwrap();
         assert_eq!(updated_agent.status, "空闲");
+        let task_runs = final_snapshot
+            .task_run_history
+            .get(&created_task.id)
+            .expect("expected task run history");
+        assert_eq!(task_runs.len(), 1);
+        assert_eq!(task_runs[0].state, "completed");
+        assert_eq!(task_runs[0].attempts.len(), 2);
+        assert_eq!(task_runs[0].attempts[0].trigger_kind, "start");
+        assert_eq!(task_runs[0].attempts[1].trigger_kind, "resume");
+    }
+
+    #[tokio::test]
+    async fn persisted_state_reloads_task_run_history_from_state_file() {
+        let workspace_root = unique_temp_path("spotlight-task-run-persistence");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let (app, state) = test_app_with_state(RuntimeMode::Stub, workspace_root.clone()).await;
+
+        let board_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = read_snapshot(board_response).await;
+        let project_id = snapshot.projects.first().unwrap().id;
+        let agent = snapshot.agents.first().unwrap().clone();
+
+        let create_payload = serde_json::to_vec(&CreateTaskRequest {
+            project_id: Some(project_id),
+            title: "验证任务运行历史持久化".into(),
+            description:
+                "启动、暂停、恢复后重新读取 server-state.json，确认 task_run_history 仍存在".into(),
+            priority: None,
+            labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
+        })
+        .unwrap();
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created_task = read_task(create_response).await;
+
+        let start_payload = serde_json::to_vec(&AgentInvocationRequest {
+            agent_name_hint: agent.name.clone(),
+            prompt: Some("请先开始执行，再等待恢复。".into()),
+        })
+        .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/start/{}", created_task.id, agent.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(start_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/pause", created_task.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resume_payload = serde_json::to_vec(&AgentResumeRequest {
+            agent_name_hint: agent.name.clone(),
+            prompt: "我补充了恢复提示，请继续完成。".into(),
+        })
+        .unwrap();
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/tasks/{}/resume/{}",
+                        created_task.id, agent.id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(resume_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let persisted = super::load_or_initialize_state(&workspace_root, &state.store_path);
+        let task_runs = persisted
+            .task_run_history
+            .get(&created_task.id)
+            .expect("expected persisted task run history");
+        assert_eq!(task_runs.len(), 1);
+        assert_eq!(task_runs[0].state, "completed");
+        assert_eq!(task_runs[0].attempts.len(), 2);
+        assert_eq!(task_runs[0].attempts[0].trigger_kind, "start");
+        assert_eq!(task_runs[0].attempts[1].trigger_kind, "resume");
     }
 
     #[tokio::test]
@@ -8823,6 +8335,9 @@ process.stdin.on('data', (chunk) => {
             description: "未启动时直接暂停，状态不应被改成 PAUSED。".into(),
             priority: None,
             labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -8897,6 +8412,9 @@ process.stdin.on('data', (chunk) => {
             description: "缺少运行时上下文时恢复请求不应把任务改成 RUNNING。".into(),
             priority: None,
             labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -8998,6 +8516,9 @@ process.stdin.on('data', (chunk) => {
             description: "启动真实 Codex 会话后暂停，确认会发送 turn/interrupt。".into(),
             priority: None,
             labels: Vec::new(),
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -9349,6 +8870,9 @@ process.stdin.on('data', (chunk) => {
             description: "验证撤销态会阻止后续认领和启动".into(),
             priority: Some(TaskPriority::Medium),
             labels: vec!["cancel".into()],
+            requested_agent_id: None,
+            approval_required: false,
+            acceptance_owner_user_id: None,
         })
         .unwrap();
         let create_response = app
@@ -9591,6 +9115,8 @@ process.stdin.on('data', (chunk) => {
             labels: vec!["desktop".into()],
             creator_user_id: None,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![
@@ -9617,6 +9143,8 @@ process.stdin.on('data', (chunk) => {
                 }],
                 last_error: None,
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
         let latest_scan = ProjectScanSummary {
@@ -9678,6 +9206,10 @@ process.stdin.on('data', (chunk) => {
         assert!(prompt.contains("恢复失败的任务统一留在 PAUSED"));
         assert!(prompt.contains("最近项目聊天室"));
         assert!(prompt.contains("左侧的去掉，只保留项目聊天室"));
+        assert!(prompt.contains("任务上下文快照（机器可读）"));
+        assert!(prompt.contains("\"recent_task_summaries\""));
+        assert!(prompt.contains("\"pending_questions\""));
+        assert!(prompt.contains("\"scope_signals\""));
         assert!(prompt.contains("不要继续实现对应子需求"));
         assert!(prompt.contains("用户补充提示词"));
     }
@@ -9717,6 +9249,8 @@ process.stdin.on('data', (chunk) => {
             labels: Vec::new(),
             creator_user_id,
             assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
             source_task_id: None,
             claimed_by: None,
             activities: vec![TaskActivity {
@@ -9735,6 +9269,8 @@ process.stdin.on('data', (chunk) => {
                 )],
                 last_error: None,
             }),
+            approval: Default::default(),
+            acceptance: Default::default(),
             state_snapshot: TaskStateSnapshot::default(),
         };
 
@@ -9743,6 +9279,7 @@ process.stdin.on('data', (chunk) => {
             projects,
             tasks: vec![source_task.clone()],
             agents: default_agents(&users),
+            task_run_history: HashMap::new(),
             pending_questions: Vec::new(),
             project_scans: HashMap::new(),
             project_sessions: Vec::new(),
@@ -9751,6 +9288,7 @@ process.stdin.on('data', (chunk) => {
             memory_revisions: Vec::new(),
             memory_tags: Vec::new(),
             memory_edges: Vec::new(),
+            decisions: Vec::new(),
         };
 
         assert!(super::process_task_completion_outputs(
@@ -9804,5 +9342,371 @@ process.stdin.on('data', (chunk) => {
             .activities
             .iter()
             .any(|item| item.kind == "task.completion_summary"));
+    }
+
+    #[test]
+    fn process_project_session_completion_outputs_creates_memory_tasks_and_chat_for_planner() {
+        let users = default_users();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("failed to resolve workspace root")
+            .to_path_buf();
+        let projects = default_projects(&workspace_root);
+        let project_id = projects.first().expect("expected project").id;
+        let session_id = Uuid::new_v4();
+
+        let mut state = BoardState {
+            users: users.clone(),
+            projects,
+            tasks: Vec::new(),
+            agents: default_agents(&users),
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: vec![ProjectSession {
+                id: session_id,
+                project_id,
+                title: "客户端 Harness 规划".into(),
+                mode: "planner".into(),
+                status: "completed".into(),
+                workspace_path: Some(workspace_root.to_string_lossy().into_owned()),
+                thread_id: Some("planner-thread".into()),
+                active_turn_id: None,
+                messages: Vec::new(),
+                log: vec![new_runtime_entry(
+                    "assistant",
+                    "```json\n{\n  \"result\": \"plan_ready\",\n  \"summary\": \"已整理客户端 Harness 的最小闭环规划。\",\n  \"questions\": [\n    {\n      \"question\": \"是否先只聚焦桌面端客户端可用性？\",\n      \"context\": \"移动端和后台端可以继续排在后面\"\n    }\n  ],\n  \"follow_ups\": [\n    {\n      \"kind\": \"follow_up_task\",\n      \"title\": \"梳理客户端 Harness 最小闭环规格\",\n      \"description\": \"明确 planner / generator / evaluator 在当前版本中的最小落地点、入口和验收标准。\",\n      \"priority\": \"P1\",\n      \"can_auto_create_task\": true,\n      \"can_auto_apply\": false\n    }\n  ],\n  \"risks\": [\"如果没有统一验收标准，后续会继续碎片化推进\"]\n}\n```",
+                )],
+                last_error: None,
+            }],
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        assert!(super::process_project_session_completion_outputs(
+            &mut state, session_id
+        ));
+        assert!(state.tasks.iter().any(|task| {
+            task.title == "梳理客户端 Harness 最小闭环规格"
+                && task.labels.iter().any(|label| label == "harness:planner")
+        }));
+        assert!(state.project_chat_messages.iter().any(|message| {
+            message.user_display_name == "规划器"
+                && message.content.contains("待确认问题")
+                && message.content.contains("桌面端客户端可用性")
+        }));
+        let memory_item = state
+            .memory_items
+            .iter()
+            .find(|item| {
+                item.scope_kind == "project"
+                    && item.scope_id == project_id
+                    && item.memory_kind == "project_harness_report"
+                    && item.stable_key == "project_harness_report/planner"
+            })
+            .expect("expected planner memory item");
+        let memory_tag = state
+            .memory_tags
+            .iter()
+            .find(|tag| tag.memory_item_id == memory_item.id)
+            .expect("expected planner memory tag");
+        let memory_revision = state
+            .memory_revisions
+            .iter()
+            .find(|revision| revision.id == memory_tag.target_revision_id)
+            .expect("expected planner memory revision");
+        assert!(memory_revision.title.contains("规划器报告"));
+        assert!(memory_revision.content.contains("最小闭环规划"));
+        assert!(state.project_sessions[0]
+            .log
+            .iter()
+            .any(|entry| entry.kind == "project.session.completion_processed"));
+    }
+
+    #[test]
+    fn process_project_session_completion_outputs_creates_fix_task_for_evaluator() {
+        let users = default_users();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("failed to resolve workspace root")
+            .to_path_buf();
+        let projects = default_projects(&workspace_root);
+        let project_id = projects.first().expect("expected project").id;
+        let session_id = Uuid::new_v4();
+
+        let mut state = BoardState {
+            users: users.clone(),
+            projects,
+            tasks: Vec::new(),
+            agents: default_agents(&users),
+            task_run_history: HashMap::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: vec![ProjectSession {
+                id: session_id,
+                project_id,
+                title: "客户端运行评估".into(),
+                mode: "evaluator".into(),
+                status: "completed".into(),
+                workspace_path: Some(workspace_root.to_string_lossy().into_owned()),
+                thread_id: Some("evaluator-thread".into()),
+                active_turn_id: None,
+                messages: Vec::new(),
+                log: vec![new_runtime_entry(
+                    "assistant",
+                    "```json\n{\n  \"result\": \"needs_fix\",\n  \"summary\": \"发现客户端日志可见性仍不足。\",\n  \"questions\": [],\n  \"follow_ups\": [\n    {\n      \"kind\": \"bug_fix\",\n      \"title\": \"修复任务运行日志可见性\",\n      \"description\": \"确保客户端能看到运行中任务、Agent 输出和 failed to fetch 的真实原因。\",\n      \"priority\": \"P1\",\n      \"can_auto_create_task\": true,\n      \"can_auto_apply\": false\n    }\n  ],\n  \"risks\": [\"如果日志链路不通，客户端会持续表现为像死了一样\"]\n}\n```",
+                )],
+                last_error: None,
+            }],
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        assert!(super::process_project_session_completion_outputs(
+            &mut state, session_id
+        ));
+        let fix_task = state
+            .tasks
+            .iter()
+            .find(|task| task.title == "修复任务运行日志可见性")
+            .expect("expected evaluator follow-up task");
+        assert_eq!(fix_task.priority, Some(TaskPriority::High));
+        assert!(fix_task
+            .labels
+            .iter()
+            .any(|label| label == "harness:evaluator"));
+        assert!(fix_task.description.contains("客户端运行评估"));
+        assert!(state.memory_items.iter().any(|item| {
+            item.scope_kind == "project"
+                && item.scope_id == project_id
+                && item.memory_kind == "project_harness_report"
+                && item.stable_key == "project_harness_report/evaluator"
+        }));
+    }
+
+    #[test]
+    fn reassess_gate_marks_done_when_completion_evidence_exists() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            title: "[0.1.2] Agent 调用 MVP".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![
+                new_activity(
+                    "runtime.turn_completed",
+                    "Turn stub-turn 已结束，状态：completed",
+                ),
+                new_activity("task.watchdog_recovered", "超时回收"),
+            ],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: vec![new_runtime_entry(
+                    "assistant",
+                    "已完成所有修改\n```json\n{\"result\":\"done\",\"summary\":\"完成\"}\n```",
+                )],
+                last_error: None,
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let all_tasks = vec![task.clone()];
+        let result = crate::automation::quick_reassess_gate(&task, &all_tasks, task.project_id);
+        assert_eq!(result, "DONE");
+    }
+
+    #[test]
+    fn reassess_gate_detects_cancel_signal() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            title: "[0.1.3] 工作流引擎".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![
+                new_activity("task.started", "已开始"),
+                new_activity("task.paused", "先不做这个功能，取消"),
+            ],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let all_tasks = vec![task.clone()];
+        let result = crate::automation::quick_reassess_gate(&task, &all_tasks, task.project_id);
+        assert_eq!(result, "CANCELED");
+    }
+
+    #[test]
+    fn reassess_gate_detects_overlapping_done_task() {
+        let project_id = Uuid::new_v4();
+        let done_task = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "[0.1.2] Agent 调用与运行时接入".into(),
+            description: "已完成".into(),
+            status: TaskStatus::Done,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![new_activity("task.done", "完成")],
+            runtime: None,
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let paused_task = Task {
+            id: Uuid::new_v4(),
+            project_id,
+            title: "[0.1.2] Agent 调用与运行时 MVP 接入".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![
+                new_activity("runtime.thread_started", "线程启动"),
+                new_activity("task.watchdog_recovered", "超时回收"),
+            ],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-2".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let all_tasks = vec![done_task, paused_task.clone()];
+        let result = crate::automation::quick_reassess_gate(&paused_task, &all_tasks, project_id);
+        assert_eq!(result, "DONE", "应该检测到重叠的已完成任务");
+    }
+
+    #[test]
+    fn reassess_gate_suggests_restart_when_thread_available() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            title: "[0.1.4] 桌面执行壳".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![new_activity("task.watchdog_recovered", "超时回收")],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let all_tasks = vec![task.clone()];
+        let result = crate::automation::quick_reassess_gate(&task, &all_tasks, task.project_id);
+        assert_eq!(result, "RESTART");
+    }
+
+    #[test]
+    fn reassess_gate_suggests_reopen_after_recovery_loop_exhausted() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            title: "[0.1.2] 真实 Codex 接入".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: None,
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![
+                new_activity("task.watchdog_recovered", "第一次回收"),
+                new_activity("task.auto_retry_queued", "第二次"),
+                new_activity("task.runtime_session_lost", "第三次"),
+            ],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: None,
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let all_tasks = vec![task.clone()];
+        let result = crate::automation::quick_reassess_gate(&task, &all_tasks, task.project_id);
+        assert_eq!(result, "REOPEN");
     }
 }
