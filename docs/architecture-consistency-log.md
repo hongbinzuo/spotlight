@@ -5,6 +5,76 @@
 目标不是“写个说明”。
 目标是让后续任何会话、任何 Agent 接手时，都能基于同一份约束继续推进，不把系统带回混乱状态。
 
+## 2026-03-30：`auto_claim_next_task` 选择规则与唯一事实来源收口
+
+### 1. 当前发现的问题
+
+- `task_ops.rs` 与 `git_ops.rs` 曾同时保留 `auto_claim_next_task` 相关实现
+- 两处实现的选择顺序不一致，历史上已经出现过“先优先级还是先队列归属”的语义分叉
+- 如果不明确唯一事实来源，后续很容易再次在 legacy 分支上演化出第二套规则
+
+### 2. 本次对齐结论
+
+- 当前生产语义统一以 `apps/server/src/task_ops.rs` 为唯一事实来源
+- `auto_claim_next_task` 的筛选与排序规则收敛为：
+  - 仅从 `Open` 且未被认领的任务中选择
+  - 先过滤掉与当前 Agent 不匹配的定向任务、不可见队列任务、以及存在活动冲突的任务
+  - 排序时先看队列归属，再看优先级，再看创建时间
+- 当前队列归属顺序为：
+  - `AssignedAgent` 定向 Agent 队列
+  - 绑定到 Agent 所属用户的本人待办队列
+  - 共享待办队列
+- 当前同一队列内的优先级顺序为：
+  - `High`
+  - `Medium`
+  - `Low`
+  - `None`
+- 若 Agent 未开启 `auto_mode`，或当前已有进行中任务，则本轮不自动认领
+
+### 3. 本次新增约束
+
+- 后续修改 `auto_claim_next_task` 行为时，只允许在 `apps/server/src/task_ops.rs` 演进主实现
+- `apps/server/src/git_ops.rs` 中残留的 `auto_claim_*` 只视为待删除 legacy 分支，在编码污染修复前不得重新接回主入口
+- 若调整队列归属或优先级语义，必须同时更新：
+  - 决策记录
+  - 回归测试
+  - 任务活动中的选择依据文案
+
+### 4. 关联实现与验证
+
+- 实现：`apps/server/src/task_ops.rs`
+- legacy 残留：`apps/server/src/git_ops.rs`
+- 回归测试：`auto_claim_next_task_prefers_owner_queue_before_shared_priority`
+
+## 2026-03-29：服务端入口路由装配与 `main.rs` 边界收口
+
+### 1. 当前发现的问题
+
+- `handlers.rs` 与 `task_ops.rs` 已经存在明确职责归属
+- 但 `server.rs` 的路由装配仍然直接依赖 `main.rs` 中的私有 handler
+- 结果是模块已经拆出，真实入口却仍挂在旧实现上，`main.rs` 收口边界不成立
+
+### 2. 本次对齐结论
+
+- `server.rs` 的路由装配直接绑定 `handlers.rs`
+- 入口装配继续通过 `state.rs` 初始化状态、通过 `automation.rs` 启动后台循环
+- `main.rs` 的角色收敛为：
+  - 模块声明
+  - 顶层共享类型
+  - 启动入口
+  - 极少量跨模块共享胶水
+
+### 3. 本次新增约束
+
+- 新增服务端 API 时，默认写入 `handlers.rs`，再由 `server.rs` 装配
+- 已经在专属模块中存在实现的职责，不允许继续在 `main.rs` 保留并演进重复版本
+- 后续继续清理 `main.rs` 时，应优先删除重复实现，而不是再扩张入口文件
+
+### 4. 关联文档
+
+- `docs/main-rs-entry-boundary-v1.md`
+- `docs/clawteam-adoption-todo.md`
+
 ## 2026-03-20：服务端骨架 API 前缀与统一入口对齐
 
 ### 1. 当前发现的问题

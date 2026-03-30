@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
 use platform_core::{
-    new_activity, new_runtime_entry, Agent, PendingQuestion, Project, RuntimeLogEntry, Task,
-    TaskAcceptanceState, TaskApprovalState, TaskAssignmentMode, TaskPriority, TaskRuntime,
-    TaskStateSnapshot, TaskStatus,
+    new_activity, new_runtime_entry, PendingQuestion, Project, RuntimeLogEntry, Task,
+    TaskAssignmentMode, TaskPriority, TaskRuntime, TaskStateSnapshot, TaskStatus,
 };
 use uuid::Uuid;
 
@@ -12,11 +11,100 @@ use crate::git_ops::task_priority_order;
 use crate::models::*;
 use crate::{AppResult, AppState, BoardState};
 
+fn normalize_serialization_workspace_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+pub(crate) fn task_serialization_lane_key(projects: &[Project], task: &Task) -> String {
+    if let Some(workspace_path) = projects
+        .iter()
+        .find(|project| project.id == task.project_id)
+        .and_then(Project::primary_workspace)
+        .map(|workspace| normalize_serialization_workspace_path(&workspace.path))
+    {
+        return format!("workspace:{workspace_path}");
+    }
+
+    format!("project:{}", task.project_id)
+}
+
+fn tasks_share_serialization_lane(projects: &[Project], left: &Task, right: &Task) -> bool {
+    task_serialization_lane_key(projects, left) == task_serialization_lane_key(projects, right)
+}
+
+pub(crate) fn task_is_serialized_active(task: &Task) -> bool {
+    matches!(task.status, TaskStatus::Claimed | TaskStatus::Running)
+}
+
+pub(crate) fn active_task_conflict<'a>(
+    projects: &[Project],
+    tasks: &'a [Task],
+    task_id: Uuid,
+    exclude_task_id: Option<Uuid>,
+) -> Option<&'a Task> {
+    let target_task = tasks.iter().find(|task| task.id == task_id)?;
+    tasks.iter().find(|task| {
+        task_is_serialized_active(task)
+            && exclude_task_id.is_none_or(|excluded_task_id| task.id != excluded_task_id)
+            && tasks_share_serialization_lane(projects, target_task, task)
+    })
+}
+
+pub(crate) fn active_task_conflict_message(task: &Task) -> String {
+    format!(
+        "任务《{}》当前已在同一工作区处于{}，同一工作区一次只允许一个活跃任务",
+        task.title,
+        match task.status {
+            TaskStatus::Open => "待处理",
+            TaskStatus::Claimed => "已认领",
+            TaskStatus::ApprovalRequested => "待审批",
+            TaskStatus::Approved => "已审批",
+            TaskStatus::Running => "执行中",
+            TaskStatus::Paused => "已暂停",
+            TaskStatus::PendingAcceptance => "待验收",
+            TaskStatus::Accepted => "已验收",
+            TaskStatus::Done => "已完成",
+            TaskStatus::Failed => "已失败",
+            TaskStatus::ManualReview => "人工复核",
+            TaskStatus::Canceled => "已撤销",
+        }
+    )
+}
+
 pub(crate) fn mark_task_running(
     state: &mut BoardState,
     task_id: Uuid,
     agent_id: Uuid,
     agent_name: &str,
+    prompt: &str,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    git_auto_merge_enabled: bool,
+) -> AppResult<()> {
+    mark_task_running_with_provider(
+        state,
+        task_id,
+        agent_id,
+        agent_name,
+        "codex",
+        prompt,
+        thread_id,
+        turn_id,
+        git_auto_merge_enabled,
+    )
+}
+
+pub(crate) fn mark_task_running_with_provider(
+    state: &mut BoardState,
+    task_id: Uuid,
+    agent_id: Uuid,
+    agent_name: &str,
+    provider_id: &str,
     prompt: &str,
     thread_id: Option<String>,
     turn_id: Option<String>,
@@ -43,13 +131,14 @@ pub(crate) fn mark_task_running(
             format!("已由 {agent_name} 开始执行"),
         ));
         let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
-            provider: "codex".into(),
+            provider: provider_id.into(),
             thread_id: None,
             active_turn_id: None,
             git_auto_merge_enabled: false,
             log: Vec::new(),
             last_error: None,
         });
+        runtime.provider = provider_id.into();
         runtime.thread_id = thread_id;
         runtime.active_turn_id = turn_id;
         runtime.git_auto_merge_enabled = git_auto_merge_enabled;
@@ -127,17 +216,16 @@ pub(crate) fn assign_agent_claimed(
     assign_agent_task(state, agent_id, task_id, "CLAIMED", action);
 }
 
+#[allow(dead_code)]
 pub(crate) fn claim_task_for_agent(
     state: &mut BoardState,
     task_id: Uuid,
     agent_id: Uuid,
 ) -> AppResult<()> {
-    if let Some(conflict) =
-        crate::active_task_conflict(&state.projects, &state.tasks, task_id, Some(task_id))
-    {
+    if let Some(conflict) = active_task_conflict(&state.projects, &state.tasks, task_id, Some(task_id)) {
         return Err((
             StatusCode::CONFLICT,
-            crate::active_task_conflict_message(conflict),
+            active_task_conflict_message(conflict),
         ));
     }
 
@@ -776,7 +864,7 @@ pub(crate) fn select_next_auto_claim_task_index(
         .filter(|(_, task)| matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none())
         .filter(|(_, task)| task_is_claimable_by_agent(task, agent_id, owner_user_id))
         .filter(|(_, task)| {
-            crate::active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none()
+            active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none()
         })
         .min_by_key(|(index, task)| {
             (

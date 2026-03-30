@@ -610,7 +610,11 @@ pub(crate) fn timestamp_compact() -> String {
         .to_string()
 }
 
-pub(crate) fn auto_claim_next_task(
+// Legacy duplicate kept only as a temporary reference while this file still has
+// encoding pollution. Production auto-claim behavior is owned by task_ops.rs.
+// Do not reconnect new selection rules to this block.
+#[allow(dead_code)]
+fn legacy_auto_claim_next_task(
     state: &mut BoardState,
     agent_id: Uuid,
 ) -> AppResult<Option<Task>> {
@@ -633,7 +637,7 @@ pub(crate) fn auto_claim_next_task(
     }
 
     let Some(task_index) =
-        select_next_auto_claim_task_index(&state.projects, &state.tasks, owner_user_id)
+        legacy_select_next_auto_claim_task_index(&state.projects, &state.tasks, owner_user_id)
     else {
         return Ok(None);
     };
@@ -650,7 +654,7 @@ pub(crate) fn auto_claim_next_task(
 
         task.activities.push(new_activity(
             "task.auto_claim_reason",
-            auto_claim_selection_reason(task, owner_user_id),
+            legacy_auto_claim_selection_reason(task, owner_user_id),
         ));
 
         task.clone()
@@ -666,7 +670,8 @@ pub(crate) fn auto_claim_next_task(
     Ok(Some(claimed_task))
 }
 
-pub(crate) fn select_next_auto_claim_task_index(
+#[allow(dead_code)]
+fn legacy_select_next_auto_claim_task_index(
     projects: &[Project],
     tasks: &[Task],
     owner_user_id: Option<Uuid>,
@@ -679,13 +684,14 @@ pub(crate) fn select_next_auto_claim_task_index(
             task.assignee_user_id.is_none() || task.assignee_user_id == owner_user_id
         })
         .filter(|(_, task)| {
-            crate::active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none()
+            crate::task_ops::active_task_conflict(projects, tasks, task.id, Some(task.id))
+                .is_none()
         })
         .min_by_key(|(index, task)| {
             (
                 task_priority_order(task.priority),
-                task_assignment_order(task, owner_user_id),
-                task_created_order(task),
+                legacy_task_assignment_order(task, owner_user_id),
+                legacy_task_created_order(task),
                 *index,
             )
         })
@@ -701,14 +707,16 @@ pub(crate) fn task_priority_order(priority: Option<TaskPriority>) -> u8 {
     }
 }
 
-pub(crate) fn task_assignment_order(task: &Task, owner_user_id: Option<Uuid>) -> u8 {
+#[allow(dead_code)]
+fn legacy_task_assignment_order(task: &Task, owner_user_id: Option<Uuid>) -> u8 {
     match owner_user_id {
         Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => 0,
         _ => 1,
     }
 }
 
-pub(crate) fn auto_claim_selection_reason(task: &Task, owner_user_id: Option<Uuid>) -> String {
+#[allow(dead_code)]
+fn legacy_auto_claim_selection_reason(task: &Task, owner_user_id: Option<Uuid>) -> String {
     let queue_scope = match owner_user_id {
         Some(owner_user_id) if task.assignee_user_id == Some(owner_user_id) => "本人待办队列",
         _ => "共享待办队列",
@@ -723,7 +731,8 @@ pub(crate) fn auto_claim_selection_reason(task: &Task, owner_user_id: Option<Uui
     format!("选择依据：{} / {}", queue_scope, priority_basis)
 }
 
-pub(crate) fn task_created_order(task: &Task) -> u128 {
+#[allow(dead_code)]
+fn legacy_task_created_order(task: &Task) -> u128 {
     task.activities
         .first()
         .and_then(|activity| activity.at.parse::<u128>().ok())

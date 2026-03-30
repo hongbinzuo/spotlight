@@ -1,3 +1,5 @@
+use platform_core::BoardSnapshot;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::{
     env, fs,
@@ -16,6 +18,10 @@ use url::Url;
 struct BackendStatus {
     backend_url: String,
     server_running: bool,
+    tcp_connected: bool,
+    http_responding: bool,
+    auto_launching: bool,
+    last_launch_message: Option<String>,
     backend_state: String,
     message: String,
     platform: String,
@@ -50,20 +56,41 @@ struct BackendLaunchTracker {
     last_message: Option<String>,
 }
 
-const BACKEND_URL: &str = "http://127.0.0.1:3000";
-const BACKEND_ADDR: &str = "127.0.0.1:3000";
 const BACKEND_LAUNCH_COOLDOWN: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy)]
+struct BackendEndpoint {
+    url: &'static str,
+    addr: &'static str,
+}
+
+const BACKEND_ENDPOINTS: [BackendEndpoint; 2] = [
+    BackendEndpoint {
+        url: "http://127.0.0.1:3000",
+        addr: "127.0.0.1:3000",
+    },
+    BackendEndpoint {
+        url: "http://127.0.0.1:3001",
+        addr: "127.0.0.1:3001",
+    },
+];
 
 #[tauri::command]
 fn app_status(launch_state: tauri::State<BackendLaunchState>) -> Result<BackendStatus, String> {
-    let tcp_connected = is_backend_running();
-    let http_responding = backend_http_responding();
+    let backend = preferred_backend_endpoint();
+    let tcp_connected = is_backend_running(backend);
+    let http_responding = backend_http_responding(backend);
     let running = tcp_connected && http_responding;
     let (backend_state, message) =
-        derive_backend_status(&launch_state, tcp_connected, http_responding);
+        derive_backend_status(&launch_state, backend, tcp_connected, http_responding);
+    let (auto_launching, last_launch_message) = backend_launch_snapshot(&launch_state);
     Ok(BackendStatus {
-        backend_url: BACKEND_URL.to_string(),
+        backend_url: backend.url.to_string(),
         server_running: running,
+        tcp_connected,
+        http_responding,
+        auto_launching,
+        last_launch_message,
         backend_state: backend_state.into(),
         message,
         platform: current_platform_label(),
@@ -72,24 +99,36 @@ fn app_status(launch_state: tauri::State<BackendLaunchState>) -> Result<BackendS
 
 #[tauri::command]
 fn probe_backend() -> Result<BackendProbe, String> {
-    let tcp_connected = is_backend_running();
-    let http_responding = backend_http_responding();
+    let backend = preferred_backend_endpoint();
+    let tcp_connected = is_backend_running(backend);
+    let http_responding = backend_http_responding(backend);
 
     Ok(BackendProbe {
-        backend_url: BACKEND_URL.to_string(),
+        backend_url: backend.url.to_string(),
         tcp_connected,
         http_responding,
-        message: backend_probe_message(tcp_connected, http_responding),
+        message: backend_probe_message(backend, tcp_connected, http_responding),
     })
 }
 
 #[tauri::command]
+fn board_snapshot() -> Result<BoardSnapshot, String> {
+    let backend = preferred_backend_endpoint();
+    if !backend_http_responding(backend) {
+        return Err("本机 Spotlight 服务尚未就绪，暂时无法读取治理快照。".into());
+    }
+
+    fetch_backend_json(backend, "/api/v1/board")
+}
+
+#[tauri::command]
 fn open_backend_in_browser(url: Option<String>) -> Result<(), String> {
-    if !is_backend_running() {
+    let backend = preferred_backend_endpoint();
+    if !is_backend_running(backend) {
         return Err("本机 Spotlight 服务未运行，请先单独启动服务端。".into());
     }
 
-    let target_url = resolve_backend_browser_url(url)?;
+    let target_url = resolve_backend_browser_url(backend, url)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -122,10 +161,13 @@ fn open_backend_in_browser(url: Option<String>) -> Result<(), String> {
     Err("当前平台暂不支持自动打开浏览器".into())
 }
 
-fn resolve_backend_browser_url(url: Option<String>) -> Result<String, String> {
-    let raw = url.unwrap_or_else(|| BACKEND_URL.to_string());
+fn resolve_backend_browser_url(
+    backend: BackendEndpoint,
+    url: Option<String>,
+) -> Result<String, String> {
+    let raw = url.unwrap_or_else(|| backend.url.to_string());
     let parsed = Url::parse(&raw).map_err(|error| format!("解析浏览器地址失败：{error}"))?;
-    let backend = Url::parse(BACKEND_URL).map_err(|error| format!("解析后台地址失败：{error}"))?;
+    let backend = Url::parse(backend.url).map_err(|error| format!("解析后台地址失败：{error}"))?;
 
     if parsed.scheme() != backend.scheme()
         || parsed.host_str() != backend.host_str()
@@ -150,7 +192,12 @@ fn rebuild_and_restart_desktop(app: tauri::AppHandle) -> Result<DesktopRestartPl
     }
 
     let (script_path, log_path) =
-        write_restart_helper_script(&desktop_root, &executable_path, std::process::id())?;
+        write_restart_helper_script(
+            &workspace_root,
+            &desktop_root,
+            &executable_path,
+            std::process::id(),
+        )?;
     spawn_restart_helper(&script_path)?;
 
     let plan = DesktopRestartPlan {
@@ -177,6 +224,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             app_status,
             probe_backend,
+            board_snapshot,
             open_backend_in_browser,
             rebuild_and_restart_desktop
         ])
@@ -185,7 +233,7 @@ fn main() {
 
             thread::spawn(move || {
                 for _ in 0..20 {
-                    if backend_http_responding() {
+                    if backend_http_responding(preferred_backend_endpoint()) {
                         let _ = navigate_main_window_to_backend(&app_handle);
                         return;
                     }
@@ -200,9 +248,37 @@ fn main() {
         .expect("error while running Spotlight desktop");
 }
 
-fn is_backend_running() -> bool {
+fn preferred_backend_endpoint() -> BackendEndpoint {
+    for endpoint in BACKEND_ENDPOINTS {
+        if backend_http_responding(endpoint) {
+            return endpoint;
+        }
+    }
+    for endpoint in BACKEND_ENDPOINTS {
+        if is_backend_running(endpoint) {
+            return endpoint;
+        }
+    }
+    BACKEND_ENDPOINTS[0]
+}
+
+fn launchable_backend_endpoint() -> Option<BackendEndpoint> {
+    BACKEND_ENDPOINTS
+        .into_iter()
+        .find(|endpoint| !is_backend_running(*endpoint))
+}
+
+fn backend_port(endpoint: BackendEndpoint) -> u16 {
+    Url::parse(endpoint.url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .unwrap_or(3000)
+}
+
+fn is_backend_running(endpoint: BackendEndpoint) -> bool {
     TcpStream::connect_timeout(
-        &BACKEND_ADDR
+        &endpoint
+            .addr
             .parse()
             .expect("backend socket address should be valid"),
         Duration::from_millis(350),
@@ -210,9 +286,10 @@ fn is_backend_running() -> bool {
     .is_ok()
 }
 
-fn backend_http_responding() -> bool {
+fn backend_http_responding(endpoint: BackendEndpoint) -> bool {
     let mut stream = match TcpStream::connect_timeout(
-        &BACKEND_ADDR
+        &endpoint
+            .addr
             .parse()
             .expect("backend socket address should be valid"),
         Duration::from_secs(1),
@@ -254,25 +331,35 @@ fn current_platform_label() -> String {
 
 fn derive_backend_status<'a>(
     launch_state: &'a BackendLaunchState,
+    backend: BackendEndpoint,
     tcp_connected: bool,
     http_responding: bool,
 ) -> (&'a str, String) {
     if tcp_connected && http_responding {
         clear_backend_launch_tracker(launch_state);
-        return ("ready", backend_status_message(true, true));
+        return ("ready", backend_status_message(backend, true, true));
     }
 
     if tcp_connected {
-        if recently_attempted_backend_launch(launch_state) {
-            return ("starting", backend_http_starting_message());
+        if let Some(launch_endpoint) = launchable_backend_endpoint() {
+            if recently_attempted_backend_launch(launch_state) {
+                return ("starting", backend_http_starting_message(launch_endpoint));
+            }
+            return request_backend_launch(launch_state, launch_endpoint);
         }
-        return ("partial", backend_status_message(true, false));
+        if recently_attempted_backend_launch(launch_state) {
+            return ("starting", backend_http_starting_message(backend));
+        }
+        return ("partial", backend_status_message(backend, true, false));
     }
 
-    request_backend_launch(launch_state)
+    request_backend_launch(launch_state, preferred_backend_endpoint())
 }
 
-fn request_backend_launch<'a>(launch_state: &'a BackendLaunchState) -> (&'a str, String) {
+fn request_backend_launch<'a>(
+    launch_state: &'a BackendLaunchState,
+    endpoint: BackendEndpoint,
+) -> (&'a str, String) {
     {
         let tracker = launch_state
             .tracker
@@ -287,7 +374,7 @@ fn request_backend_launch<'a>(launch_state: &'a BackendLaunchState) -> (&'a str,
                 tracker
                     .last_message
                     .clone()
-                    .unwrap_or_else(backend_launch_waiting_message),
+                    .unwrap_or_else(|| backend_launch_waiting_message(endpoint)),
             );
         }
     }
@@ -319,9 +406,9 @@ fn request_backend_launch<'a>(launch_state: &'a BackendLaunchState) -> (&'a str,
         );
     };
 
-    match spawn_backend_process(&server_binary, &workspace_root) {
+    match spawn_backend_process(&server_binary, &workspace_root, endpoint) {
         Ok(()) => {
-            let message = backend_launch_message(&server_binary);
+            let message = backend_launch_message(&server_binary, endpoint);
             let mut tracker = launch_state
                 .tracker
                 .lock()
@@ -348,6 +435,17 @@ fn clear_backend_launch_tracker(launch_state: &BackendLaunchState) {
     tracker.last_message = None;
 }
 
+fn backend_launch_snapshot(launch_state: &BackendLaunchState) -> (bool, Option<String>) {
+    let tracker = launch_state
+        .tracker
+        .lock()
+        .expect("backend launch tracker lock should not be poisoned");
+    let auto_launching = tracker
+        .last_attempt_at
+        .is_some_and(|attempted_at| attempted_at.elapsed() < BACKEND_LAUNCH_COOLDOWN);
+    (auto_launching, tracker.last_message.clone())
+}
+
 fn recently_attempted_backend_launch(launch_state: &BackendLaunchState) -> bool {
     launch_state
         .tracker
@@ -357,37 +455,187 @@ fn recently_attempted_backend_launch(launch_state: &BackendLaunchState) -> bool 
         .is_some_and(|attempted_at| attempted_at.elapsed() < BACKEND_LAUNCH_COOLDOWN)
 }
 
-fn backend_status_message(tcp_connected: bool, http_responding: bool) -> String {
+fn backend_status_message(
+    backend: BackendEndpoint,
+    tcp_connected: bool,
+    http_responding: bool,
+) -> String {
     match (tcp_connected, http_responding) {
         (true, true) => "桌面客户端已经连接到本机 Spotlight 服务。".into(),
         (true, false) => {
-            "检测到 3000 端口可连接，但服务页面未正常响应。客户端暂不加载内嵌页。".into()
+            format!(
+                "检测到 {} 可连接，但服务页面未正常响应。客户端暂不加载内嵌页。",
+                backend.addr
+            )
         }
-        (false, _) => "本机 Spotlight 服务未运行。请单独启动服务端后，再回到客户端刷新连接状态。".into(),
+        (false, _) => {
+            "本机 Spotlight 服务未运行。请单独启动服务端后，再回到客户端刷新连接状态。".into()
+        }
     }
 }
 
-fn backend_http_starting_message() -> String {
-    "已经拉起本地 Spotlight 服务进程，正在等待 HTTP 接口就绪。客户端会在服务准备好后自动连接。".into()
-}
-
-fn backend_launch_waiting_message() -> String {
-    "正在尝试自动拉起本地 Spotlight 服务，请稍候，客户端会自动重连。".into()
-}
-
-fn backend_launch_message(server_binary: &Path) -> String {
+fn backend_http_starting_message(backend: BackendEndpoint) -> String {
     format!(
-        "正在自动拉起本地 Spotlight 服务：{}。客户端会在服务就绪后自动连接。",
-        server_binary.display()
+        "已经拉起本地 Spotlight 服务进程，正在等待 {} 的 HTTP 接口就绪。客户端会在服务准备好后自动连接。",
+        backend.addr
     )
 }
 
-fn backend_probe_message(tcp_connected: bool, http_responding: bool) -> String {
+fn backend_launch_waiting_message(backend: BackendEndpoint) -> String {
+    format!(
+        "正在尝试自动拉起本地 Spotlight 服务（目标 {}），请稍候，客户端会自动重连。",
+        backend.addr
+    )
+}
+
+fn backend_launch_message(server_binary: &Path, backend: BackendEndpoint) -> String {
+    format!(
+        "正在自动拉起本地 Spotlight 服务：{}。目标地址 {}，客户端会在服务就绪后自动连接。",
+        server_binary.display(),
+        backend.addr
+    )
+}
+
+fn backend_probe_message(
+    backend: BackendEndpoint,
+    tcp_connected: bool,
+    http_responding: bool,
+) -> String {
     match (tcp_connected, http_responding) {
-        (true, true) => "原生探测成功：3000 端口可连接，HTTP 已返回响应。".into(),
-        (true, false) => "原生探测异常：3000 端口可连接，但 HTTP 没有正常返回。".into(),
-        (false, _) => "原生探测失败：客户端进程无法连接到 127.0.0.1:3000。".into(),
+        (true, true) => format!("原生探测成功：{} 可连接，HTTP 已返回响应。", backend.addr),
+        (true, false) => format!(
+            "原生探测异常：{} 可连接，但 HTTP 没有正常返回。",
+            backend.addr
+        ),
+        (false, _) => format!("原生探测失败：客户端进程无法连接到 {}。", backend.addr),
     }
+}
+
+fn fetch_backend_json<T: DeserializeOwned>(
+    backend: BackendEndpoint,
+    path: &str,
+) -> Result<T, String> {
+    let response = fetch_backend_response(backend, path)?;
+    let body = parse_http_response_body(&response)?;
+    serde_json::from_slice::<T>(&body).map_err(|error| format!("解析后台 JSON 响应失败：{error}"))
+}
+
+fn fetch_backend_response(backend: BackendEndpoint, path: &str) -> Result<Vec<u8>, String> {
+    let mut stream = TcpStream::connect_timeout(
+        &backend
+            .addr
+            .parse()
+            .expect("backend socket address should be valid"),
+        Duration::from_secs(2),
+    )
+    .map_err(|error| format!("连接本地 Spotlight 服务失败：{error}"))?;
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("请求本地 Spotlight 服务失败：{error}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| format!("读取本地 Spotlight 服务响应失败：{error}"))?;
+
+    Ok(response)
+}
+
+fn parse_http_response_body(response: &[u8]) -> Result<Vec<u8>, String> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "本地 Spotlight 服务响应格式不完整。".to_string())?;
+
+    let header_bytes = &response[..header_end];
+    let body_bytes = &response[header_end + 4..];
+    let header_text = String::from_utf8_lossy(header_bytes);
+    let mut header_lines = header_text.lines();
+    let status_line = header_lines
+        .next()
+        .ok_or_else(|| "本地 Spotlight 服务响应缺少状态行。".to_string())?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "本地 Spotlight 服务响应状态行无效。".to_string())?
+        .parse::<u16>()
+        .map_err(|error| format!("解析本地 Spotlight 服务状态码失败：{error}"))?;
+
+    let is_chunked = header_lines.any(|line| {
+        line.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+    });
+    let payload = if is_chunked {
+        decode_chunked_body(body_bytes)?
+    } else {
+        body_bytes.to_vec()
+    };
+
+    if !(200..300).contains(&status_code) {
+        let preview = String::from_utf8_lossy(&payload);
+        return Err(format!(
+            "本地 Spotlight 服务返回 {status_code}：{}",
+            truncate_for_error(&preview)
+        ));
+    }
+
+    Ok(payload)
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut cursor = 0;
+    let mut decoded = Vec::new();
+
+    loop {
+        let Some(size_end) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            return Err("chunked 响应缺少大小行。".into());
+        };
+
+        let size_bytes = &body[cursor..cursor + size_end];
+        let size_text = String::from_utf8_lossy(size_bytes);
+        let size_hex = size_text
+            .split(';')
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "chunked 响应块大小为空。".to_string())?;
+        let chunk_size = usize::from_str_radix(size_hex, 16)
+            .map_err(|error| format!("解析 chunked 响应块大小失败：{error}"))?;
+
+        cursor += size_end + 2;
+        if chunk_size == 0 {
+            return Ok(decoded);
+        }
+
+        if body.len() < cursor + chunk_size + 2 {
+            return Err("chunked 响应块内容不完整。".into());
+        }
+
+        decoded.extend_from_slice(&body[cursor..cursor + chunk_size]);
+        cursor += chunk_size + 2;
+    }
+}
+
+fn truncate_for_error(message: &str) -> String {
+    let total = message.chars().count();
+    if total <= 160 {
+        return message.to_string();
+    }
+
+    format!(
+        "{}...(已截断，共 {total} 字符)",
+        message.chars().take(160).collect::<String>()
+    )
 }
 
 fn navigate_main_window_to_backend(app: &tauri::AppHandle) -> Result<(), String> {
@@ -395,7 +643,8 @@ fn navigate_main_window_to_backend(app: &tauri::AppHandle) -> Result<(), String>
         .get_webview_window("main")
         .ok_or_else(|| "未找到主窗口".to_string())?;
 
-    let url = Url::parse(BACKEND_URL).map_err(|error| format!("解析后台地址失败：{error}"))?;
+    let backend = preferred_backend_endpoint();
+    let url = Url::parse(backend.url).map_err(|error| format!("解析后台地址失败：{error}"))?;
 
     window
         .navigate(url)
@@ -427,8 +676,14 @@ fn find_workspace_root() -> Result<PathBuf, String> {
 fn backend_launch_candidates(workspace_root: &Path) -> Vec<PathBuf> {
     let binary_name = server_binary_name();
     vec![
-        workspace_root.join("target").join("debug").join(binary_name),
-        workspace_root.join("target").join("release").join(binary_name),
+        workspace_root
+            .join("target")
+            .join("debug")
+            .join(binary_name),
+        workspace_root
+            .join("target")
+            .join("release")
+            .join(binary_name),
         workspace_root
             .join("apps")
             .join("desktop")
@@ -446,10 +701,15 @@ fn server_binary_name() -> &'static str {
     }
 }
 
-fn spawn_backend_process(server_binary: &Path, workspace_root: &Path) -> Result<(), String> {
+fn spawn_backend_process(
+    server_binary: &Path,
+    workspace_root: &Path,
+    endpoint: BackendEndpoint,
+) -> Result<(), String> {
     let mut command = Command::new(server_binary);
     command
         .current_dir(workspace_root)
+        .env("SPOTLIGHT_SERVER_PORT", backend_port(endpoint).to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -493,6 +753,7 @@ fn release_executable_path(desktop_root: &Path, current_exe: &Path) -> PathBuf {
 }
 
 fn write_restart_helper_script(
+    workspace_root: &Path,
     desktop_root: &Path,
     executable_path: &Path,
     pid: u32,
@@ -509,9 +770,9 @@ fn write_restart_helper_script(
     };
 
     let content = if cfg!(target_os = "windows") {
-        build_windows_restart_script(pid, desktop_root, executable_path, &log_path)
+        build_windows_restart_script(pid, workspace_root, desktop_root, executable_path, &log_path)
     } else {
-        build_unix_restart_script(pid, desktop_root, executable_path, &log_path)
+        build_unix_restart_script(pid, workspace_root, desktop_root, executable_path, &log_path)
     };
 
     fs::write(&script_path, content)
@@ -550,10 +811,22 @@ fn spawn_restart_helper(script_path: &Path) -> Result<(), String> {
 
 fn build_windows_restart_script(
     pid: u32,
+    workspace_root: &Path,
     desktop_root: &Path,
     executable_path: &Path,
     log_path: &Path,
 ) -> String {
+    let workspace_target = workspace_root
+        .join("target")
+        .display()
+        .to_string()
+        .replace('\'', "''");
+    let desktop_target = desktop_root
+        .join("src-tauri")
+        .join("target")
+        .display()
+        .to_string()
+        .replace('\'', "''");
     let desktop_root = desktop_root.display().to_string().replace('\'', "''");
     let executable_path = executable_path.display().to_string().replace('\'', "''");
     let log_path = log_path.display().to_string().replace('\'', "''");
@@ -561,6 +834,8 @@ fn build_windows_restart_script(
     format!(
         r#"$ErrorActionPreference = 'Stop'
 $pidToWait = {pid}
+$workspaceTarget = '{workspace_target}'
+$desktopTarget = '{desktop_target}'
 $desktopRoot = '{desktop_root}'
 $exePath = '{executable_path}'
 $logPath = '{log_path}'
@@ -585,6 +860,13 @@ if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
   exit 1
 }}
 
+foreach ($targetPath in @($desktopTarget, $workspaceTarget)) {{
+  if (Test-Path $targetPath) {{
+    Write-Log ('清理旧 target 目录：' + $targetPath)
+    Remove-Item -Recurse -Force $targetPath
+  }}
+}}
+
 Write-Log '开始执行 npm run tauri build -- --no-bundle'
 Set-Location $desktopRoot
 npm run tauri build -- --no-bundle *>> $logPath
@@ -596,12 +878,15 @@ if ($LASTEXITCODE -ne 0) {{
 Write-Log '构建完成，准备重新启动客户端'
 Start-Process -FilePath $exePath -WorkingDirectory ([System.IO.Path]::GetDirectoryName($exePath))
 Write-Log '客户端已重新启动'
-"#
+"#,
+        workspace_target = workspace_target,
+        desktop_target = desktop_target,
     )
 }
 
 fn build_unix_restart_script(
     pid: u32,
+    workspace_root: &Path,
     desktop_root: &Path,
     executable_path: &Path,
     log_path: &Path,
@@ -610,6 +895,8 @@ fn build_unix_restart_script(
         r#"#!/bin/sh
 set -eu
 PID_TO_WAIT="{pid}"
+WORKSPACE_TARGET="{workspace_target}"
+DESKTOP_TARGET="{desktop_target}"
 DESKTOP_ROOT="{desktop_root}"
 EXE_PATH="{executable_path}"
 LOG_PATH="{log_path}"
@@ -633,6 +920,13 @@ if kill -0 "$PID_TO_WAIT" 2>/dev/null; then
   exit 1
 fi
 
+for target_path in "$DESKTOP_TARGET" "$WORKSPACE_TARGET"; do
+  if [ -d "$target_path" ]; then
+    log "清理旧 target 目录: $target_path"
+    rm -rf "$target_path"
+  fi
+done
+
 log "开始执行 npm run tauri build -- --no-bundle"
 cd "$DESKTOP_ROOT"
 npm run tauri build -- --no-bundle >> "$LOG_PATH" 2>&1
@@ -641,6 +935,8 @@ log "构建完成，准备重新启动客户端"
 log "客户端已重新启动"
 "#,
         pid = pid,
+        workspace_target = workspace_root.join("target").display(),
+        desktop_target = desktop_root.join("src-tauri").join("target").display(),
         desktop_root = desktop_root.display(),
         executable_path = executable_path.display(),
         log_path = log_path.display()
@@ -652,8 +948,9 @@ mod tests {
     use super::{
         backend_http_starting_message, backend_launch_candidates, backend_launch_message,
         backend_probe_message, backend_status_message, build_windows_restart_script,
-        find_workspace_root_from, release_executable_path, resolve_backend_browser_url,
-        server_binary_name,
+        decode_chunked_body, find_workspace_root_from, parse_http_response_body,
+        release_executable_path, resolve_backend_browser_url, server_binary_name,
+        BACKEND_ENDPOINTS,
     };
     use std::{
         fs,
@@ -664,7 +961,7 @@ mod tests {
     #[test]
     fn reports_connected_message_when_server_is_running() {
         assert_eq!(
-            backend_status_message(true, true),
+            backend_status_message(BACKEND_ENDPOINTS[0], true, true),
             "桌面客户端已经连接到本机 Spotlight 服务。"
         );
     }
@@ -672,7 +969,7 @@ mod tests {
     #[test]
     fn reports_manual_start_message_when_server_is_not_running() {
         assert_eq!(
-            backend_status_message(false, false),
+            backend_status_message(BACKEND_ENDPOINTS[0], false, false),
             "本机 Spotlight 服务未运行。请单独启动服务端后，再回到客户端刷新连接状态。"
         );
     }
@@ -680,40 +977,41 @@ mod tests {
     #[test]
     fn reports_partial_connection_message_when_http_is_not_ready() {
         assert_eq!(
-            backend_status_message(true, false),
-            "检测到 3000 端口可连接，但服务页面未正常响应。客户端暂不加载内嵌页。"
+            backend_status_message(BACKEND_ENDPOINTS[0], true, false),
+            "检测到 127.0.0.1:3000 可连接，但服务页面未正常响应。客户端暂不加载内嵌页。"
         );
     }
 
     #[test]
     fn reports_starting_message_after_auto_launch() {
         assert_eq!(
-            backend_http_starting_message(),
-            "已经拉起本地 Spotlight 服务进程，正在等待 HTTP 接口就绪。客户端会在服务准备好后自动连接。"
+            backend_http_starting_message(BACKEND_ENDPOINTS[0]),
+            "已经拉起本地 Spotlight 服务进程，正在等待 127.0.0.1:3000 的 HTTP 接口就绪。客户端会在服务准备好后自动连接。"
         );
     }
 
     #[test]
     fn reports_probe_success_message() {
         assert_eq!(
-            backend_probe_message(true, true),
-            "原生探测成功：3000 端口可连接，HTTP 已返回响应。"
+            backend_probe_message(BACKEND_ENDPOINTS[0], true, true),
+            "原生探测成功：127.0.0.1:3000 可连接，HTTP 已返回响应。"
         );
     }
 
     #[test]
     fn reports_probe_partial_failure_message() {
         assert_eq!(
-            backend_probe_message(true, false),
-            "原生探测异常：3000 端口可连接，但 HTTP 没有正常返回。"
+            backend_probe_message(BACKEND_ENDPOINTS[0], true, false),
+            "原生探测异常：127.0.0.1:3000 可连接，但 HTTP 没有正常返回。"
         );
     }
 
     #[test]
     fn browser_url_can_include_focus_query_params() {
-        let url = resolve_backend_browser_url(Some(
-            "http://127.0.0.1:3000/?project_id=project-1&task_id=task-2".into(),
-        ))
+        let url = resolve_backend_browser_url(
+            BACKEND_ENDPOINTS[0],
+            Some("http://127.0.0.1:3000/?project_id=project-1&task_id=task-2".into()),
+        )
         .unwrap();
 
         assert!(url.contains("project_id=project-1"));
@@ -723,7 +1021,8 @@ mod tests {
     #[test]
     fn browser_url_rejects_other_hosts() {
         let error =
-            resolve_backend_browser_url(Some("https://example.com/".into())).unwrap_err();
+            resolve_backend_browser_url(BACKEND_ENDPOINTS[0], Some("https://example.com/".into()))
+                .unwrap_err();
 
         assert!(error.contains("Spotlight"));
     }
@@ -752,14 +1051,18 @@ mod tests {
     fn windows_restart_script_contains_build_and_relaunch_steps() {
         let script = build_windows_restart_script(
             42,
+            Path::new("C:/repo"),
             Path::new("C:/repo/apps/desktop"),
             Path::new("C:/repo/apps/desktop/src-tauri/target/release/spotlight-desktop.exe"),
             Path::new("C:/temp/restart.log"),
         );
 
+        assert!(script.contains("Remove-Item -Recurse -Force"));
         assert!(script.contains("npm run tauri build -- --no-bundle"));
         assert!(script.contains("Start-Process -FilePath $exePath"));
         assert!(script.contains("$pidToWait = 42"));
+        assert!(script.contains("C:/repo/target"));
+        assert!(script.contains("C:/repo/apps/desktop/src-tauri/target"));
     }
 
     #[test]
@@ -782,19 +1085,49 @@ mod tests {
 
         assert_eq!(
             candidates.first(),
-            Some(&workspace_root.join("target").join("debug").join(server_binary_name()))
+            Some(
+                &workspace_root
+                    .join("target")
+                    .join("debug")
+                    .join(server_binary_name())
+            )
         );
         assert_eq!(
             candidates.get(1),
-            Some(&workspace_root.join("target").join("release").join(server_binary_name()))
+            Some(
+                &workspace_root
+                    .join("target")
+                    .join("release")
+                    .join(server_binary_name())
+            )
         );
     }
 
     #[test]
     fn backend_launch_message_mentions_binary_path() {
-        let message = backend_launch_message(Path::new("C:/repo/target/debug/spotlight-server.exe"));
+        let message = backend_launch_message(
+            Path::new("C:/repo/target/debug/spotlight-server.exe"),
+            BACKEND_ENDPOINTS[0],
+        );
         assert!(message.contains("spotlight-server.exe"));
+        assert!(message.contains("127.0.0.1:3000"));
         assert!(message.contains("自动连接"));
+    }
+
+    #[test]
+    fn can_decode_chunked_http_body() {
+        let decoded = decode_chunked_body(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
+        assert_eq!(decoded, b"Wikipedia");
+    }
+
+    #[test]
+    fn parse_http_response_body_supports_chunked_payloads() {
+        let payload = parse_http_response_body(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n{\"ok\":true,\"n\":1}\r\n0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(payload, br#"{"ok":true,"n":1}"#);
     }
 
     fn unique_temp_dir() -> PathBuf {

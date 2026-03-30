@@ -415,6 +415,12 @@ pub(crate) struct PersistedState {
     #[serde(default)]
     pub task_run_history: std::collections::HashMap<Uuid, Vec<platform_core::TaskRunRecord>>,
     #[serde(default)]
+    pub execution_slots: Vec<platform_core::ExecutionSlotRecord>,
+    #[serde(default)]
+    pub workspace_leases: Vec<platform_core::WorkspaceLeaseRecord>,
+    #[serde(default)]
+    pub coordination_write_intents: Vec<platform_core::CoordinationWriteIntent>,
+    #[serde(default)]
     pub pending_questions: Vec<PendingQuestion>,
     #[serde(default)]
     pub project_scans: std::collections::HashMap<Uuid, ProjectScanSummary>,

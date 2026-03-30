@@ -584,3 +584,102 @@ Agent 自治与决策边界：
 - 已考虑性能影响
 
 当版本规划、质量门禁、语言规则发生重要变化时，必须同步更新本文件。
+
+## 12. 解决问题总规则：先找参考，再为我所用
+
+每次面对架构决策、新功能设计、或技术难题时，Agent 必须遵守以下步骤：
+
+### 12.1 先搜索，不要从零开始
+
+在动手实现之前，先在 GitHub 和技术社区搜索是否已有成熟的开源方案或设计模式。
+搜索目标包括但不限于：
+
+- 类似功能的开源项目
+- 相关架构设计文档
+- 已发表的论文或技术博客
+- 行业最佳实践
+
+### 12.2 评估与借鉴标准
+
+找到参考后，按以下维度评估是否值得借鉴：
+
+| 维度 | 问题 |
+|------|------|
+| 问题匹配度 | 它解决的问题和我们的问题有多大重叠？ |
+| 架构兼容性 | 它的设计能否融入 Spotlight 现有架构？ |
+| 成熟度 | 它是实验项目还是经过生产验证的？ |
+| 可提取性 | 能否只提取核心思路而不引入整个依赖？ |
+| 许可证 | 是否允许借鉴？ |
+
+### 12.3 借鉴方式
+
+不是复制粘贴代码，而是：
+
+1. 提取核心设计思路和模式
+2. 用 Spotlight 的架构语言重新实现
+3. 在文档或任务记录中注明参考来源
+4. 保留参考项目的链接供后续追踪
+
+### 12.4 当前重点参考项目
+
+以下项目与 Spotlight 的目标高度相关，Agent 在相关领域做决策时应优先参考：
+
+#### 多 Agent 并行编排
+
+- [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator)
+  - 核心价值：每个 Agent 独立 worktree + 独立分支 + 独立 PR；CI 失败自动修复；编排器本身也是 Agent
+  - 可借鉴：执行槽隔离模型、CI 反应机制、notification-driven 的人机协作模式
+  - 状态机：SPAWNING → WORKING → PR_OPEN → CI_FAILED/REVIEW_PENDING → MERGEABLE
+
+- [GitHub Squad](https://github.blog/ai-and-ml/github-copilot/how-squad-runs-coordinated-ai-agents-inside-your-repository/)
+  - 核心价值：repo-native 多 Agent 协作，用 `decisions.md` 做 drop-box 式异步协调
+  - 可借鉴：避免活锁的异步协调模式、结构化决策记录
+
+- [crewAI](https://github.com/crewAIInc/crewAI)
+  - 核心价值：角色驱动的 Agent 协作框架，定义清晰的角色边界和任务委派
+  - 可借鉴：角色模型设计、任务依赖链处理
+
+#### 自迭代与自改进
+
+- [MaximeRobeyns/self_improving_coding_agent (SICA)](https://github.com/MaximeRobeyns/self_improving_coding_agent)
+  - 核心价值：Agent 改进自己的代码库，通过 benchmark 衡量改进效果；ICLR 2025 论文验证
+  - 可借鉴：meta-agent loop 设计、异步 overseer 监督机制、通过 benchmark 驱动自迭代
+  - 论文：[arXiv:2504.15228](https://arxiv.org/abs/2504.15228)
+
+- [Composio 自改进系统](https://composio.dev/blog/the-self-improving-ai-system-that-built-itself)
+  - 核心价值：30 个并行 Agent 重建自身系统的实战案例
+  - 可借鉴：从 bash 脚本到正式编排器的演进路径
+
+- [Addy Osmani: Self-Improving Coding Agents](https://addyosmani.com/blog/self-improving-agents/)
+  - 核心价值：Claude Code 持续循环改进代码的实践总结
+  - 可借鉴：iterative agent loop 模式
+
+#### 分布式 Agent 系统工程
+
+- [GitHub Blog: Multi-Agent Workflow Engineering](https://github.blog/ai-and-ml/generative-ai/multi-agent-workflows-often-fail-heres-how-to-engineer-ones-that-dont/)
+  - 核心价值：把多 Agent 当分布式系统工程而非聊天界面来设计
+  - 可借鉴：typed schema、constrained actions、结构化接口；"treat agents like code, not chat"
+
+- [OxyGent (JD)](https://github.com/jd-opensource/OxyGent)
+  - 核心价值：动态规划范式、弹性拓扑、自动依赖映射
+  - 可借鉴：分布式调度器的线性成本增长模型
+
+- [Swarms](https://github.com/kyegomez/swarms)
+  - 核心价值：统一编排器接口，支持多种 swarm 策略动态切换
+  - 可借鉴：swarm 策略抽象
+
+#### 自学习与记忆
+
+- [Gödel Agent: Recursive Self-Improvement](https://gist.github.com/ruvnet/15c6ef556be49e173ab0ecd6d252a7b9)
+  - 核心价值：递归自改进架构蓝图，每解决一个任务就变得更好
+  - 可借鉴：自改进验证机制
+
+- [Self-Evolving Agents 论文集](https://github.com/CharlesQ9/Self-Evolving-Agents)
+  - 核心价值：自演化 Agent 的学术研究汇总
+  - 可借鉴：形式化的自改进框架
+
+### 12.5 维护规则
+
+- 参考项目列表不是固定的，Agent 发现更好的参考时应更新
+- 每次借鉴后在任务记录中注明"参考了 XXX 的 YYY 设计"
+- 如果某个参考项目已过时或不再维护，标注并寻找替代

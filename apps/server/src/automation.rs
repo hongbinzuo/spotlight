@@ -8,13 +8,18 @@ use uuid::Uuid;
 
 use crate::git_ops::task_priority_order;
 use crate::models::RuntimeMode;
-use crate::state::persist_state;
+use crate::runtime::{
+    spawn_runtime_session_with_timeout, start_runtime_thread_with_timeout,
+    start_runtime_turn_with_timeout,
+};
+use crate::state::{
+    current_time_nanos, persist_state, record_task_run_start, record_task_run_transition,
+    stale_timeout_nanos, task_has_completion_evidence, task_has_progress_evidence,
+    task_last_touch_nanos,
+};
 use crate::task_ops::*;
 use crate::{
-    active_task_conflict, active_task_conflict_message, current_time_nanos, stale_timeout_nanos,
-    task_has_completion_evidence, task_has_progress_evidence, task_is_serialized_active,
-    task_last_touch_nanos, AppResult, AppState, BoardState, AUTO_MAINTENANCE_INTERVAL_SECS,
-    TASK_STALE_TIMEOUT_SECS,
+    AppResult, AppState, BoardState, AUTO_MAINTENANCE_INTERVAL_SECS, TASK_STALE_TIMEOUT_SECS,
 };
 
 pub(crate) fn start_background_automation(state: AppState) {
@@ -131,6 +136,7 @@ async fn drive_auto_mode_agents(state: &AppState) {
 }
 
 /// 处理超时的决策卡片：按 timeout_action 自动执行
+#[allow(dead_code)]
 async fn expire_timed_out_decisions(state: &AppState) {
     let now_secs: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -181,6 +187,7 @@ async fn expire_timed_out_decisions(state: &AppState) {
 
 /// 策略扫描：定期对所有滞留任务做快速重评估
 /// 高置信度结果直接执行，中低置信度投递到决策收件箱等人确认
+#[allow(dead_code)]
 async fn reassess_stale_tasks(state: &AppState) {
     let candidates: Vec<(Uuid, Uuid, String, String, f32)> = {
         let guard = state.inner.lock().await;
@@ -324,6 +331,7 @@ async fn reassess_stale_tasks(state: &AppState) {
     let _ = crate::state::persist_state(state).await;
 }
 
+#[allow(dead_code)]
 fn decision_option(id: &str, label: &str, style: &str) -> platform_core::DecisionOption {
     platform_core::DecisionOption {
         id: id.into(),
@@ -435,6 +443,7 @@ fn significant_task_keywords(title: &str) -> Vec<String> {
 }
 
 /// 应用重评估结果：改变任务状态
+#[allow(dead_code)]
 async fn apply_reassess_decision(
     state: &AppState,
     task_id: Uuid,
@@ -456,6 +465,7 @@ async fn apply_reassess_decision(
 }
 
 /// 应用重评估结果：重新开放（清理运行上下文）
+#[allow(dead_code)]
 async fn apply_reassess_reopen(state: &AppState, task_id: Uuid, message: &str) {
     let mut guard = state.inner.lock().await;
     if let Ok(task) = find_task_mut(&mut guard, task_id) {
@@ -538,7 +548,7 @@ pub(crate) fn reconcile_parallel_active_tasks(state: &mut BoardState) -> Vec<Uui
         .iter()
         .filter(|task| task_is_serialized_active(task))
     {
-        let lane_key = crate::task_serialization_lane_key(&state.projects, task);
+            let lane_key = task_serialization_lane_key(&state.projects, task);
         active_task_groups
             .entry(lane_key)
             .or_default()
@@ -764,7 +774,7 @@ pub(crate) async fn auto_start_task(
     match state.runtime_mode {
         RuntimeMode::Stub => {
             let mut guard = state.inner.lock().await;
-            crate::mark_task_running(
+            crate::task_ops::mark_task_running_with_provider(
                 &mut guard,
                 task_id,
                 agent_id,
@@ -775,7 +785,7 @@ pub(crate) async fn auto_start_task(
                 Some("stub-turn".into()),
                 false,
             )?;
-            crate::record_task_run_start(
+            record_task_run_start(
                 &mut guard,
                 task_id,
                 agent_id,
@@ -798,21 +808,21 @@ pub(crate) async fn auto_start_task(
         }
         RuntimeMode::RealCodex => {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let session = crate::spawn_runtime_session_with_timeout(
+            let session = spawn_runtime_session_with_timeout(
                 context.workspace_root.clone(),
                 event_tx,
                 "鑷姩鍚姩浠诲姟鏃跺垱寤鸿繍琛屾椂浼氳瘽",
             )
             .await?;
             let provider_id = session.provider_id().to_string();
-            let thread_id = crate::start_runtime_thread_with_timeout(
+            let thread_id = start_runtime_thread_with_timeout(
                 &session,
                 &context.workspace_root,
                 &crate::prompt::task_developer_instructions(),
                 "鑷姩鍚姩浠诲姟鏃跺垱寤虹嚎绋?",
             )
             .await?;
-            let turn_id = crate::start_runtime_turn_with_timeout(
+            let turn_id = start_runtime_turn_with_timeout(
                 &session,
                 &context.workspace_root,
                 &thread_id,
@@ -824,7 +834,7 @@ pub(crate) async fn auto_start_task(
             let run_turn_id = turn_id.clone();
             {
                 let mut guard = state.inner.lock().await;
-                crate::mark_task_running(
+                crate::task_ops::mark_task_running_with_provider(
                     &mut guard,
                     task_id,
                     agent_id,
@@ -841,7 +851,7 @@ pub(crate) async fn auto_start_task(
                         "系统检测到空闲 Agent，已自动开始执行该任务",
                     ));
                 }
-                crate::record_task_run_start(
+                record_task_run_start(
                     &mut guard,
                     task_id,
                     agent_id,
@@ -853,7 +863,7 @@ pub(crate) async fn auto_start_task(
                     "auto_start",
                 );
             }
-            crate::register_task_runtime_session(
+            crate::handlers::register_task_runtime_session(
                 state,
                 task_id,
                 agent_id,
@@ -919,7 +929,7 @@ async fn auto_resume_task(
                 .log
                 .push(new_runtime_entry("assistant", "Stub 自动恢复后已完成任务"));
             runtime.active_turn_id = None;
-            crate::record_task_run_start(
+            record_task_run_start(
                 &mut guard,
                 task_id,
                 agent_id,
@@ -930,7 +940,7 @@ async fn auto_resume_task(
                 Some("stub-turn-auto-resume".into()),
                 "auto_resume",
             );
-            crate::record_task_run_transition(
+            record_task_run_transition(
                 &mut guard,
                 task_id,
                 "completed",
@@ -945,7 +955,7 @@ async fn auto_resume_task(
             Ok(())
         }
         RuntimeMode::RealCodex => {
-            let resolved_session = crate::resolve_task_runtime_session(
+            let resolved_session = crate::handlers::resolve_task_runtime_session(
                 state,
                 task_id,
                 agent_id,
@@ -954,7 +964,7 @@ async fn auto_resume_task(
             )
             .await?;
 
-            let turn_id = match crate::start_runtime_turn_with_timeout(
+            let turn_id = match start_runtime_turn_with_timeout(
                 &resolved_session.session,
                 &workspace_root,
                 &resolved_session.thread_id,
@@ -972,7 +982,7 @@ async fn auto_resume_task(
                 }
             };
 
-            crate::register_task_runtime_session(
+            crate::handlers::register_task_runtime_session(
                 state,
                 task_id,
                 agent_id,
@@ -1004,10 +1014,10 @@ async fn auto_resume_task(
                 runtime.last_error = None;
                 runtime.log.push(new_runtime_entry("user", prompt.clone()));
                 let task_title = task.title.clone();
-                crate::record_task_run_start(
-                    &mut guard,
-                    task_id,
-                    agent_id,
+            record_task_run_start(
+                &mut guard,
+                task_id,
+                agent_id,
                     &run_provider_id,
                     &prompt,
                     Some(workspace_root.display().to_string()),
@@ -1078,6 +1088,7 @@ async fn auto_resume_prompt(state: &AppState, task_id: Uuid) -> AppResult<String
 /// 2. 检测跨项目的资源冲突
 /// 3. 标记需要人工注意的异常
 /// 4. 动态调整优先级（基于项目进度）
+#[allow(dead_code)]
 async fn run_strategy_sweep(state: &AppState) {
     // 阶段 0：处理超时的决策卡片
     expire_timed_out_decisions(state).await;
@@ -1093,6 +1104,7 @@ async fn run_strategy_sweep(state: &AppState) {
 }
 
 /// 检测系统级异常并记录到活动日志
+#[allow(dead_code)]
 async fn detect_system_anomalies(state: &AppState) {
     let anomalies: Vec<String> = {
         let guard = state.inner.lock().await;
@@ -1163,6 +1175,7 @@ async fn detect_system_anomalies(state: &AppState) {
 }
 
 /// 根据项目进度动态调整未启动任务的优先级
+#[allow(dead_code)]
 async fn adjust_task_priorities(state: &AppState) {
     let adjustments: Vec<(Uuid, String)> = {
         let guard = state.inner.lock().await;

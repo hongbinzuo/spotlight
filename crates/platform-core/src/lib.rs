@@ -284,6 +284,8 @@ pub struct TaskRunRecord {
     #[serde(default)]
     pub primary_workspace_path: Option<String>,
     #[serde(default)]
+    pub execution_slot_id: Option<Uuid>,
+    #[serde(default)]
     pub session_threads: Vec<String>,
     #[serde(default)]
     pub attempts: Vec<TaskRunAttemptRecord>,
@@ -309,6 +311,157 @@ pub struct TaskRunAttemptRecord {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionSlotState {
+    Pending,
+    Running,
+    Paused,
+    Releasing,
+    Released,
+    Failed,
+}
+
+impl Default for ExecutionSlotState {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+impl ExecutionSlotState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Releasing => "releasing",
+            Self::Released => "released",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSlotRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub task_id: Uuid,
+    #[serde(default)]
+    pub task_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub assigned_agent_id: Option<Uuid>,
+    #[serde(default)]
+    pub workspace_lease_id: Option<Uuid>,
+    #[serde(default)]
+    pub lane_key: Option<String>,
+    #[serde(default)]
+    pub state: ExecutionSlotState,
+    pub opened_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceLeaseState {
+    Pending,
+    Active,
+    Released,
+    Expired,
+}
+
+impl Default for WorkspaceLeaseState {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+impl WorkspaceLeaseState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Released => "released",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLeaseRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub slot_id: Uuid,
+    #[serde(default)]
+    pub workspace_root_id: Option<Uuid>,
+    pub workspace_path: String,
+    pub lane_key: String,
+    #[serde(default)]
+    pub state: WorkspaceLeaseState,
+    pub acquired_at: String,
+    #[serde(default)]
+    pub released_at: Option<String>,
+    #[serde(default)]
+    pub release_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationConflictPolicy {
+    FirstCommitWins,
+    PriorityWins,
+    LastWriteWins,
+}
+
+impl Default for CoordinationConflictPolicy {
+    fn default() -> Self {
+        Self::FirstCommitWins
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationIntentStatus {
+    Proposed,
+    Committed,
+    Rejected,
+    Superseded,
+}
+
+impl Default for CoordinationIntentStatus {
+    fn default() -> Self {
+        Self::Proposed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinationWriteIntent {
+    pub id: Uuid,
+    pub resource_kind: String,
+    pub resource_key: String,
+    pub action_kind: String,
+    #[serde(default)]
+    pub conflict_policy: CoordinationConflictPolicy,
+    #[serde(default)]
+    pub status: CoordinationIntentStatus,
+    #[serde(default)]
+    pub proposed_by_agent_id: Option<Uuid>,
+    #[serde(default)]
+    pub proposed_by_slot_id: Option<Uuid>,
+    #[serde(default)]
+    pub justification: Option<String>,
+    pub proposed_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub resolution_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +503,12 @@ pub struct BoardSnapshot {
     pub agents: Vec<Agent>,
     #[serde(default)]
     pub task_run_history: HashMap<Uuid, Vec<TaskRunRecord>>,
+    #[serde(default)]
+    pub execution_slots: Vec<ExecutionSlotRecord>,
+    #[serde(default)]
+    pub workspace_leases: Vec<WorkspaceLeaseRecord>,
+    #[serde(default)]
+    pub coordination_write_intents: Vec<CoordinationWriteIntent>,
     #[serde(default)]
     pub pending_questions: Vec<PendingQuestion>,
 }

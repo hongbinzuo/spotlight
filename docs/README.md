@@ -58,6 +58,12 @@
   - 对比 Network-AI 与 Spotlight 的目标差距，沉淀原子共享状态、权限治理、预算熔断、journey 合规和项目上下文包等协调治理层借鉴点。
 - `workspace-serialization-transition-2026-03-28.md`
   - 记录从“全局串行”过渡到“按工作区串行”的临时决策、实现范围、风险边界与后续重构顺序。
+- `execution-slot-and-coordination-model-v1.md`
+  - 记录 `execution slot + workspace lease + coordination_write_intent` 第一阶段模型、为何暂不把 `execution_slot_id` 直接挂到 `Task`、以及当前已落地的状态升级与运行期联动行为。
+- `main-rs-entry-boundary-v1.md`
+  - 明确 `apps/server/src/main.rs` 在当前阶段只保留入口胶水、顶层共享类型和启动逻辑，禁止继续承载 handler 与任务业务逻辑。
+- `reference-project-refresh-2026-03-30.md`
+  - 重新核对 Agent Orchestrator、Squad、crewAI、OxyGent、SICA 等参考项目，收敛当前阶段最该吸收的设计结论，并重排近期 TODO 优先级。
 
 ## 建议阅读顺序
 
@@ -88,3 +94,6 @@
 25. `clawteam-adoption-todo.md`
 26. `network-ai-reference-gap-analysis.md`
 27. `workspace-serialization-transition-2026-03-28.md`
+28. `execution-slot-and-coordination-model-v1.md`
+29. `main-rs-entry-boundary-v1.md`
+30. `reference-project-refresh-2026-03-30.md`

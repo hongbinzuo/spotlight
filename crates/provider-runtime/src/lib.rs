@@ -22,7 +22,6 @@ use tokio::{
 pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const CLAUDE_PROVIDER_ID: &str = "claude";
 const CODEX_REQUEST_TIMEOUT_SECS: u64 = 20;
-const CLAUDE_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub type RuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = RuntimeResult<T>> + Send + 'a>>;
 pub type RuntimeResult<T> = Result<T, RuntimeError>;

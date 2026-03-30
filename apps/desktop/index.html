@@ -24,11 +24,62 @@
             <strong id="statusTitle">正在检查</strong>
             <p id="statusMessage">客户端正在确认本机 Spotlight 服务状态。</p>
           </div>
+          <div id="healthCard" class="health-card tone-idle">
+            <div class="health-grid">
+              <div class="health-item">
+                <span>客户端壳</span>
+                <strong id="healthShellValue" class="health-value tone-idle">等待检查</strong>
+              </div>
+              <div class="health-item">
+                <span>服务端口</span>
+                <strong id="healthTcpValue" class="health-value tone-idle">等待检查</strong>
+              </div>
+              <div class="health-item">
+                <span>HTTP 接口</span>
+                <strong id="healthHttpValue" class="health-value tone-idle">等待检查</strong>
+              </div>
+              <div class="health-item">
+                <span>自动拉起</span>
+                <strong id="healthAutoValue" class="health-value tone-idle">等待检查</strong>
+              </div>
+            </div>
+            <p id="healthActionValue" class="health-action">桌面端会在这里显示最近一次自检或自愈动作。</p>
+          </div>
           <div class="action-list">
             <button id="checkButton" class="primary">检查服务状态</button>
             <button id="probeButton" class="secondary">测试连接</button>
             <button id="reloadButton" class="secondary">刷新内嵌看板</button>
             <button id="browserButton" class="secondary">用浏览器打开</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head-row">
+            <h2>项目入口</h2>
+            <span class="panel-chip">项目感知</span>
+          </div>
+          <p id="projectQueueSummary" class="muted task-queue-summary">
+            服务可用后，这里会优先展示最需要推进、恢复或复核的项目，再继续展开项目内任务。
+          </p>
+          <div id="projectQueueList" class="project-queue-list">
+            <div class="task-queue-empty">
+              等待服务端返回项目队列。当前仍以治理概览和恢复状态作为最小可用入口。
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head-row">
+            <h2>左侧任务列表</h2>
+            <span id="taskQueueScope" class="panel-chip">等待同步</span>
+          </div>
+          <p id="taskQueueSummary" class="muted task-queue-summary">
+            服务可用后，这里会优先展示当前项目里最需要推进的任务，并直接联动右侧工作区。
+          </p>
+          <div id="taskQueueList" class="task-queue-list">
+            <div class="task-queue-empty">
+              等待服务端返回任务队列。当前仍以治理概览和恢复状态作为最小可用入口。
+            </div>
           </div>
         </section>
 
@@ -57,11 +108,94 @@
         </section>
 
         <section class="panel">
+          <h2>治理概览</h2>
+          <div id="governanceCard" class="status-card status-idle">
+            <strong id="governanceTitle">等待治理快照</strong>
+            <p id="governanceMessage">服务可用后，这里会优先显示状态依据、恢复信号和关键输出。</p>
+          </div>
+          <div class="governance-grid">
+            <div class="governance-metric">
+              <span>当前项目</span>
+              <strong id="governanceProjectValue">未记录</strong>
+            </div>
+            <div class="governance-metric">
+              <span>当前任务</span>
+              <strong id="governanceTaskValue">未记录</strong>
+            </div>
+            <div class="governance-metric">
+              <span>任务状态</span>
+              <strong id="governanceTaskStatusValue">等待快照</strong>
+            </div>
+            <div class="governance-metric">
+              <span>最近信号</span>
+              <strong id="governanceFreshnessValue">暂无最新信号</strong>
+            </div>
+          </div>
+          <div class="governance-stack">
+            <div class="governance-block">
+              <span>状态依据</span>
+              <p id="governanceReasonValue">
+                客户端会优先显示结构化状态依据，而不是只保留一个裸 status。
+              </p>
+              <small id="governanceEvidenceValue" class="governance-hint">
+                等待服务端返回任务状态证据。
+              </small>
+            </div>
+            <div class="governance-block">
+              <span>恢复信号</span>
+              <p id="governanceRecoveryValue">当前没有恢复快照。</p>
+            </div>
+            <div class="governance-block">
+              <span>自动运行</span>
+              <p id="governanceAutomationValue">当前还没有自动运行信号。</p>
+            </div>
+            <div class="governance-block">
+              <span>项目概览</span>
+              <p id="governanceCountsValue">运行中 0 · 待恢复 0 · 自动运行 0 · 待答 0</p>
+            </div>
+            <div class="governance-block">
+              <span>关键输出</span>
+              <p id="governanceOutputValue">当前没有可展示的关键输出。</p>
+            </div>
+          </div>
+          <div id="governanceAlert" class="governance-alert" hidden></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head-row">
+            <h2>焦点任务活动</h2>
+            <div class="detail-mode-switch">
+              <button id="activitySimpleButton" class="secondary small" type="button">简洁</button>
+              <button id="activityDiagnosticButton" class="secondary small" type="button">
+                诊断
+              </button>
+            </div>
+          </div>
+          <label id="activitySearchRow" class="activity-search" hidden>
+            <span>搜索详细日志</span>
+            <input
+              id="activitySearchInput"
+              type="search"
+              placeholder="按输出、活动或关键字搜索"
+              spellcheck="false"
+            />
+          </label>
+          <div id="activityDetailCard" class="activity-detail-card tone-idle">
+            <div class="task-queue-empty">
+              服务可用后，这里会优先显示关键输出和活动流。
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
           <h2>当前能力</h2>
           <ul class="info-list">
             <li>真实 Tauri 桌面窗口，不是简单拉起一个浏览器页签。</li>
             <li>本地服务可探测、可自动拉起，并保留兼容模式 fallback。</li>
+            <li>左栏原生任务列表会按需复核、处理中、待恢复和最近信号排序。</li>
             <li>重新打开客户端后，可恢复最近查看的项目、任务和项目会话入口。</li>
+            <li>客户端壳会优先暴露治理状态、恢复信号和关键输出，而不是只留裸连接状态。</li>
+            <li>默认先看最新且最重要的输出；更详细的活动和日志放到诊断模式，并支持搜索。</li>
             <li>移动端与浏览器仍然继续走统一入口，不绑定桌面专属协议。</li>
           </ul>
         </section>

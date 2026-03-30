@@ -9,8 +9,10 @@ use provider_runtime::{
     CODEX_PROVIDER_ID,
 };
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 
 type AppResult<T> = Result<T, (StatusCode, String)>;
+const RUNTIME_OPERATION_TIMEOUT_SECS: u64 = 25;
 
 pub use provider_runtime::RuntimeEvent;
 
@@ -155,6 +157,81 @@ impl ProviderRuntimeSession {
 // 兼容仍在拆分中的旧模块命名，避免一次性重写整个服务端。
 #[allow(dead_code)]
 pub type CodexRuntimeSession = ProviderRuntimeSession;
+
+fn runtime_operation_timeout_secs() -> u64 {
+    std::env::var("SPOTLIGHT_RUNTIME_OP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(RUNTIME_OPERATION_TIMEOUT_SECS)
+}
+
+fn runtime_operation_timeout_error(action: &str) -> (StatusCode, String) {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        format!(
+            "{action}超过 {} 秒仍未完成",
+            runtime_operation_timeout_secs()
+        ),
+    )
+}
+
+pub async fn spawn_runtime_session_with_timeout(
+    workspace_root: PathBuf,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    action: &str,
+) -> AppResult<Arc<ProviderRuntimeSession>> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        ProviderRuntimeSession::spawn(workspace_root, event_tx),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(runtime_operation_timeout_error(action)),
+    }
+}
+
+pub async fn start_runtime_thread_with_timeout(
+    session: &Arc<ProviderRuntimeSession>,
+    cwd: &Path,
+    developer_instructions: &str,
+    action: &str,
+) -> AppResult<String> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        session.start_thread(cwd, developer_instructions),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            session.shutdown().await;
+            Err(runtime_operation_timeout_error(action))
+        }
+    }
+}
+
+pub async fn start_runtime_turn_with_timeout(
+    session: &Arc<ProviderRuntimeSession>,
+    cwd: &Path,
+    thread_id: &str,
+    prompt: &str,
+    action: &str,
+) -> AppResult<String> {
+    match timeout(
+        Duration::from_secs(runtime_operation_timeout_secs()),
+        session.start_turn(cwd, thread_id, prompt),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            session.shutdown().await;
+            Err(runtime_operation_timeout_error(action))
+        }
+    }
+}
 
 fn runtime_error_to_app(error: RuntimeError) -> (StatusCode, String) {
     let status = match error.kind {

@@ -27,12 +27,12 @@ use crate::models::*;
 use crate::prompt;
 use crate::runtime::{CodexRuntimeSession, RuntimeEvent};
 use crate::snapshot::*;
-use crate::state::{persist_state, seed_tasks_from_agents_file};
-use crate::task_ops::*;
-use crate::{
-    active_task_conflict, active_task_conflict_message, refresh_task_state_snapshot, AppResult,
-    AppState, BoardState,
+use crate::state::{
+    persist_state, seed_tasks_from_agents_file, task_has_completion_evidence,
+    task_has_progress_evidence,
 };
+use crate::task_ops::*;
+use crate::{AppResult, AppState, BoardState};
 
 pub(crate) async fn index() -> Html<&'static str> {
     Html(crate::ui::INDEX_HTML)
@@ -1145,6 +1145,7 @@ pub(crate) async fn start_task(
                 task_id,
                 agent_id,
                 event_rx,
+                "codex".into(),
             ));
             let guard = state.inner.lock().await;
             let snapshot = snapshot_from_state(&guard);
@@ -1449,12 +1450,14 @@ pub(crate) async fn register_task_runtime_session(
         return;
     };
 
+    let provider_id = session.provider_id().to_string();
     state.runtime_sessions.lock().await.insert(task_id, session);
     tokio::spawn(runtime_event_loop(
         state.clone(),
         task_id,
         agent_id,
         event_rx,
+        provider_id,
     ));
 }
 
@@ -1521,6 +1524,7 @@ pub(crate) async fn runtime_event_loop(
     task_id: Uuid,
     agent_id: Uuid,
     mut event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    provider_id: String,
 ) {
     while let Some(event) = event_rx.recv().await {
         let mut guard = state.inner.lock().await;
@@ -1537,7 +1541,7 @@ pub(crate) async fn runtime_event_loop(
         {
             let task = &mut guard.tasks[task_index];
             let runtime = task.runtime.get_or_insert_with(|| TaskRuntime {
-                provider: "codex".into(),
+                provider: provider_id.clone(),
                 thread_id: None,
                 active_turn_id: None,
                 git_auto_merge_enabled: false,
@@ -1671,7 +1675,7 @@ pub(crate) async fn runtime_event_loop(
     reconcile_task_runtime_session_lost(&state, task_id).await;
 }
 
-async fn reconcile_task_runtime_session_lost(state: &AppState, task_id: Uuid) {
+pub(crate) async fn reconcile_task_runtime_session_lost(state: &AppState, task_id: Uuid) {
     let mut guard = state.inner.lock().await;
     let Some(task) = guard.tasks.iter_mut().find(|task| task.id == task_id) else {
         return;
@@ -2372,7 +2376,7 @@ pub(crate) async fn reassess_project_tasks(
         }
 
         // Open 但没有任何进度痕迹的——纯新任务，不需要评估
-        if matches!(task.status, TaskStatus::Open) && !crate::task_has_progress_evidence(task) {
+        if matches!(task.status, TaskStatus::Open) && !task_has_progress_evidence(task) {
             skipped.push(serde_json::json!({
                 "task_id": task.id,
                 "title": task.title,
@@ -2414,7 +2418,7 @@ pub(crate) async fn reassess_project_tasks(
 
 /// 基于规则引擎给出重评估建议（不依赖 Agent，作为快速参考）
 fn evaluate_reassess_by_rules(task: &Task) -> serde_json::Value {
-    let has_completion_evidence = crate::task_has_completion_evidence(task);
+    let has_completion_evidence = task_has_completion_evidence(task);
     let has_thread = task
         .runtime
         .as_ref()
@@ -2704,6 +2708,7 @@ pub(crate) async fn apply_decision_effect(
 }
 
 /// 创建一个决策卡片并投递到收件箱
+#[allow(dead_code)]
 pub(crate) fn post_decision(
     state: &mut crate::BoardState,
     project_id: Uuid,

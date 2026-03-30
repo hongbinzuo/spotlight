@@ -45,7 +45,7 @@ export function deriveWorkspaceState(status) {
     workspaceBadge: "等待连接",
     placeholderTitle: "服务端未启动",
     placeholderMessage:
-      "客户端界面已正常加载。请单独启动 spotlight-server，然后点击“检查服务状态”或“刷新内嵌面板”。",
+      "客户端界面已正常加载。请先单独启动 spotlight-server，然后点击“检查服务状态”或“刷新内嵌面板”。",
     shouldLoadFrame: false
   };
 }

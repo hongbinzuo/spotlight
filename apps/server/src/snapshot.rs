@@ -1,14 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::http::{header, HeaderMap};
-use platform_core::{Agent, BoardSnapshot, PendingQuestion, Task, TaskStatus, User};
+use platform_core::{Agent, BoardSnapshot, Task, TaskStatus, User};
 use uuid::Uuid;
 
 use crate::models::*;
-use crate::{
-    refresh_task_state_snapshot, AppResult, BoardState, BOARD_MESSAGE_CHAR_LIMIT,
-    BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT,
-};
+use crate::state::refresh_task_state_snapshot;
+use crate::{AppResult, BoardState, BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT};
 
 pub(crate) fn snapshot_from_state(state: &BoardState) -> BoardSnapshot {
     snapshot_from_state_with_user(state, state.users.first().cloned())
@@ -25,6 +23,9 @@ pub(crate) fn snapshot_from_state_with_user(
         tasks: state.tasks.iter().map(board_snapshot_task).collect(),
         agents: state.agents.clone(),
         task_run_history: state.task_run_history.clone(),
+        execution_slots: state.execution_slots.clone(),
+        workspace_leases: state.workspace_leases.clone(),
+        coordination_write_intents: state.coordination_write_intents.clone(),
         pending_questions: state.pending_questions.clone(),
     }
 }
