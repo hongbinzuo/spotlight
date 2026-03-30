@@ -128,8 +128,8 @@
 - `start_task` / `resume_task` / `auto_start_task` 已把真实执行目录写入 run history，`resolve_workspace_for_task` 会优先回放执行 worktree，而不是盲目退回主工作区
 - Git 完成态收口已改为“在执行 worktree 提交，再回主工作区 merge”；失败现场默认保留，不做自动清理
 - `runtime_event_loop` 与 runtime session lost 恢复路径已补 run history transition，便于后续 watchdog / auto-resume 基于真实执行目录恢复
+- Git 回归测试基座已改成单仓库初始化，不再依赖当前 Windows 环境里会异常的 `git clone` / `git push` 到临时本地 remote
 - 当前缺口：
-- Git 测试语义已更新到 worktree 模式，但当前 Windows 环境下临时仓库 `git clone` 会因 `sh.exe ... couldn't create signal pipe, Win32 error 5` 失败，需后续单独处理测试基座
 - 还未实现 worktree 回收策略、冲突/泄漏专项测试，也还未做 clone 模式分支
 
 - [ ] 引入 worktree 准备器

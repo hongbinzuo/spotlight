@@ -455,22 +455,12 @@ process.stdin.on('data', (chunk) => {
 
     fn init_git_test_workspace() -> PathBuf {
         let root = unique_temp_path("spotlight-git-workflow");
-        let remote = root.join("remote.git");
         let local = root.join("local");
 
         fs::create_dir_all(&root).unwrap();
         ensure_git_ok(
             &root,
-            &[
-                "init",
-                "--bare",
-                "--initial-branch=main",
-                remote.to_str().unwrap(),
-            ],
-        );
-        ensure_git_ok(
-            &root,
-            &["clone", remote.to_str().unwrap(), local.to_str().unwrap()],
+            &["init", "--initial-branch=main", local.to_str().unwrap()],
         );
         ensure_git_ok(&local, &["config", "user.name", "Spotlight Test"]);
         ensure_git_ok(&local, &["config", "user.email", "spotlight@example.com"]);
@@ -478,7 +468,6 @@ process.stdin.on('data', (chunk) => {
         fs::write(local.join("README.md"), "hello\n").unwrap();
         ensure_git_ok(&local, &["add", "README.md"]);
         ensure_git_ok(&local, &["commit", "-m", "init"]);
-        ensure_git_ok(&local, &["push", "-u", "origin", "main"]);
 
         local
     }
@@ -5143,7 +5132,7 @@ process.stdin.on('data', (chunk) => {
         let workspace_root = init_git_test_workspace();
         let task_id = Uuid::from_u128(126);
 
-        fs::write(workspace_root.join("dirty.txt"), "local change\n").unwrap();
+        fs::write(workspace_root.join("README.md"), "hello\nlocal change\n").unwrap();
 
         let prepare = prepare_git_task_branch_in_repo(&workspace_root, task_id)
             .await
