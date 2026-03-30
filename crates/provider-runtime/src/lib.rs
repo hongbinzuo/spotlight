@@ -700,22 +700,31 @@ impl ClaudeRuntimeSession {
         let mut command = if cfg!(windows) {
             let mut cmd = Command::new("cmd");
             cmd.args([
-                "/C", "claude",
-                "--output-format", "stream-json",
-                "--input-format", "stream-json",
+                "/C",
+                "claude",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
                 "--verbose",
-                "--model", "claude-opus-4-6",
-                "--permission-prompt-tool", "stdio",
+                "--model",
+                "claude-opus-4-6",
+                "--permission-prompt-tool",
+                "stdio",
             ]);
             cmd
         } else {
             let mut cmd = Command::new("claude");
             cmd.args([
-                "--output-format", "stream-json",
-                "--input-format", "stream-json",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json",
                 "--verbose",
-                "--model", "claude-opus-4-6",
-                "--permission-prompt-tool", "stdio",
+                "--model",
+                "claude-opus-4-6",
+                "--permission-prompt-tool",
+                "stdio",
             ]);
             cmd
         };
@@ -733,10 +742,9 @@ impl ClaudeRuntimeSession {
             )
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::Internal, "无法获取 Claude stdin"))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            RuntimeError::new(RuntimeErrorKind::Internal, "无法获取 Claude stdin")
+        })?;
         let stdout = child.stdout.take().ok_or_else(|| {
             RuntimeError::new(RuntimeErrorKind::Internal, "无法获取 Claude stdout")
         })?;
@@ -758,7 +766,9 @@ impl ClaudeRuntimeSession {
         let stdout_session = session.clone();
         let stdout_events = event_tx.clone();
         tokio::spawn(async move {
-            stdout_session.read_claude_stdout(stdout, stdout_events).await;
+            stdout_session
+                .read_claude_stdout(stdout, stdout_events)
+                .await;
         });
 
         // stderr 读取线程
@@ -860,18 +870,12 @@ impl ClaudeRuntimeSession {
                 continue;
             };
 
-            let msg_type = payload
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let msg_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
 
             match msg_type {
                 // 会话开始
                 "system" => {
-                    if let Some(session_id) = payload
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                    {
+                    if let Some(session_id) = payload.get("session_id").and_then(Value::as_str) {
                         *self.session_id.lock().await = Some(session_id.to_string());
                         let _ = event_tx.send(RuntimeEvent::ThreadStarted {
                             thread_id: session_id.to_string(),
@@ -884,7 +888,12 @@ impl ClaudeRuntimeSession {
                     let delta = payload
                         .get("content")
                         .and_then(Value::as_str)
-                        .or_else(|| payload.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str))
+                        .or_else(|| {
+                            payload
+                                .get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(Value::as_str)
+                        })
                         .unwrap_or("");
                     if !delta.is_empty() {
                         let _ = event_tx.send(RuntimeEvent::AgentDelta {
@@ -960,12 +969,12 @@ impl ProviderSession for ClaudeRuntimeSession {
         Box::pin(async move {
             // Claude CLI 启动时自动创建 session，我们等待 session_id 出现
             // 或者生成一个临时 ID
-            let session_id = self
-                .session_id
-                .lock()
-                .await
-                .clone()
-                .unwrap_or_else(|| format!("claude-session-{}", self.turn_counter.load(Ordering::SeqCst)));
+            let session_id = self.session_id.lock().await.clone().unwrap_or_else(|| {
+                format!(
+                    "claude-session-{}",
+                    self.turn_counter.load(Ordering::SeqCst)
+                )
+            });
             Ok(session_id)
         })
     }
@@ -992,7 +1001,11 @@ impl ProviderSession for ClaudeRuntimeSession {
         })
     }
 
-    fn interrupt_turn<'a>(&'a self, _thread_id: &'a str, _turn_id: &'a str) -> RuntimeFuture<'a, ()> {
+    fn interrupt_turn<'a>(
+        &'a self,
+        _thread_id: &'a str,
+        _turn_id: &'a str,
+    ) -> RuntimeFuture<'a, ()> {
         Box::pin(async move {
             // 发送中断信号
             let payload = json!({ "type": "cancel" });

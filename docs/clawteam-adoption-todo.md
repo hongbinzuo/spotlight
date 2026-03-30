@@ -63,7 +63,7 @@
 - 还没有联邦预算与超支硬阻断
 - 还没有 run / slot 级 journey、compliance、quality gate
 - 还没有稳定的项目上下文包契约
-- `main.rs` 虽已删除 legacy 自动化块，但仍保留大量跨模块共享 helper、task-run 归一化逻辑与服务装配逻辑
+- `main.rs` 顶层业务入口已基本收口完成；当前剩余主要是测试承载，执行底座主线已切到 slot heartbeat / recovery / worktree 隔离
 - `automation.rs` 中的 `strategy sweep` / `reassess_stale_tasks` / `quick_reassess_gate` 仍未进入当前主线自动化循环，后续必须以显式需求和测试推进
 
 ## 4. 落地顺序表
@@ -71,7 +71,7 @@
 | 波次 | 目标 | 主要输出 | 前置依赖 | 当前状态 |
 |------|------|----------|----------|----------|
 | Wave 0 | 按工作区串行过渡 | lane key、冲突判定、auto-claim 过滤、同工作区回收 | 无 | 已完成 |
-| Wave 1 | 收口状态初始化与入口文件 | `state.rs` 接管初始化/归一化；`main.rs` 只保留入口胶水 | Wave 0 | 进行中 |
+| Wave 1 | 收口状态初始化与入口文件 | `state.rs` 接管初始化/归一化；`main.rs` 只保留入口胶水 | Wave 0 | 已完成 |
 | Wave 2 | 引入 execution slot 骨架 | `execution_slot_id`、slot 状态、slot 与 task-run 关联 | Wave 1 | 进行中 |
 | Wave 3 | 引入 workspace lease | slot 绑定独立工作区实例；共享主工作区不再直接承载执行现场 | Wave 2 | 进行中 |
 | Wave 4 | Git worktree 隔离执行 | worktree 创建/复用/回收、失败现场保留、成功后可选合并 | Wave 3 | 未开始 |

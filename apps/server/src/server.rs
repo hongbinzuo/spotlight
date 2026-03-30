@@ -5,8 +5,8 @@ use axum::{
     Router,
 };
 
-use crate::{handlers, AppState, RuntimeMode};
 use crate::{automation::start_background_automation, state::default_state};
+use crate::{handlers, AppState, RuntimeMode};
 
 pub(crate) fn server_listen_addr() -> SocketAddr {
     let port = parse_server_port(std::env::var("SPOTLIGHT_SERVER_PORT").ok().as_deref());
@@ -96,17 +96,32 @@ pub(crate) fn build_api_router() -> Router<AppState> {
             "/projects/{project_id}/tasks/cloud-install-restart",
             post(handlers::create_cloud_install_restart_task),
         )
-        .route("/projects/{project_id}/explore", post(handlers::explore_project))
+        .route(
+            "/projects/{project_id}/explore",
+            post(handlers::explore_project),
+        )
         .route(
             "/agents/{agent_id}/auto-mode/toggle",
             post(handlers::toggle_agent_auto_mode),
         )
-        .route("/agents/{agent_id}/pull-next", post(handlers::pull_next_task))
-        .route("/tasks/{task_id}/claim/{agent_id}", post(handlers::claim_task))
-        .route("/tasks/{task_id}/start/{agent_id}", post(handlers::start_task))
+        .route(
+            "/agents/{agent_id}/pull-next",
+            post(handlers::pull_next_task),
+        )
+        .route(
+            "/tasks/{task_id}/claim/{agent_id}",
+            post(handlers::claim_task),
+        )
+        .route(
+            "/tasks/{task_id}/start/{agent_id}",
+            post(handlers::start_task),
+        )
         .route("/tasks/{task_id}/pause", post(handlers::pause_task))
         .route("/tasks/{task_id}/cancel", post(handlers::cancel_task))
-        .route("/tasks/{task_id}/resume/{agent_id}", post(handlers::resume_task))
+        .route(
+            "/tasks/{task_id}/resume/{agent_id}",
+            post(handlers::resume_task),
+        )
         .route("/tasks/{task_id}/reassess", post(handlers::reassess_task))
         .route(
             "/projects/{project_id}/reassess",

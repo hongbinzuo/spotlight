@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::models::*;
 use crate::state::refresh_task_state_snapshot;
-use crate::{AppResult, BoardState, BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT};
+use crate::{
+    AppResult, BoardState, BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT,
+    BOARD_TASK_RUNTIME_LOG_LIMIT,
+};
 
 pub(crate) fn snapshot_from_state(state: &BoardState) -> BoardSnapshot {
     snapshot_from_state_with_user(state, state.users.first().cloned())

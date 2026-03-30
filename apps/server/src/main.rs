@@ -1,4 +1,4 @@
-﻿mod automation;
+mod automation;
 mod completion;
 mod git_ops;
 mod handlers;
@@ -26,27 +26,17 @@ use state::{
     default_agents, default_projects, default_state, default_users, load_or_initialize_state,
     normalize_persisted_state,
 };
-use task_ops::{
-    active_task_conflict, assign_agent_claimed, auto_claim_next_task, find_task_mut,
-};
+use task_ops::{active_task_conflict, assign_agent_claimed, auto_claim_next_task, find_task_mut};
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use axum::{
-    http::StatusCode,
-};
+use axum::http::StatusCode;
 use platform_core::{
     Agent, CoordinationWriteIntent, DecisionCard, ExecutionSlotRecord, PendingQuestion, Project,
     Task, TaskRunRecord, User, WorkspaceLeaseRecord,
 };
 use runtime::{ProviderRuntimeSession, RuntimeEvent};
-use tokio::{
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type AppResult<T> = Result<T, (StatusCode, String)>;
@@ -105,23 +95,22 @@ async fn main() {
 mod tests {
     use super::{
         active_task_conflict, auto_claim_next_task, build_api_router, build_app, default_agents,
-        default_projects, default_state, default_users,
-        finalize_git_task_branch_in_repo, prepare_git_task_branch_in_repo,
-        reconcile_parallel_active_tasks, reconcile_watchdog_state, run_automation_cycle_once,
-        runtime_event_loop, select_next_auto_resume_task_id,
+        default_projects, default_state, default_users, finalize_git_task_branch_in_repo,
+        prepare_git_task_branch_in_repo, reconcile_parallel_active_tasks, reconcile_watchdog_state,
+        run_automation_cycle_once, runtime_event_loop, select_next_auto_resume_task_id,
         write_memory_revision, AppState, BoardState, MemoryWriteSpec, PersistedState,
         ProjectChatMessage, ProjectContextSnapshot, ProjectMemorySnapshot, ProjectScanSummary,
         ProjectSession, ProjectSummarySnapshot, PullNextResponse, RuntimeEvent, RuntimeMode,
         BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT,
         TASK_STALE_TIMEOUT_SECS,
     };
+    use crate::task_ops::{
+        detect_project_stack, mark_task_running_with_provider, sanitize_credential_hint,
+    };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
         Router,
-    };
-    use crate::task_ops::{
-        detect_project_stack, mark_task_running_with_provider, sanitize_credential_hint,
     };
     use platform_core::{
         new_activity, new_runtime_entry, AgentInvocationRequest, AgentResumeRequest, BoardSnapshot,
@@ -2700,6 +2689,366 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[test]
+    fn normalize_persisted_state_refreshes_execution_slot_heartbeat_from_latest_task_touch() {
+        let workspace_root = unique_temp_path("spotlight-slot-heartbeat");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let project_id = projects.first().unwrap().id;
+        let task_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let slot_id = Uuid::new_v4();
+        let workspace_path = workspace_root.to_string_lossy().into_owned();
+
+        let mut state = PersistedState {
+            users: users.clone(),
+            projects: projects.clone(),
+            tasks: vec![Task {
+                id: task_id,
+                project_id,
+                title: "slot-heartbeat".into(),
+                description: "heartbeat".into(),
+                status: TaskStatus::Paused,
+                priority: Some(TaskPriority::High),
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: None,
+                activities: vec![TaskActivity {
+                    kind: "task.watchdog_recovered".into(),
+                    message: "paused".into(),
+                    at: "50".into(),
+                }],
+                runtime: Some(TaskRuntime {
+                    provider: "codex".into(),
+                    thread_id: Some("thread-1".into()),
+                    active_turn_id: None,
+                    git_auto_merge_enabled: false,
+                    log: vec![RuntimeLogEntry {
+                        kind: "assistant".into(),
+                        message: "still alive".into(),
+                        at: "1000".into(),
+                    }],
+                    last_error: Some("slot heartbeat stale".into()),
+                }),
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }],
+            agents: default_agents(&users),
+            task_run_history: HashMap::from([(
+                task_id,
+                vec![platform_core::TaskRunRecord {
+                    id: run_id,
+                    task_id,
+                    run_number: 1,
+                    state: "executing".into(),
+                    provider: "codex".into(),
+                    started_by_agent_id: None,
+                    started_at: "10".into(),
+                    ended_at: None,
+                    retry_count: 0,
+                    primary_workspace_path: Some(workspace_path.clone()),
+                    execution_slot_id: Some(slot_id),
+                    session_threads: vec!["thread-1".into()],
+                    attempts: vec![platform_core::TaskRunAttemptRecord {
+                        id: Uuid::new_v4(),
+                        attempt_number: 1,
+                        trigger_kind: "resume".into(),
+                        status: "executing".into(),
+                        prompt: "continue".into(),
+                        started_at: "10".into(),
+                        ended_at: None,
+                        thread_id: Some("thread-1".into()),
+                        turn_id: None,
+                        error_summary: None,
+                    }],
+                    log: vec![new_runtime_entry("system", "resumed")],
+                    last_error: None,
+                }],
+            )]),
+            execution_slots: vec![platform_core::ExecutionSlotRecord {
+                id: slot_id,
+                project_id,
+                task_id,
+                task_run_id: Some(run_id),
+                assigned_agent_id: None,
+                workspace_lease_id: None,
+                lane_key: Some(workspace_path.to_ascii_lowercase()),
+                state: platform_core::ExecutionSlotState::Paused,
+                opened_at: "10".into(),
+                updated_at: "10".into(),
+                last_heartbeat_at: Some("10".into()),
+                released_at: None,
+                last_error: None,
+            }],
+            workspace_leases: Vec::new(),
+            coordination_write_intents: Vec::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        assert!(crate::normalize_persisted_state(&mut state));
+        let slot = state
+            .execution_slots
+            .first()
+            .expect("expected execution slot");
+        assert_eq!(slot.last_heartbeat_at.as_deref(), Some("1000"));
+        assert_eq!(slot.updated_at, "1000");
+        assert_eq!(slot.last_error.as_deref(), Some("slot heartbeat stale"));
+    }
+
+    #[test]
+    fn reconcile_watchdog_state_recovers_running_task_when_workspace_lease_is_missing() {
+        let workspace_root = unique_temp_path("spotlight-watchdog-missing-lease");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let mut agents = default_agents(&users);
+        let agent_id = agents.first().unwrap().id;
+        let project_id = projects.first().unwrap().id;
+        let task_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let slot_id = Uuid::new_v4();
+        let missing_lease_id = Uuid::new_v4();
+        agents.first_mut().unwrap().current_task_id = Some(task_id);
+
+        let mut state = BoardState {
+            users,
+            projects,
+            tasks: vec![Task {
+                id: task_id,
+                project_id,
+                title: "missing-lease".into(),
+                description: "missing lease".into(),
+                status: TaskStatus::Running,
+                priority: Some(TaskPriority::High),
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: Some(agent_id),
+                activities: vec![TaskActivity {
+                    kind: "task.started".into(),
+                    message: "running".into(),
+                    at: "100".into(),
+                }],
+                runtime: Some(TaskRuntime {
+                    provider: "codex".into(),
+                    thread_id: Some("thread-1".into()),
+                    active_turn_id: Some("turn-1".into()),
+                    git_auto_merge_enabled: false,
+                    log: vec![RuntimeLogEntry {
+                        kind: "assistant".into(),
+                        message: "running".into(),
+                        at: "100".into(),
+                    }],
+                    last_error: None,
+                }),
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }],
+            agents,
+            task_run_history: HashMap::from([(
+                task_id,
+                vec![platform_core::TaskRunRecord {
+                    id: run_id,
+                    task_id,
+                    run_number: 1,
+                    state: "executing".into(),
+                    provider: "codex".into(),
+                    started_by_agent_id: Some(agent_id),
+                    started_at: "100".into(),
+                    ended_at: None,
+                    retry_count: 0,
+                    primary_workspace_path: Some(workspace_root.to_string_lossy().into_owned()),
+                    execution_slot_id: Some(slot_id),
+                    session_threads: vec!["thread-1".into()],
+                    attempts: Vec::new(),
+                    log: Vec::new(),
+                    last_error: None,
+                }],
+            )]),
+            execution_slots: vec![platform_core::ExecutionSlotRecord {
+                id: slot_id,
+                project_id,
+                task_id,
+                task_run_id: Some(run_id),
+                assigned_agent_id: Some(agent_id),
+                workspace_lease_id: Some(missing_lease_id),
+                lane_key: Some("lane".into()),
+                state: platform_core::ExecutionSlotState::Running,
+                opened_at: "100".into(),
+                updated_at: "100".into(),
+                last_heartbeat_at: Some("100".into()),
+                released_at: None,
+                last_error: None,
+            }],
+            workspace_leases: Vec::new(),
+            coordination_write_intents: Vec::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        let sessions_to_stop =
+            reconcile_watchdog_state(&mut state, &HashSet::from([task_id]), 120_u128);
+
+        assert_eq!(sessions_to_stop, vec![task_id]);
+        let task = state.tasks.first().expect("expected task");
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert!(task
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.last_error.as_deref())
+            .is_some_and(|message| message.contains("workspace lease 记录缺失")));
+    }
+
+    #[test]
+    fn reconcile_watchdog_state_recovers_running_task_when_workspace_path_is_missing() {
+        let workspace_root = unique_temp_path("spotlight-watchdog-missing-workspace");
+        let missing_workspace = workspace_root.join("missing-worktree");
+        let users = default_users();
+        let projects = default_projects(&workspace_root);
+        let mut agents = default_agents(&users);
+        let agent_id = agents.first().unwrap().id;
+        let project_id = projects.first().unwrap().id;
+        let task_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let slot_id = Uuid::new_v4();
+        let lease_id = Uuid::new_v4();
+        agents.first_mut().unwrap().current_task_id = Some(task_id);
+
+        let mut state = BoardState {
+            users,
+            projects,
+            tasks: vec![Task {
+                id: task_id,
+                project_id,
+                title: "missing-workspace".into(),
+                description: "missing workspace".into(),
+                status: TaskStatus::Running,
+                priority: Some(TaskPriority::High),
+                labels: Vec::new(),
+                creator_user_id: None,
+                assignee_user_id: None,
+                assignment_mode: TaskAssignmentMode::PublicQueue,
+                requested_agent_id: None,
+                source_task_id: None,
+                claimed_by: Some(agent_id),
+                activities: vec![TaskActivity {
+                    kind: "task.started".into(),
+                    message: "running".into(),
+                    at: "100".into(),
+                }],
+                runtime: Some(TaskRuntime {
+                    provider: "codex".into(),
+                    thread_id: Some("thread-1".into()),
+                    active_turn_id: Some("turn-1".into()),
+                    git_auto_merge_enabled: false,
+                    log: vec![RuntimeLogEntry {
+                        kind: "assistant".into(),
+                        message: "running".into(),
+                        at: "100".into(),
+                    }],
+                    last_error: None,
+                }),
+                approval: Default::default(),
+                acceptance: Default::default(),
+                state_snapshot: TaskStateSnapshot::default(),
+            }],
+            agents,
+            task_run_history: HashMap::from([(
+                task_id,
+                vec![platform_core::TaskRunRecord {
+                    id: run_id,
+                    task_id,
+                    run_number: 1,
+                    state: "executing".into(),
+                    provider: "codex".into(),
+                    started_by_agent_id: Some(agent_id),
+                    started_at: "100".into(),
+                    ended_at: None,
+                    retry_count: 0,
+                    primary_workspace_path: Some(missing_workspace.to_string_lossy().into_owned()),
+                    execution_slot_id: Some(slot_id),
+                    session_threads: vec!["thread-1".into()],
+                    attempts: Vec::new(),
+                    log: Vec::new(),
+                    last_error: None,
+                }],
+            )]),
+            execution_slots: vec![platform_core::ExecutionSlotRecord {
+                id: slot_id,
+                project_id,
+                task_id,
+                task_run_id: Some(run_id),
+                assigned_agent_id: Some(agent_id),
+                workspace_lease_id: Some(lease_id),
+                lane_key: Some("lane".into()),
+                state: platform_core::ExecutionSlotState::Running,
+                opened_at: "100".into(),
+                updated_at: "100".into(),
+                last_heartbeat_at: Some("100".into()),
+                released_at: None,
+                last_error: None,
+            }],
+            workspace_leases: vec![platform_core::WorkspaceLeaseRecord {
+                id: lease_id,
+                project_id,
+                slot_id,
+                workspace_root_id: None,
+                workspace_path: missing_workspace.to_string_lossy().into_owned(),
+                lane_key: "lane".into(),
+                state: platform_core::WorkspaceLeaseState::Active,
+                acquired_at: "100".into(),
+                released_at: None,
+                release_reason: None,
+            }],
+            coordination_write_intents: Vec::new(),
+            pending_questions: Vec::new(),
+            project_scans: HashMap::new(),
+            project_sessions: Vec::new(),
+            project_chat_messages: Vec::new(),
+            memory_items: Vec::new(),
+            memory_revisions: Vec::new(),
+            memory_tags: Vec::new(),
+            memory_edges: Vec::new(),
+            decisions: Vec::new(),
+        };
+
+        let sessions_to_stop =
+            reconcile_watchdog_state(&mut state, &HashSet::from([task_id]), 120_u128);
+
+        assert_eq!(sessions_to_stop, vec![task_id]);
+        let task = state.tasks.first().expect("expected task");
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert!(task
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.last_error.as_deref())
+            .is_some_and(|message| message.contains("workspace 路径不存在")));
+    }
+
+    #[test]
     fn normalize_persisted_state_backfills_priority_and_repairs_reverted_open_tasks() {
         let workspace_root = unique_temp_path("spotlight-normalize");
         let users = default_users();
@@ -3099,7 +3448,11 @@ process.stdin.on('data', (chunk) => {
         let auto_started_task = guard
             .tasks
             .iter()
-            .find(|task| task.activities.iter().any(|item| item.kind == "task.auto_started"))
+            .find(|task| {
+                task.activities
+                    .iter()
+                    .any(|item| item.kind == "task.auto_started")
+            })
             .expect("expected one auto started task");
         let latest_run = guard
             .task_run_history
@@ -3153,7 +3506,10 @@ process.stdin.on('data', (chunk) => {
                 requested_agent_id: None,
                 source_task_id: None,
                 claimed_by: None,
-                activities: vec![new_activity("task.watchdog_recovered", "watchdog recovered")],
+                activities: vec![new_activity(
+                    "task.watchdog_recovered",
+                    "watchdog recovered",
+                )],
                 runtime: Some(TaskRuntime {
                     provider: "codex".into(),
                     thread_id: Some("resumable-thread".into()),
@@ -3196,6 +3552,45 @@ process.stdin.on('data', (chunk) => {
                 .map(|attempt| attempt.trigger_kind.as_str()),
             Some("auto_resume")
         );
+    }
+
+    #[test]
+    fn select_next_auto_resume_task_skips_workspace_missing_recovery_tasks() {
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            title: "missing-workspace".into(),
+            description: "test".into(),
+            status: TaskStatus::Paused,
+            priority: Some(TaskPriority::High),
+            labels: Vec::new(),
+            creator_user_id: None,
+            assignee_user_id: None,
+            assignment_mode: TaskAssignmentMode::PublicQueue,
+            requested_agent_id: None,
+            source_task_id: None,
+            claimed_by: None,
+            activities: vec![new_activity(
+                "task.watchdog_recovered",
+                "workspace 丢失后已回收",
+            )],
+            runtime: Some(TaskRuntime {
+                provider: "codex".into(),
+                thread_id: Some("thread-1".into()),
+                active_turn_id: None,
+                git_auto_merge_enabled: false,
+                log: Vec::new(),
+                last_error: Some(
+                    "workspace 路径不存在，无法恢复 execution slot：C:/missing".into(),
+                ),
+            }),
+            approval: Default::default(),
+            acceptance: Default::default(),
+            state_snapshot: TaskStateSnapshot::default(),
+        };
+
+        let next = select_next_auto_resume_task_id(&[task], None);
+        assert_eq!(next, None);
     }
 
     #[tokio::test]

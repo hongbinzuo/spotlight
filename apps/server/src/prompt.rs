@@ -822,7 +822,7 @@ pub(crate) fn compose_task_reassess_prompt(
     project_constraints: &[String],
     recent_chat: &[ProjectChatMessage],
 ) -> String {
-        let status_label = crate::state::task_status_label(task.status);
+    let status_label = crate::state::task_status_label(task.status);
 
     let recent_activities = recent_task_activity_lines(task, 12);
     let activity_section = prompt_section_or_default(recent_activities, "没有任务活动记录。");
@@ -854,7 +854,7 @@ pub(crate) fn compose_task_reassess_prompt(
         if sibling.id == task.id {
             continue;
         }
-            let sib_status = crate::state::task_status_label(sibling.status);
+        let sib_status = crate::state::task_status_label(sibling.status);
         let sib_summary = sibling.state_snapshot.reason.as_deref().unwrap_or("");
         let overlap_hint = if titles_overlap(&task.title, &sibling.title) {
             " [标题相近，可能重叠]"

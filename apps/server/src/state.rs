@@ -7,12 +7,10 @@ use std::{
 
 use platform_core::{
     infer_task_priority, merge_unique_tasks, new_activity, new_runtime_entry,
-    seed_tasks_from_agents_markdown,
-    seed_tasks_from_docs, Agent, CoordinationConflictPolicy, CoordinationIntentStatus,
-    CoordinationWriteIntent, ExecutionSlotRecord, ExecutionSlotState, Project, Task,
-    TaskPriority, TaskRunAttemptRecord, TaskRunRecord, TaskStateSnapshot, TaskStatus, User,
-    WorkspaceLeaseRecord,
-    WorkspaceLeaseState, WorkspaceRoot,
+    seed_tasks_from_agents_markdown, seed_tasks_from_docs, Agent, CoordinationConflictPolicy,
+    CoordinationIntentStatus, CoordinationWriteIntent, ExecutionSlotRecord, ExecutionSlotState,
+    Project, Task, TaskPriority, TaskRunAttemptRecord, TaskRunRecord, TaskStateSnapshot,
+    TaskStatus, User, WorkspaceLeaseRecord, WorkspaceLeaseState, WorkspaceRoot,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -30,6 +28,16 @@ pub(crate) fn current_time_nanos() -> u128 {
 
 pub(crate) fn stale_timeout_nanos() -> u128 {
     current_time_nanos() + 300_000_000_000 - current_time_nanos()
+}
+
+fn latest_timestamp_string<I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    candidates
+        .into_iter()
+        .flatten()
+        .max_by_key(|value| value.parse::<u128>().unwrap_or_default())
 }
 
 pub(crate) fn task_last_touch_nanos(task: &Task) -> Option<u128> {
@@ -146,8 +154,14 @@ fn evaluate_task_state_snapshot(task: &Task, evaluator: &str) -> TaskStateSnapsh
                 "任务正在由 Agent 执行。".to_string()
             }
         }
-        TaskStatus::Paused => match task.activities.last().map(|activity| activity.kind.as_str()) {
-            Some("task.runtime_session_lost") => "本地运行会话已断开，任务处于可恢复状态。".to_string(),
+        TaskStatus::Paused => match task
+            .activities
+            .last()
+            .map(|activity| activity.kind.as_str())
+        {
+            Some("task.runtime_session_lost") => {
+                "本地运行会话已断开，任务处于可恢复状态。".to_string()
+            }
             Some("task.watchdog_recovered") => {
                 "系统检测到任务长时间无进展，已自动暂停等待恢复。".to_string()
             }
@@ -594,7 +608,11 @@ fn should_recover_open_task_as_paused(task: &Task) -> bool {
 
 fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
     let mut changed = false;
-    let task_ids = state.tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
+    let task_ids = state
+        .tasks
+        .iter()
+        .map(|task| task.id)
+        .collect::<HashSet<_>>();
 
     let slot_count_before = state.execution_slots.len();
     state
@@ -660,26 +678,42 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
             continue;
         };
         let desired_slot_state = execution_slot_state_for_task_status(task.status);
+        let task_last_touch_at = task_last_touch_nanos(&task).map(|value| value.to_string());
+        let slot_last_error = task
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.last_error.clone())
+            .or(run_last_error.clone());
         let lane_key =
             coordination_lane_key_for_task(&projects, &task, preferred_workspace_path.as_deref());
-        let workspace_path =
-            coordination_workspace_path_for_task(&projects, &task, preferred_workspace_path.as_deref());
-        let workspace_root_id = workspace_path.as_deref().and_then(|path| {
-            coordination_workspace_root_id_for_task(&projects, &task, path)
-        });
+        let workspace_path = coordination_workspace_path_for_task(
+            &projects,
+            &task,
+            preferred_workspace_path.as_deref(),
+        );
+        let workspace_root_id = workspace_path
+            .as_deref()
+            .and_then(|path| coordination_workspace_root_id_for_task(&projects, &task, path));
 
         let slot_index = run_execution_slot_id
             .and_then(|slot_id| {
-                state.execution_slots.iter().position(|slot| {
-                    slot.id == slot_id && slot.task_id == task.id
-                })
+                state
+                    .execution_slots
+                    .iter()
+                    .position(|slot| slot.id == slot_id && slot.task_id == task.id)
             })
             .or_else(|| {
-                state.execution_slots.iter().rposition(|slot| {
-                    slot.task_id == task.id && slot.task_run_id == Some(run_id)
-                })
+                state
+                    .execution_slots
+                    .iter()
+                    .rposition(|slot| slot.task_id == task.id && slot.task_run_id == Some(run_id))
             })
-            .or_else(|| state.execution_slots.iter().rposition(|slot| slot.task_id == task.id));
+            .or_else(|| {
+                state
+                    .execution_slots
+                    .iter()
+                    .rposition(|slot| slot.task_id == task.id)
+            });
 
         let (slot_id, slot_index) = if let Some(slot_index) = slot_index {
             (state.execution_slots[slot_index].id, slot_index)
@@ -695,26 +729,39 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 lane_key: Some(lane_key.clone()),
                 state: desired_slot_state,
                 opened_at: run_started_at.clone(),
-                updated_at: run_ended_at
-                    .clone()
-                    .unwrap_or_else(|| run_started_at.clone()),
+                updated_at: latest_timestamp_string([
+                    task_last_touch_at.clone(),
+                    run_ended_at.clone(),
+                    Some(run_started_at.clone()),
+                ])
+                .unwrap_or_else(|| run_started_at.clone()),
                 last_heartbeat_at: (!matches!(
                     desired_slot_state,
                     ExecutionSlotState::Released | ExecutionSlotState::Failed
                 ))
-                .then(|| run_ended_at.clone().unwrap_or_else(|| run_started_at.clone())),
+                .then(|| {
+                    latest_timestamp_string([
+                        task_last_touch_at.clone(),
+                        run_ended_at.clone(),
+                        Some(run_started_at.clone()),
+                    ])
+                    .unwrap_or_else(|| run_started_at.clone())
+                }),
                 released_at: matches!(
                     desired_slot_state,
                     ExecutionSlotState::Released | ExecutionSlotState::Failed
                 )
                 .then(|| {
-                    run_ended_at
-                        .clone()
-                        .unwrap_or_else(|| run_started_at.clone())
+                    latest_timestamp_string([
+                        task_last_touch_at.clone(),
+                        run_ended_at.clone(),
+                        Some(run_started_at.clone()),
+                    ])
+                    .unwrap_or_else(|| run_started_at.clone())
                 }),
                 last_error: match desired_slot_state {
                     ExecutionSlotState::Released => None,
-                    _ => run_last_error.clone(),
+                    _ => slot_last_error.clone(),
                 },
             });
             append_coordination_backfill_intent(
@@ -760,9 +807,12 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 slot.opened_at = run_started_at.clone();
                 changed = true;
             }
-            let updated_at = run_ended_at
-                .clone()
-                .unwrap_or_else(|| run_started_at.clone());
+            let updated_at = latest_timestamp_string([
+                task_last_touch_at.clone(),
+                run_ended_at.clone(),
+                Some(run_started_at.clone()),
+            ])
+            .unwrap_or_else(|| run_started_at.clone());
             if slot.updated_at != updated_at {
                 slot.updated_at = updated_at.clone();
                 changed = true;
@@ -771,7 +821,10 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 desired_slot_state,
                 ExecutionSlotState::Released | ExecutionSlotState::Failed
             ))
-            .then(|| updated_at.clone());
+            .then(|| {
+                latest_timestamp_string([task_last_touch_at.clone(), Some(updated_at.clone())])
+                    .unwrap_or_else(|| updated_at.clone())
+            });
             if slot.last_heartbeat_at != desired_heartbeat {
                 slot.last_heartbeat_at = desired_heartbeat;
                 changed = true;
@@ -780,14 +833,21 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 desired_slot_state,
                 ExecutionSlotState::Released | ExecutionSlotState::Failed
             )
-            .then(|| updated_at);
+            .then(|| {
+                latest_timestamp_string([
+                    task_last_touch_at.clone(),
+                    run_ended_at.clone(),
+                    Some(updated_at.clone()),
+                ])
+                .unwrap_or(updated_at.clone())
+            });
             if slot.released_at != desired_released_at {
                 slot.released_at = desired_released_at;
                 changed = true;
             }
             let desired_last_error = match desired_slot_state {
                 ExecutionSlotState::Released => None,
-                _ => run_last_error.clone(),
+                _ => slot_last_error.clone(),
             };
             if slot.last_error != desired_last_error {
                 slot.last_error = desired_last_error;
@@ -811,7 +871,12 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
 
         let existing_lease_id = state.execution_slots[slot_index].workspace_lease_id;
         let lease_index = existing_lease_id
-            .and_then(|lease_id| state.workspace_leases.iter().position(|lease| lease.id == lease_id))
+            .and_then(|lease_id| {
+                state
+                    .workspace_leases
+                    .iter()
+                    .position(|lease| lease.id == lease_id)
+            })
             .or_else(|| {
                 state
                     .workspace_leases
@@ -820,7 +885,9 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
             });
 
         let desired_lease_state = match desired_slot_state {
-            ExecutionSlotState::Released | ExecutionSlotState::Failed => WorkspaceLeaseState::Released,
+            ExecutionSlotState::Released | ExecutionSlotState::Failed => {
+                WorkspaceLeaseState::Released
+            }
             _ => WorkspaceLeaseState::Active,
         };
 
@@ -856,13 +923,17 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 changed = true;
             }
             let desired_released_at = matches!(desired_lease_state, WorkspaceLeaseState::Released)
-                .then(|| run_ended_at.clone().unwrap_or_else(|| run_started_at.clone()));
+                .then(|| {
+                    run_ended_at
+                        .clone()
+                        .unwrap_or_else(|| run_started_at.clone())
+                });
             if lease.released_at != desired_released_at {
                 lease.released_at = desired_released_at;
                 changed = true;
             }
             let desired_release_reason = match desired_lease_state {
-                WorkspaceLeaseState::Released => run_last_error
+                WorkspaceLeaseState::Released => slot_last_error
                     .clone()
                     .or_else(|| Some("task run 已进入终态".into())),
                 _ => None,
@@ -883,10 +954,15 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
                 lane_key: lane_key.clone(),
                 state: desired_lease_state,
                 acquired_at: run_started_at.clone(),
-                released_at: matches!(desired_lease_state, WorkspaceLeaseState::Released)
-                    .then(|| run_ended_at.clone().unwrap_or_else(|| run_started_at.clone())),
+                released_at: matches!(desired_lease_state, WorkspaceLeaseState::Released).then(
+                    || {
+                        run_ended_at
+                            .clone()
+                            .unwrap_or_else(|| run_started_at.clone())
+                    },
+                ),
                 release_reason: match desired_lease_state {
-                    WorkspaceLeaseState::Released => run_last_error
+                    WorkspaceLeaseState::Released => slot_last_error
                         .clone()
                         .or_else(|| Some("task run 已进入终态".into())),
                     _ => None,
@@ -909,7 +985,6 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
             state.execution_slots[slot_index].workspace_lease_id = Some(lease_id);
             changed = true;
         }
-
     }
 
     let valid_slot_ids = state
@@ -918,10 +993,12 @@ fn normalize_execution_coordination_state(state: &mut PersistedState) -> bool {
         .map(|slot| slot.id)
         .collect::<HashSet<_>>();
     for slot in &mut state.execution_slots {
-        if slot
-            .workspace_lease_id
-            .is_some_and(|lease_id| !state.workspace_leases.iter().any(|lease| lease.id == lease_id))
-        {
+        if slot.workspace_lease_id.is_some_and(|lease_id| {
+            !state
+                .workspace_leases
+                .iter()
+                .any(|lease| lease.id == lease_id)
+        }) {
             slot.workspace_lease_id = None;
             changed = true;
         }
@@ -952,7 +1029,11 @@ fn normalize_task_run_entry_for_task(task: &Task, run: &mut TaskRunRecord) -> bo
         .as_ref()
         .and_then(|runtime| runtime.thread_id.as_deref())
     {
-        if !run.session_threads.iter().any(|existing| existing == thread_id) {
+        if !run
+            .session_threads
+            .iter()
+            .any(|existing| existing == thread_id)
+        {
             run.session_threads.push(thread_id.to_string());
             changed = true;
         }
@@ -976,12 +1057,18 @@ fn normalize_task_run_entry_for_task(task: &Task, run: &mut TaskRunRecord) -> bo
             prompt: task.description.clone(),
             started_at: run.started_at.clone(),
             ended_at: run.ended_at.clone(),
-            thread_id: task.runtime.as_ref().and_then(|runtime| runtime.thread_id.clone()),
+            thread_id: task
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.thread_id.clone()),
             turn_id: task
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.active_turn_id.clone()),
-            error_summary: task.runtime.as_ref().and_then(|runtime| runtime.last_error.clone()),
+            error_summary: task
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.last_error.clone()),
         });
         changed = true;
     } else if let Some(attempt) = run.attempts.last_mut() {
@@ -1004,7 +1091,10 @@ fn normalize_task_run_entry_for_task(task: &Task, run: &mut TaskRunRecord) -> bo
             }
         }
         if task_run_is_terminal(expected_state) && attempt.ended_at.is_none() {
-            attempt.ended_at = run.ended_at.clone().or_else(|| Some(timestamp_string_for_state()));
+            attempt.ended_at = run
+                .ended_at
+                .clone()
+                .or_else(|| Some(timestamp_string_for_state()));
             changed = true;
         }
     }

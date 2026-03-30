@@ -222,11 +222,10 @@ pub(crate) fn claim_task_for_agent(
     task_id: Uuid,
     agent_id: Uuid,
 ) -> AppResult<()> {
-    if let Some(conflict) = active_task_conflict(&state.projects, &state.tasks, task_id, Some(task_id)) {
-        return Err((
-            StatusCode::CONFLICT,
-            active_task_conflict_message(conflict),
-        ));
+    if let Some(conflict) =
+        active_task_conflict(&state.projects, &state.tasks, task_id, Some(task_id))
+    {
+        return Err((StatusCode::CONFLICT, active_task_conflict_message(conflict)));
     }
 
     let (agent_name, owner_user_id) = state
@@ -863,9 +862,7 @@ pub(crate) fn select_next_auto_claim_task_index(
         .enumerate()
         .filter(|(_, task)| matches!(task.status, TaskStatus::Open) && task.claimed_by.is_none())
         .filter(|(_, task)| task_is_claimable_by_agent(task, agent_id, owner_user_id))
-        .filter(|(_, task)| {
-            active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none()
-        })
+        .filter(|(_, task)| active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none())
         .min_by_key(|(index, task)| {
             (
                 task_assignment_order(task, owner_user_id),

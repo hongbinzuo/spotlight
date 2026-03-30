@@ -1,7 +1,10 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use axum::http::StatusCode;
-use platform_core::{new_activity, new_runtime_entry, Task, TaskRuntime, TaskStatus};
+use platform_core::{
+    new_activity, new_runtime_entry, ExecutionSlotRecord, ExecutionSlotState, Task, TaskRuntime,
+    TaskStatus, WorkspaceLeaseRecord, WorkspaceLeaseState,
+};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -485,13 +488,26 @@ pub(crate) fn reconcile_watchdog_state(
     now_nanos: u128,
 ) -> Vec<Uuid> {
     let mut sessions_to_stop = Vec::new();
+    let recovered_tasks = state
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let has_session = active_runtime_task_ids.contains(&task.id);
+            stale_task_recovery_reason(state, task, has_session, now_nanos)
+                .map(|reason| (task.id, reason, has_session))
+        })
+        .collect::<Vec<_>>();
 
-    for task in &mut state.tasks {
-        let has_session = active_runtime_task_ids.contains(&task.id);
-        let Some(reason) = stale_task_recovery_reason(task, has_session, now_nanos) else {
-            continue;
-        };
+    for (task_id, reason, _has_session) in recovered_tasks {
+        if let Some(slot_index) = latest_execution_slot_index_for_task(state, task_id) {
+            let slot = &mut state.execution_slots[slot_index];
+            slot.state = ExecutionSlotState::Paused;
+            slot.updated_at = now_nanos.to_string();
+            slot.last_heartbeat_at = Some(now_nanos.to_string());
+            slot.last_error = Some(reason.clone());
+        }
 
+        let task = find_task_mut(state, task_id).expect("recovered task should exist");
         if let Some(runtime) = task.runtime.as_mut() {
             runtime.active_turn_id = None;
             runtime.last_error = Some(reason.clone());
@@ -503,15 +519,11 @@ pub(crate) fn reconcile_watchdog_state(
 
         task.status = TaskStatus::Paused;
         task.claimed_by = None;
-
         task.activities.push(new_activity(
             "task.watchdog_recovered",
             format!("系统检测到任务长时间无进展，已自动回收：{reason}"),
         ));
-
-        if has_session {
-            sessions_to_stop.push(task.id);
-        }
+        sessions_to_stop.push(task_id);
     }
 
     for agent in &mut state.agents {
@@ -548,7 +560,7 @@ pub(crate) fn reconcile_parallel_active_tasks(state: &mut BoardState) -> Vec<Uui
         .iter()
         .filter(|task| task_is_serialized_active(task))
     {
-            let lane_key = task_serialization_lane_key(&state.projects, task);
+        let lane_key = task_serialization_lane_key(&state.projects, task);
         active_task_groups
             .entry(lane_key)
             .or_default()
@@ -648,12 +660,51 @@ fn active_task_keep_order(task: &Task, index: usize) -> (u8, u8, u128, u128, usi
     )
 }
 
-fn stale_task_recovery_reason(task: &Task, has_session: bool, now_nanos: u128) -> Option<String> {
+fn stale_task_recovery_reason(
+    state: &BoardState,
+    task: &Task,
+    has_session: bool,
+    now_nanos: u128,
+) -> Option<String> {
     match task.status {
         TaskStatus::Running => {
             let runtime = task.runtime.as_ref()?;
             if runtime.active_turn_id.is_none() {
                 return Some("运行中任务缺少活动 turn".into());
+            }
+            let slot = latest_execution_slot_for_task(state, task.id);
+            if slot.is_none() {
+                return Some("运行中任务缺少 execution slot".into());
+            }
+            let slot = slot.expect("slot checked above");
+            let lease = latest_workspace_lease_for_slot(state, slot);
+            if slot.workspace_lease_id.is_none() && lease.is_none() {
+                return Some("execution slot 缺少 workspace lease".into());
+            }
+            if slot_heartbeat_timed_out(slot, now_nanos) {
+                return Some(format!(
+                    "execution slot heartbeat 超时，超过 {} 秒未刷新",
+                    TASK_STALE_TIMEOUT_SECS
+                ));
+            }
+            if lease.is_none() {
+                return Some("workspace lease 记录缺失".into());
+            }
+            let lease = lease.expect("lease checked above");
+            if matches!(
+                lease.state,
+                WorkspaceLeaseState::Released | WorkspaceLeaseState::Expired
+            ) {
+                return Some(format!("workspace lease 已失效：{}", lease.state.as_str()));
+            }
+            if lease.workspace_path.trim().is_empty() {
+                return Some("workspace lease 缺少工作目录".into());
+            }
+            if !Path::new(&lease.workspace_path).exists() {
+                return Some(format!(
+                    "workspace 路径不存在，无法恢复 execution slot：{}",
+                    lease.workspace_path
+                ));
             }
             if !has_session {
                 return Some("本地运行会话已丢失，无法继续流式执行".into());
@@ -736,6 +787,75 @@ fn is_non_resumable_thread_error(message: &str) -> bool {
     normalized.contains("thread not found")
         || normalized.contains("no rollout found")
         || normalized.contains("rollout not found")
+        || normalized.contains("workspace lease")
+        || normalized.contains("workspace 路径不存在")
+        || normalized.contains("workspace missing")
+}
+
+fn latest_execution_slot_index_for_task(state: &BoardState, task_id: Uuid) -> Option<usize> {
+    state
+        .task_run_history
+        .get(&task_id)
+        .and_then(|runs| runs.last())
+        .and_then(|run| run.execution_slot_id)
+        .and_then(|slot_id| {
+            state
+                .execution_slots
+                .iter()
+                .position(|slot| slot.id == slot_id && slot.task_id == task_id)
+        })
+        .or_else(|| {
+            state
+                .execution_slots
+                .iter()
+                .rposition(|slot| slot.task_id == task_id)
+        })
+}
+
+fn latest_execution_slot_for_task<'a>(
+    state: &'a BoardState,
+    task_id: Uuid,
+) -> Option<&'a ExecutionSlotRecord> {
+    latest_execution_slot_index_for_task(state, task_id)
+        .and_then(|index| state.execution_slots.get(index))
+}
+
+fn latest_workspace_lease_for_slot<'a>(
+    state: &'a BoardState,
+    slot: &ExecutionSlotRecord,
+) -> Option<&'a WorkspaceLeaseRecord> {
+    slot.workspace_lease_id
+        .and_then(|lease_id| {
+            state
+                .workspace_leases
+                .iter()
+                .find(|lease| lease.id == lease_id)
+        })
+        .or_else(|| {
+            state
+                .workspace_leases
+                .iter()
+                .rfind(|lease| lease.slot_id == slot.id)
+        })
+}
+
+fn slot_heartbeat_timed_out(slot: &ExecutionSlotRecord, now_nanos: u128) -> bool {
+    if matches!(
+        slot.state,
+        ExecutionSlotState::Released | ExecutionSlotState::Failed
+    ) {
+        return false;
+    }
+
+    let Some(last_heartbeat) = slot
+        .last_heartbeat_at
+        .as_deref()
+        .and_then(|value| value.parse::<u128>().ok())
+    else {
+        return false;
+    };
+
+    now_nanos.saturating_sub(last_heartbeat) > stale_timeout_nanos()
 }
 
 pub(crate) async fn auto_start_task(
@@ -1014,10 +1134,10 @@ async fn auto_resume_task(
                 runtime.last_error = None;
                 runtime.log.push(new_runtime_entry("user", prompt.clone()));
                 let task_title = task.title.clone();
-            record_task_run_start(
-                &mut guard,
-                task_id,
-                agent_id,
+                record_task_run_start(
+                    &mut guard,
+                    task_id,
+                    agent_id,
                     &run_provider_id,
                     &prompt,
                     Some(workspace_root.display().to_string()),

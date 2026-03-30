@@ -614,10 +614,7 @@ pub(crate) fn timestamp_compact() -> String {
 // encoding pollution. Production auto-claim behavior is owned by task_ops.rs.
 // Do not reconnect new selection rules to this block.
 #[allow(dead_code)]
-fn legacy_auto_claim_next_task(
-    state: &mut BoardState,
-    agent_id: Uuid,
-) -> AppResult<Option<Task>> {
+fn legacy_auto_claim_next_task(state: &mut BoardState, agent_id: Uuid) -> AppResult<Option<Task>> {
     let (agent_name, owner_user_id, auto_mode_enabled, agent_busy) = state
         .agents
         .iter()
@@ -684,8 +681,7 @@ fn legacy_select_next_auto_claim_task_index(
             task.assignee_user_id.is_none() || task.assignee_user_id == owner_user_id
         })
         .filter(|(_, task)| {
-            crate::task_ops::active_task_conflict(projects, tasks, task.id, Some(task.id))
-                .is_none()
+            crate::task_ops::active_task_conflict(projects, tasks, task.id, Some(task.id)).is_none()
         })
         .min_by_key(|(index, task)| {
             (
