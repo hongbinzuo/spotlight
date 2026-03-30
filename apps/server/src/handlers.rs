@@ -28,8 +28,8 @@ use crate::prompt;
 use crate::runtime::{CodexRuntimeSession, RuntimeEvent};
 use crate::snapshot::*;
 use crate::state::{
-    persist_state, seed_tasks_from_agents_file, task_has_completion_evidence,
-    task_has_progress_evidence,
+    persist_state, record_task_run_start, record_task_run_transition, seed_tasks_from_agents_file,
+    task_has_completion_evidence, task_has_progress_evidence,
 };
 use crate::task_ops::*;
 use crate::{AppResult, AppState, BoardState};
@@ -1081,13 +1081,14 @@ pub(crate) async fn start_task(
         }
     }
 
-    let context =
+    let mut context =
         prompt::resolve_task_execution_context(&state, task_id, request.prompt.clone()).await?;
     let _ = std::fs::create_dir_all(&context.workspace_root);
     let mut git_auto_merge_enabled = false;
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
         let git_prepare =
             git_ops::prepare_git_task_branch_in_repo(&context.workspace_root, task_id).await?;
+        context.workspace_root = git_prepare.workspace_root.clone();
         git_auto_merge_enabled = git_prepare.auto_merge_enabled;
         for (kind, message) in git_prepare.activities {
             record_task_activity(&state, task_id, kind, message).await;
@@ -1108,6 +1109,17 @@ pub(crate) async fn start_task(
                 Some("stub-turn".into()),
                 false,
             )?;
+            record_task_run_start(
+                &mut guard,
+                task_id,
+                agent_id,
+                "stub-codex",
+                &context.prompt,
+                Some(context.workspace_root.display().to_string()),
+                Some("stub-thread".into()),
+                Some("stub-turn".into()),
+                "manual_start",
+            );
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
             persist_state(&state).await?;
@@ -1128,6 +1140,8 @@ pub(crate) async fn start_task(
                 .await?;
             {
                 let mut guard = state.inner.lock().await;
+                let run_thread_id = thread_id.clone();
+                let run_turn_id = turn_id.clone();
                 mark_task_running(
                     &mut guard,
                     task_id,
@@ -1138,6 +1152,17 @@ pub(crate) async fn start_task(
                     Some(turn_id),
                     git_auto_merge_enabled,
                 )?;
+                record_task_run_start(
+                    &mut guard,
+                    task_id,
+                    agent_id,
+                    "codex",
+                    &context.prompt,
+                    Some(context.workspace_root.display().to_string()),
+                    Some(run_thread_id),
+                    Some(run_turn_id),
+                    "manual_start",
+                );
             }
             state.runtime_sessions.lock().await.insert(task_id, session);
             tokio::spawn(runtime_event_loop(
@@ -1174,6 +1199,14 @@ pub(crate) async fn pause_task(
                         .push(new_runtime_entry("system", "已暂停当前任务"));
                 }
             }
+            record_task_run_transition(
+                &mut guard,
+                task_id,
+                "interrupted",
+                Some("任务已暂停，等待补充提示词"),
+                Some("stub-thread"),
+                Some("stub-turn"),
+            );
             reset_agent_if_needed(&mut guard, task_id, "任务已暂停，等待恢复");
             let snapshot = snapshot_from_state(&guard);
             drop(guard);
@@ -1211,6 +1244,14 @@ pub(crate) async fn pause_task(
                     .push(new_runtime_entry("system", "已暂停当前任务"));
             }
         }
+        record_task_run_transition(
+            &mut guard,
+            task_id,
+            "interrupted",
+            Some("任务已暂停，等待补充提示词"),
+            Some(&thread_id),
+            Some(&turn_id),
+        );
         reset_agent_if_needed(&mut guard, task_id, "任务已暂停，等待恢复");
         snapshot_from_state(&guard)
     };
@@ -1254,7 +1295,9 @@ pub(crate) async fn cancel_task(
 
         task.status = TaskStatus::Canceled;
         task.claimed_by = None;
+        let mut thread_id = None;
         if let Some(runtime) = task.runtime.as_mut() {
+            thread_id = runtime.thread_id.clone();
             runtime.active_turn_id = None;
             runtime
                 .log
@@ -1264,6 +1307,14 @@ pub(crate) async fn cancel_task(
             "task.canceled",
             format!("任务已撤销。操作人: {current_user_label}；原因: {reason}"),
         ));
+        record_task_run_transition(
+            &mut guard,
+            task_id,
+            "aborted",
+            Some(reason),
+            thread_id.as_deref(),
+            None,
+        );
         reset_agent_if_needed(&mut guard, task_id, "最近一次任务已撤销");
     }
 
@@ -1279,6 +1330,8 @@ pub(crate) async fn resume_task(
     State(state): State<AppState>,
     Json(request): Json<AgentResumeRequest>,
 ) -> AppResult<Json<BoardSnapshot>> {
+    let workspace_root = resolve_workspace_for_task(&state, task_id).await?;
+
     if request.prompt.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "恢复时必须补充提示词".into()));
     }
@@ -1323,6 +1376,25 @@ pub(crate) async fn resume_task(
                     .push(new_runtime_entry("assistant", "Stub 会话已完成任务"));
                 runtime.active_turn_id = None;
             }
+            record_task_run_start(
+                &mut guard,
+                task_id,
+                agent_id,
+                "stub-codex",
+                request.prompt.trim(),
+                Some(workspace_root.display().to_string()),
+                Some("stub-thread".into()),
+                Some("stub-turn-auto-resume".into()),
+                "manual_resume",
+            );
+            record_task_run_transition(
+                &mut guard,
+                task_id,
+                "completed",
+                Some("Stub 会话已完成任务"),
+                Some("stub-thread"),
+                Some("stub-turn-auto-resume"),
+            );
             process_task_completion_outputs(&mut guard, task_id);
             reset_agent_if_needed(&mut guard, task_id, "最近一次任务已完成");
             let snapshot = snapshot_from_state(&guard);
@@ -1333,7 +1405,6 @@ pub(crate) async fn resume_task(
         RuntimeMode::RealCodex => {}
     }
 
-    let workspace_root = resolve_workspace_for_task(&state, task_id).await?;
     let thread_id = {
         let guard = state.inner.lock().await;
         let task = find_task(&guard, task_id)?;
@@ -1390,10 +1461,21 @@ pub(crate) async fn resume_task(
                 runtime
                     .log
                     .push(new_runtime_entry("user", request.prompt.trim().to_string()));
-                runtime.thread_id = Some(resolved_session.thread_id);
-                runtime.active_turn_id = Some(turn_id);
+                runtime.thread_id = Some(resolved_session.thread_id.clone());
+                runtime.active_turn_id = Some(turn_id.clone());
             }
         }
+        record_task_run_start(
+            &mut guard,
+            task_id,
+            agent_id,
+            resolved_session.session.provider_id(),
+            request.prompt.trim(),
+            Some(workspace_root.display().to_string()),
+            Some(resolved_session.thread_id.clone()),
+            Some(turn_id.clone()),
+            "manual_resume",
+        );
         assign_agent_running(&mut guard, agent_id, task_id, "继续执行当前任务".into());
         snapshot_from_state(&guard)
     };
@@ -1632,6 +1714,36 @@ pub(crate) async fn runtime_event_loop(
 
         if let Some(action) = reset_action {
             reset_agent_if_needed(&mut guard, task_id, action);
+            let task = &guard.tasks[task_index];
+            let (run_state, detail) = match task.status {
+                TaskStatus::Done => ("completed", Some("runtime event completed")),
+                TaskStatus::Paused => ("interrupted", Some("runtime event interrupted")),
+                TaskStatus::Failed => (
+                    "failed",
+                    task.runtime.as_ref().and_then(|runtime| {
+                        runtime
+                            .last_error
+                            .as_deref()
+                            .or(Some("runtime event failed"))
+                    }),
+                ),
+                _ => ("executing", None),
+            };
+            if run_state != "executing" {
+                let thread_id = task
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.thread_id.clone());
+                let detail = detail.map(str::to_string);
+                record_task_run_transition(
+                    &mut guard,
+                    task_id,
+                    run_state,
+                    detail.as_deref(),
+                    thread_id.as_deref(),
+                    None,
+                );
+            }
         }
 
         if should_process_completion_outputs {
@@ -1644,20 +1756,27 @@ pub(crate) async fn runtime_event_loop(
             }
         }
 
-        let workspace_root = if should_finalize_git_merge {
+        let merge_workspaces = if should_finalize_git_merge {
             let project_id = guard.tasks[task_index].project_id;
-            find_project(&guard, project_id)
-                .ok()
-                .and_then(|project| primary_workspace_path(project).ok())
+            find_project(&guard, project_id).ok().and_then(|project| {
+                let primary_workspace_root = primary_workspace_path(project).ok()?;
+                let execution_workspace_root = task_execution_workspace_path(&guard, task_id)
+                    .unwrap_or_else(|| primary_workspace_root.clone());
+                Some((primary_workspace_root, execution_workspace_root))
+            })
         } else {
             None
         };
 
         drop(guard);
 
-        if let Some(workspace_root) = workspace_root {
-            let merge_activities =
-                git_ops::finalize_git_task_branch_in_repo(&workspace_root, task_id).await;
+        if let Some((primary_workspace_root, execution_workspace_root)) = merge_workspaces {
+            let merge_activities = git_ops::finalize_git_task_branch_in_repo(
+                &primary_workspace_root,
+                &execution_workspace_root,
+                task_id,
+            )
+            .await;
             for (kind, message) in merge_activities {
                 record_task_activity(&state, task_id, kind, message).await;
             }
@@ -1688,15 +1807,27 @@ pub(crate) async fn reconcile_task_runtime_session_lost(state: &AppState, task_i
     let message = "本地运行会话已断开，任务已转为可恢复状态，等待自动恢复或人工继续";
     task.status = TaskStatus::Paused;
     task.claimed_by = None;
+    let mut thread_id = None;
+    let mut turn_id = None;
     task.activities
         .push(new_activity("task.runtime_session_lost", message));
     if let Some(runtime) = task.runtime.as_mut() {
+        thread_id = runtime.thread_id.clone();
+        turn_id = runtime.active_turn_id.clone();
         runtime.active_turn_id = None;
         runtime.last_error = Some(message.into());
         runtime
             .log
             .push(new_runtime_entry("system", message.to_string()));
     }
+    record_task_run_transition(
+        &mut guard,
+        task_id,
+        "interrupted",
+        Some(message),
+        thread_id.as_deref(),
+        turn_id.as_deref(),
+    );
     reset_agent_if_needed(&mut guard, task_id, "本地运行会话已断开，等待恢复");
     drop(guard);
     let _ = persist_state(state).await;

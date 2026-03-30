@@ -877,13 +877,14 @@ pub(crate) async fn auto_start_task(
         }
     }
 
-    let context = crate::prompt::resolve_task_execution_context(state, task_id, None).await?;
+    let mut context = crate::prompt::resolve_task_execution_context(state, task_id, None).await?;
     let _ = std::fs::create_dir_all(&context.workspace_root);
     let mut git_auto_merge_enabled = false;
     if matches!(state.runtime_mode, RuntimeMode::RealCodex) {
         let git_prepare =
             crate::git_ops::prepare_git_task_branch_in_repo(&context.workspace_root, task_id)
                 .await?;
+        context.workspace_root = git_prepare.workspace_root.clone();
         git_auto_merge_enabled = git_prepare.auto_merge_enabled;
         for (kind, message) in git_prepare.activities {
             record_task_activity(state, task_id, kind, message).await;

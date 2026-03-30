@@ -123,6 +123,15 @@
 
 ### Wave 4：Git worktree 隔离执行
 
+- 2026-03-31 进展：
+- 已落地最小可用的 `git worktree` 隔离执行链路，当前统一在仓库内 `.spotlight/runtime-worktrees/<task-id>` 准备/复用任务工作区
+- `start_task` / `resume_task` / `auto_start_task` 已把真实执行目录写入 run history，`resolve_workspace_for_task` 会优先回放执行 worktree，而不是盲目退回主工作区
+- Git 完成态收口已改为“在执行 worktree 提交，再回主工作区 merge”；失败现场默认保留，不做自动清理
+- `runtime_event_loop` 与 runtime session lost 恢复路径已补 run history transition，便于后续 watchdog / auto-resume 基于真实执行目录恢复
+- 当前缺口：
+- Git 测试语义已更新到 worktree 模式，但当前 Windows 环境下临时仓库 `git clone` 会因 `sh.exe ... couldn't create signal pipe, Win32 error 5` 失败，需后续单独处理测试基座
+- 还未实现 worktree 回收策略、冲突/泄漏专项测试，也还未做 clone 模式分支
+
 - [ ] 引入 worktree 准备器
 - [ ] 任务执行默认进入隔离 worktree
 - [ ] 失败时保留现场，成功后按策略合并或回收

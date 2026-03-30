@@ -1,6 +1,7 @@
 use platform_core::{Agent, PendingQuestion, Project, RuntimeLogEntry, Task, User, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -161,6 +162,7 @@ pub(crate) struct GitTaskBranchPlan {
 }
 
 pub(crate) struct GitPrepareResult {
+    pub workspace_root: PathBuf,
     pub activities: Vec<(String, String)>,
     pub auto_merge_enabled: bool,
 }

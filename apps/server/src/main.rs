@@ -5085,12 +5085,16 @@ process.stdin.on('data', (chunk) => {
             .await
             .unwrap();
         let activities = prepare.activities;
+        let execution_workspace_root = prepare.workspace_root;
 
         let current_branch = ensure_git_ok(&workspace_root, &["branch", "--show-current"]);
-        assert_eq!(current_branch, format!("task/{task_id}"));
+        assert_eq!(current_branch, "main");
+        let execution_branch =
+            ensure_git_ok(&execution_workspace_root, &["branch", "--show-current"]);
+        assert_eq!(execution_branch, format!("task/{task_id}"));
         assert!(activities
             .iter()
-            .any(|(kind, _)| kind == "git.task_branch_created"));
+            .any(|(kind, _)| kind == "git.task_worktree_created"));
 
         let _ = fs::remove_dir_all(
             workspace_root
@@ -5104,12 +5108,18 @@ process.stdin.on('data', (chunk) => {
         let workspace_root = init_git_test_workspace();
         let task_id = Uuid::from_u128(84);
 
-        prepare_git_task_branch_in_repo(&workspace_root, task_id)
+        let prepare = prepare_git_task_branch_in_repo(&workspace_root, task_id)
             .await
             .unwrap();
-        fs::write(workspace_root.join("feature.txt"), "from task branch\n").unwrap();
+        fs::write(
+            prepare.workspace_root.join("feature.txt"),
+            "from task branch\n",
+        )
+        .unwrap();
 
-        let activities = finalize_git_task_branch_in_repo(&workspace_root, task_id).await;
+        let activities =
+            finalize_git_task_branch_in_repo(&workspace_root, &prepare.workspace_root, task_id)
+                .await;
 
         let current_branch = ensure_git_ok(&workspace_root, &["branch", "--show-current"]);
         assert_eq!(current_branch, "main");
@@ -5129,7 +5139,7 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[tokio::test]
-    async fn prepare_git_task_branch_skips_auto_branching_when_worktree_is_dirty() {
+    async fn prepare_git_task_branch_creates_isolated_worktree_when_primary_is_dirty() {
         let workspace_root = init_git_test_workspace();
         let task_id = Uuid::from_u128(126);
 
@@ -5138,14 +5148,22 @@ process.stdin.on('data', (chunk) => {
         let prepare = prepare_git_task_branch_in_repo(&workspace_root, task_id)
             .await
             .unwrap();
+        let execution_workspace_root = prepare.workspace_root;
 
         let current_branch = ensure_git_ok(&workspace_root, &["branch", "--show-current"]);
         assert_eq!(current_branch, "main");
-        assert!(!prepare.auto_merge_enabled);
+        let execution_branch =
+            ensure_git_ok(&execution_workspace_root, &["branch", "--show-current"]);
+        assert_eq!(execution_branch, format!("task/{task_id}"));
+        assert!(prepare.auto_merge_enabled);
         assert!(prepare
             .activities
             .iter()
-            .any(|(kind, _)| kind == "git.branch_prepare_skipped"));
+            .any(|(kind, _)| kind == "git.primary_workspace_dirty"));
+        assert!(prepare
+            .activities
+            .iter()
+            .any(|(kind, _)| kind == "git.task_worktree_created"));
 
         let _ = fs::remove_dir_all(
             workspace_root

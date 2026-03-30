@@ -408,6 +408,9 @@ pub(crate) async fn resolve_workspace_for_task(
     task_id: Uuid,
 ) -> AppResult<PathBuf> {
     let guard = state.inner.lock().await;
+    if let Some(workspace_root) = task_execution_workspace_path(&guard, task_id) {
+        return Ok(workspace_root);
+    }
     let task = guard
         .tasks
         .iter()
@@ -415,6 +418,34 @@ pub(crate) async fn resolve_workspace_for_task(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "未找到任务".into()))?;
     let project = find_project(&guard, task.project_id)?;
     primary_workspace_path(project)
+}
+
+pub(crate) fn task_execution_workspace_path(state: &BoardState, task_id: Uuid) -> Option<PathBuf> {
+    state
+        .task_run_history
+        .get(&task_id)
+        .and_then(|runs| runs.last())
+        .and_then(|run| run.primary_workspace_path.as_deref())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let slot_id = state
+                .task_run_history
+                .get(&task_id)
+                .and_then(|runs| runs.last())
+                .and_then(|run| run.execution_slot_id)
+                .or_else(|| {
+                    state
+                        .execution_slots
+                        .iter()
+                        .rfind(|slot| slot.task_id == task_id)
+                        .map(|slot| slot.id)
+                })?;
+            state
+                .workspace_leases
+                .iter()
+                .rfind(|lease| lease.slot_id == slot_id)
+                .map(|lease| PathBuf::from(&lease.workspace_path))
+        })
 }
 
 pub(crate) fn build_local_build_restart_task(project: &Project) -> Task {

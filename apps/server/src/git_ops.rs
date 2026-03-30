@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
@@ -71,6 +71,53 @@ pub(crate) async fn git_worktree_dirty(workspace_root: &Path) -> Result<bool, St
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
+pub(crate) async fn git_tracked_worktree_dirty(workspace_root: &Path) -> Result<bool, String> {
+    let output = git_command_output(
+        workspace_root,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(git_stderr_message(&output));
+    }
+
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn isolated_task_worktree_path(primary_workspace_root: &Path, task_id: Uuid) -> PathBuf {
+    primary_workspace_root
+        .join(".spotlight")
+        .join("runtime-worktrees")
+        .join(task_id.to_string())
+}
+
+fn ensure_runtime_worktree_excluded(primary_workspace_root: &Path) -> Result<(), String> {
+    let exclude_path = primary_workspace_root
+        .join(".git")
+        .join("info")
+        .join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 .git/info 目录失败：{error}"))?;
+    }
+
+    let pattern = ".spotlight/runtime-worktrees/";
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == pattern) {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(pattern);
+    updated.push('\n');
+    std::fs::write(&exclude_path, updated)
+        .map_err(|error| format!("更新 .git/info/exclude 失败：{error}"))?;
+    Ok(())
+}
+
 pub(crate) async fn detect_primary_remote(workspace_root: &Path) -> Option<String> {
     if git_command_output(workspace_root, &["remote", "get-url", "origin"])
         .await
@@ -137,6 +184,7 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
     task_id: Uuid,
 ) -> AppResult<GitPrepareResult> {
     let mut activities = Vec::new();
+    let execution_workspace_root = isolated_task_worktree_path(workspace_root, task_id);
 
     if !is_git_repo(workspace_root).await {
         activities.push((
@@ -144,26 +192,31 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
             "当前工作目录不是 Git 仓库，跳过任务分支预处理。".into(),
         ));
         return Ok(GitPrepareResult {
+            workspace_root: workspace_root.to_path_buf(),
             activities,
             auto_merge_enabled: false,
         });
     }
 
-    if git_worktree_dirty(workspace_root)
+    ensure_runtime_worktree_excluded(workspace_root)
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))?;
+
+    if git_tracked_worktree_dirty(workspace_root)
         .await
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message.clone()))?
     {
-        let _message =
-            "任务启动前检测到 Git 工作区存在未提交改动，已阻止自动切换主分支并创建任务分支。"
-                .to_string();
         activities.push((
-            "git.branch_prepare_skipped".into(),
-            "任务启动前检测到 Git 工作区存在未提交改动，本次跳过自动切换主分支、任务分支创建和后续自动合并；任务仍会继续执行。".into(),
+            "git.primary_workspace_dirty".into(),
+            "检测到主工作区存在未提交跟踪改动；隔离 worktree 将基于最近一次已提交基线创建，不会带入这些本地修改。".into(),
         ));
-        return Ok(GitPrepareResult {
-            activities,
-            auto_merge_enabled: false,
-        });
+    } else if git_worktree_dirty(workspace_root)
+        .await
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message.clone()))?
+    {
+        activities.push((
+            "git.primary_workspace_untracked".into(),
+            "检测到主工作区存在未跟踪文件；隔离 worktree 已启用，不再因此跳过任务分支准备。".into(),
+        ));
     }
 
     let plan = detect_git_task_branch_plan(workspace_root, task_id).await;
@@ -176,6 +229,63 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
             plan.remote_name.as_deref().unwrap_or("无")
         ),
     ));
+
+    if execution_workspace_root.exists() {
+        if !is_git_repo(&execution_workspace_root).await {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "隔离 worktree 路径已存在但不是 Git 工作区：{}",
+                    execution_workspace_root.display()
+                ),
+            ));
+        }
+
+        let current_branch =
+            git_stdout_trimmed(&execution_workspace_root, &["branch", "--show-current"])
+                .await
+                .unwrap_or_default();
+        if current_branch.trim() != plan.task_branch {
+            match git_command_output(&execution_workspace_root, &["checkout", &plan.task_branch])
+                .await
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "复用隔离 worktree 失败，无法切换到任务分支 {}：{}",
+                            plan.task_branch,
+                            git_stderr_message(&output)
+                        ),
+                    ));
+                }
+                Err(error) => return Err((StatusCode::CONFLICT, error)),
+            }
+        }
+
+        activities.push((
+            "git.task_worktree_reused".into(),
+            format!(
+                "已复用任务隔离 worktree：{}",
+                execution_workspace_root.display()
+            ),
+        ));
+        return Ok(GitPrepareResult {
+            workspace_root: execution_workspace_root,
+            activities,
+            auto_merge_enabled: true,
+        });
+    }
+
+    if let Some(parent) = execution_workspace_root.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("创建隔离 worktree 父目录失败：{error}"),
+            )
+        })?;
+    }
 
     if let Some(remote) = plan.remote_name.as_deref() {
         let fetch = git_command_output(workspace_root, &["fetch", remote]).await;
@@ -196,89 +306,65 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
         }
     }
 
-    let checkout_base = git_command_output(workspace_root, &["checkout", &plan.base_branch]).await;
-    match checkout_base {
-        Ok(output) if output.status.success() => activities.push((
-            "git.base_checked_out".into(),
-            format!("已切换到主分支 {}。", plan.base_branch),
-        )),
-        Ok(output) => {
-            let message = format!(
-                "切换到主分支 {} 失败：{}",
-                plan.base_branch,
-                git_stderr_message(&output)
-            );
-            activities.push(("git.branch_prepare_failed".into(), message.clone()));
-            return Err((StatusCode::CONFLICT, message));
-        }
-        Err(error) => {
-            activities.push(("git.branch_prepare_failed".into(), error.clone()));
-            return Err((StatusCode::CONFLICT, error));
-        }
-    }
-
-    if let Some(remote) = plan.remote_name.as_deref() {
-        let remote_branch_ref = format!("refs/remotes/{remote}/{}", plan.base_branch);
-        if git_ref_exists(workspace_root, &remote_branch_ref).await {
-            let upstream = format!("{remote}/{}", plan.base_branch);
-            let update_main =
-                git_command_output(workspace_root, &["merge", "--ff-only", &upstream]).await;
-            match update_main {
-                Ok(output) if output.status.success() => activities.push((
-                    "git.base_updated".into(),
-                    format!("已使用 {upstream} 快进更新本地主分支。"),
-                )),
-                Ok(output) => {
-                    let message = format!(
-                        "主分支在任务启动前无法快进到 {upstream}：{}",
-                        git_stderr_message(&output)
-                    );
-                    activities.push(("git.branch_prepare_failed".into(), message.clone()));
-                    return Err((StatusCode::CONFLICT, message));
-                }
-                Err(error) => {
-                    activities.push(("git.branch_prepare_failed".into(), error.clone()));
-                    return Err((StatusCode::CONFLICT, error));
-                }
-            }
-        } else {
-            activities.push((
-                "git.base_update_skipped".into(),
-                format!(
-                    "远端 {remote} 上未找到 {}/{}，跳过主分支快进。",
-                    remote, plan.base_branch
-                ),
-            ));
-        }
-    }
-
     let task_branch_ref = format!("refs/heads/{}", plan.task_branch);
     let branch_exists = git_ref_exists(workspace_root, &task_branch_ref).await;
-    let checkout_task_args = if branch_exists {
-        vec!["checkout", plan.task_branch.as_str()]
+    let start_point = if let Some(remote) = plan.remote_name.as_deref() {
+        let remote_branch_ref = format!("refs/remotes/{remote}/{}", plan.base_branch);
+        if git_ref_exists(workspace_root, &remote_branch_ref).await {
+            format!("{remote}/{}", plan.base_branch)
+        } else {
+            plan.base_branch.clone()
+        }
     } else {
-        vec!["checkout", "-b", plan.task_branch.as_str()]
+        plan.base_branch.clone()
     };
-    let checkout_task = git_command_output(workspace_root, &checkout_task_args).await;
+    let worktree_add_args_owned = if branch_exists {
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            execution_workspace_root.display().to_string(),
+            plan.task_branch.clone(),
+        ]
+    } else {
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            "-b".to_string(),
+            plan.task_branch.clone(),
+            execution_workspace_root.display().to_string(),
+            start_point.clone(),
+        ]
+    };
+    let worktree_add_args = worktree_add_args_owned
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let checkout_task = git_command_output(workspace_root, &worktree_add_args).await;
     match checkout_task {
         Ok(output) if output.status.success() => activities.push((
             if branch_exists {
-                "git.task_branch_reused".into()
+                "git.task_worktree_attached".into()
             } else {
-                "git.task_branch_created".into()
+                "git.task_worktree_created".into()
             },
             if branch_exists {
-                format!("已切换到已存在的任务分支 {}。", plan.task_branch)
+                format!(
+                    "已为任务分支 {} 挂载隔离 worktree：{}。",
+                    plan.task_branch,
+                    execution_workspace_root.display()
+                )
             } else {
                 format!(
-                    "已基于主分支 {} 创建任务分支 {}。",
-                    plan.base_branch, plan.task_branch
+                    "已基于 {} 创建任务分支 {}，隔离 worktree={}",
+                    start_point,
+                    plan.task_branch,
+                    execution_workspace_root.display()
                 )
             },
         )),
         Ok(output) => {
             let message = format!(
-                "切换到任务分支 {} 失败：{}",
+                "创建任务隔离 worktree {} 失败：{}",
                 plan.task_branch,
                 git_stderr_message(&output)
             );
@@ -292,6 +378,7 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
     }
 
     Ok(GitPrepareResult {
+        workspace_root: execution_workspace_root,
         activities,
         auto_merge_enabled: true,
     })
@@ -299,14 +386,15 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
 
 pub(crate) async fn finalize_git_task_branch_in_repo(
     workspace_root: &Path,
+    execution_workspace_root: &Path,
     task_id: Uuid,
 ) -> Vec<(String, String)> {
     let mut activities = Vec::new();
 
-    if !is_git_repo(workspace_root).await {
+    if !is_git_repo(workspace_root).await || !is_git_repo(execution_workspace_root).await {
         activities.push((
             "git.merge_skipped".into(),
-            "当前工作目录不是 Git 仓库，跳过任务完成后的自动合并。".into(),
+            "主工作区或执行 worktree 不是 Git 仓库，跳过任务完成后的自动合并。".into(),
         ));
         return activities;
     }
@@ -315,19 +403,21 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
     activities.push((
         "git.merge_plan".into(),
         format!(
-            "任务完成后的 Git 合并计划：主分支={}，任务分支={}，远端={}",
+            "任务完成后的 Git 合并计划：主分支={}，任务分支={}，远端={}，执行 worktree={}",
             plan.base_branch,
             plan.task_branch,
-            plan.remote_name.as_deref().unwrap_or("无")
+            plan.remote_name.as_deref().unwrap_or("无"),
+            execution_workspace_root.display()
         ),
     ));
 
-    let current_branch = git_stdout_trimmed(workspace_root, &["branch", "--show-current"])
-        .await
-        .unwrap_or_default();
+    let current_branch =
+        git_stdout_trimmed(execution_workspace_root, &["branch", "--show-current"])
+            .await
+            .unwrap_or_default();
     if current_branch.trim() != plan.task_branch {
         let task_branch_ref = format!("refs/heads/{}", plan.task_branch);
-        if !git_ref_exists(workspace_root, &task_branch_ref).await {
+        if !git_ref_exists(execution_workspace_root, &task_branch_ref).await {
             activities.push((
                 "git.merge_skipped".into(),
                 format!("未找到任务分支 {}，跳过自动合并。", plan.task_branch),
@@ -335,16 +425,19 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
             return activities;
         }
 
-        match git_command_output(workspace_root, &["checkout", &plan.task_branch]).await {
+        match git_command_output(execution_workspace_root, &["checkout", &plan.task_branch]).await {
             Ok(output) if output.status.success() => activities.push((
                 "git.task_branch_checked_out".into(),
-                format!("自动合并前已切换回任务分支 {}。", plan.task_branch),
+                format!(
+                    "自动合并前已在隔离 worktree 中切换回任务分支 {}。",
+                    plan.task_branch
+                ),
             )),
             Ok(output) => {
                 activities.push((
                     "git.merge_blocked".into(),
                     format!(
-                        "自动合并前无法切换到任务分支 {}：{}",
+                        "自动合并前无法在隔离 worktree 中切换到任务分支 {}：{}",
                         plan.task_branch,
                         git_stderr_message(&output)
                     ),
@@ -358,9 +451,9 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
         }
     }
 
-    match git_worktree_dirty(workspace_root).await {
+    match git_worktree_dirty(execution_workspace_root).await {
         Ok(true) => {
-            match git_command_output(workspace_root, &["add", "-A"]).await {
+            match git_command_output(execution_workspace_root, &["add", "-A"]).await {
                 Ok(output) if output.status.success() => {}
                 Ok(output) => {
                     activities.push((
@@ -379,7 +472,7 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
             }
 
             let cached_clean = git_command_output(
-                workspace_root,
+                execution_workspace_root,
                 &["diff", "--cached", "--quiet", "--exit-code"],
             )
             .await;
@@ -393,12 +486,18 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
 
             if needs_commit {
                 let commit_message = format!("chore(task): 完成任务 {task_id}");
-                match git_command_output(workspace_root, &["commit", "-m", commit_message.as_str()])
-                    .await
+                match git_command_output(
+                    execution_workspace_root,
+                    &["commit", "-m", commit_message.as_str()],
+                )
+                .await
                 {
                     Ok(output) if output.status.success() => activities.push((
                         "git.task_branch_committed".into(),
-                        format!("已自动提交任务分支 {} 上的改动。", plan.task_branch),
+                        format!(
+                            "已在隔离 worktree 中自动提交任务分支 {} 上的改动。",
+                            plan.task_branch
+                        ),
                     )),
                     Ok(output) => {
                         activities.push((
@@ -428,6 +527,33 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
         }
     }
 
+    let current_primary_branch = git_stdout_trimmed(workspace_root, &["branch", "--show-current"])
+        .await
+        .unwrap_or_default();
+    if current_primary_branch.trim() != plan.base_branch {
+        match git_command_output(workspace_root, &["checkout", &plan.base_branch]).await {
+            Ok(output) if output.status.success() => activities.push((
+                "git.base_checked_out".into(),
+                format!("自动合并前已切换主工作区到主分支 {}。", plan.base_branch),
+            )),
+            Ok(output) => {
+                activities.push((
+                    "git.merge_blocked".into(),
+                    format!(
+                        "自动合并前无法切换主工作区到主分支 {}：{}",
+                        plan.base_branch,
+                        git_stderr_message(&output)
+                    ),
+                ));
+                return activities;
+            }
+            Err(error) => {
+                activities.push(("git.merge_blocked".into(), error));
+                return activities;
+            }
+        }
+    }
+
     if let Some(remote) = plan.remote_name.as_deref() {
         match git_command_output(workspace_root, &["fetch", remote]).await {
             Ok(output) if output.status.success() => activities.push((
@@ -451,30 +577,6 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
         }
     }
 
-    match git_command_output(workspace_root, &["checkout", &plan.base_branch]).await {
-        Ok(output) if output.status.success() => activities.push((
-            "git.base_checked_out".into(),
-            format!("自动合并前已切换回主分支 {}。", plan.base_branch),
-        )),
-        Ok(output) => {
-            activities.push((
-                "git.merge_blocked".into(),
-                format!(
-                    "自动合并前无法切换到主分支 {}：{}",
-                    plan.base_branch,
-                    git_stderr_message(&output)
-                ),
-            ));
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            return activities;
-        }
-        Err(error) => {
-            activities.push(("git.merge_blocked".into(), error));
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
-            return activities;
-        }
-    }
-
     if let Some(remote) = plan.remote_name.as_deref() {
         let remote_branch_ref = format!("refs/remotes/{remote}/{}", plan.base_branch);
         if git_ref_exists(workspace_root, &remote_branch_ref).await {
@@ -492,14 +594,10 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
                             git_stderr_message(&output)
                         ),
                     ));
-                    let _ =
-                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
                     return activities;
                 }
                 Err(error) => {
                     activities.push(("git.merge_blocked".into(), error));
-                    let _ =
-                        git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
                     return activities;
                 }
             }
@@ -529,7 +627,6 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
         Ok(output) => {
             let details = git_stderr_message(&output);
             let _ = git_command_output(workspace_root, &["merge", "--abort"]).await;
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
             activities.push((
                 "git.merge_blocked".into(),
                 format!(
@@ -540,7 +637,6 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
         }
         Err(error) => {
             let _ = git_command_output(workspace_root, &["merge", "--abort"]).await;
-            let _ = git_command_output(workspace_root, &["checkout", &plan.task_branch]).await;
             activities.push((
                 "git.merge_blocked".into(),
                 format!(
