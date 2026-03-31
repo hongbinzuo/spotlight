@@ -5116,6 +5116,10 @@ process.stdin.on('data', (chunk) => {
         assert!(activities
             .iter()
             .any(|(kind, _)| kind == "git.merge_completed"));
+        assert!(activities
+            .iter()
+            .any(|(kind, _)| kind == "git.task_worktree_removed"));
+        assert!(!prepare.workspace_root.exists());
 
         let merged_branches = ensure_git_ok(&workspace_root, &["branch", "--merged", "main"]);
         assert!(merged_branches.contains(&format!("task/{task_id}")));

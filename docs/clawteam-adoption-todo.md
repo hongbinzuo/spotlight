@@ -126,11 +126,11 @@
 - 2026-03-31 进展：
 - 已落地最小可用的 `git worktree` 隔离执行链路，当前统一在仓库内 `.spotlight/runtime-worktrees/<task-id>` 准备/复用任务工作区
 - `start_task` / `resume_task` / `auto_start_task` 已把真实执行目录写入 run history，`resolve_workspace_for_task` 会优先回放执行 worktree，而不是盲目退回主工作区
-- Git 完成态收口已改为“在执行 worktree 提交，再回主工作区 merge”；失败现场默认保留，不做自动清理
+- Git 完成态收口已改为“在执行 worktree 提交，再回主工作区 merge”；成功合并后会自动回收任务 worktree，失败现场默认保留
 - `runtime_event_loop` 与 runtime session lost 恢复路径已补 run history transition，便于后续 watchdog / auto-resume 基于真实执行目录恢复
 - Git 回归测试基座已改成单仓库初始化，不再依赖当前 Windows 环境里会异常的 `git clone` / `git push` 到临时本地 remote
 - 当前缺口：
-- 还未实现 worktree 回收策略、冲突/泄漏专项测试，也还未做 clone 模式分支
+- 还未实现更细粒度的 worktree 回收策略、冲突/泄漏专项测试，也还未做 clone 模式分支
 
 - [ ] 引入 worktree 准备器
 - [ ] 任务执行默认进入隔离 worktree

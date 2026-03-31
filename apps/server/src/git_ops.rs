@@ -617,13 +617,47 @@ pub(crate) async fn finalize_git_task_branch_in_repo(
     )
     .await
     {
-        Ok(output) if output.status.success() => activities.push((
-            "git.merge_completed".into(),
-            format!(
-                "已将任务分支 {} 合并回主分支 {}。",
-                plan.task_branch, plan.base_branch
-            ),
-        )),
+        Ok(output) if output.status.success() => {
+            activities.push((
+                "git.merge_completed".into(),
+                format!(
+                    "已将任务分支 {} 合并回主分支 {}。",
+                    plan.task_branch, plan.base_branch
+                ),
+            ));
+            if execution_workspace_root != workspace_root {
+                let remove_args_owned = vec![
+                    "worktree".to_string(),
+                    "remove".to_string(),
+                    "--force".to_string(),
+                    execution_workspace_root.display().to_string(),
+                ];
+                let remove_args = remove_args_owned
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                match git_command_output(workspace_root, &remove_args).await {
+                    Ok(remove_output) if remove_output.status.success() => activities.push((
+                        "git.task_worktree_removed".into(),
+                        format!(
+                            "任务 worktree 已回收：{}",
+                            execution_workspace_root.display()
+                        ),
+                    )),
+                    Ok(remove_output) => activities.push((
+                        "git.task_worktree_cleanup_blocked".into(),
+                        format!(
+                            "任务 worktree 合并成功，但回收失败：{}",
+                            git_stderr_message(&remove_output)
+                        ),
+                    )),
+                    Err(error) => activities.push((
+                        "git.task_worktree_cleanup_blocked".into(),
+                        format!("任务 worktree 合并成功，但回收失败：{error}"),
+                    )),
+                }
+            }
+        }
         Ok(output) => {
             let details = git_stderr_message(&output);
             let _ = git_command_output(workspace_root, &["merge", "--abort"]).await;
