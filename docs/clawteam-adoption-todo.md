@@ -129,8 +129,9 @@
 - Git 完成态收口已改为“在执行 worktree 提交，再回主工作区 merge”；成功合并后会自动回收任务 worktree，失败现场默认保留
 - `runtime_event_loop` 与 runtime session lost 恢复路径已补 run history transition，便于后续 watchdog / auto-resume 基于真实执行目录恢复
 - Git 回归测试基座已改成单仓库初始化，不再依赖当前 Windows 环境里会异常的 `git clone` / `git push` 到临时本地 remote
+- 已补最小 cleanup failure 回归：非 worktree 路径回收失败时会记录 `git.task_worktree_cleanup_blocked`
 - 当前缺口：
-- 还未实现更细粒度的 worktree 回收策略、冲突/泄漏专项测试，也还未做 clone 模式分支
+- 还未补真实 worktree 切换失败 / 泄漏 / 冲突专项测试，也还未做 clone 模式分支
 
 - [ ] 引入 worktree 准备器
 - [ ] 任务执行默认进入隔离 worktree

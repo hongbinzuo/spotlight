@@ -384,6 +384,44 @@ pub(crate) async fn prepare_git_task_branch_in_repo(
     })
 }
 
+pub(crate) async fn cleanup_task_worktree_in_repo(
+    workspace_root: &Path,
+    execution_workspace_root: &Path,
+) -> Vec<(String, String)> {
+    if execution_workspace_root == workspace_root {
+        return Vec::new();
+    }
+
+    let remove_args_owned = vec![
+        "worktree".to_string(),
+        "remove".to_string(),
+        "--force".to_string(),
+        execution_workspace_root.display().to_string(),
+    ];
+    let remove_args = remove_args_owned
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    match git_command_output(workspace_root, &remove_args).await {
+        Ok(remove_output) if remove_output.status.success() => vec![(
+            "git.task_worktree_removed".into(),
+            format!("任务 worktree 已回收：{}", execution_workspace_root.display()),
+        )],
+        Ok(remove_output) => vec![(
+            "git.task_worktree_cleanup_blocked".into(),
+            format!(
+                "任务 worktree 合并成功，但回收失败：{}",
+                git_stderr_message(&remove_output)
+            ),
+        )],
+        Err(error) => vec![(
+            "git.task_worktree_cleanup_blocked".into(),
+            format!("任务 worktree 合并成功，但回收失败：{error}"),
+        )],
+    }
+}
+
 pub(crate) async fn finalize_git_task_branch_in_repo(
     workspace_root: &Path,
     execution_workspace_root: &Path,

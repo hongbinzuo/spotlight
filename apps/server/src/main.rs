@@ -94,15 +94,15 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_task_conflict, auto_claim_next_task, build_api_router, build_app, default_agents,
-        default_projects, default_state, default_users, finalize_git_task_branch_in_repo,
-        prepare_git_task_branch_in_repo, reconcile_parallel_active_tasks, reconcile_watchdog_state,
-        run_automation_cycle_once, runtime_event_loop, select_next_auto_resume_task_id,
-        write_memory_revision, AppState, BoardState, MemoryWriteSpec, PersistedState,
-        ProjectChatMessage, ProjectContextSnapshot, ProjectMemorySnapshot, ProjectScanSummary,
-        ProjectSession, ProjectSummarySnapshot, PullNextResponse, RuntimeEvent, RuntimeMode,
-        BOARD_MESSAGE_CHAR_LIMIT, BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT,
-        TASK_STALE_TIMEOUT_SECS,
+        active_task_conflict, auto_claim_next_task, build_api_router, build_app,
+        cleanup_task_worktree_in_repo, default_agents, default_projects, default_state,
+        default_users, finalize_git_task_branch_in_repo, prepare_git_task_branch_in_repo,
+        reconcile_parallel_active_tasks, reconcile_watchdog_state, run_automation_cycle_once,
+        runtime_event_loop, select_next_auto_resume_task_id, write_memory_revision, AppState,
+        BoardState, MemoryWriteSpec, PersistedState, ProjectChatMessage, ProjectContextSnapshot,
+        ProjectMemorySnapshot, ProjectScanSummary, ProjectSession, ProjectSummarySnapshot,
+        PullNextResponse, RuntimeEvent, RuntimeMode, BOARD_MESSAGE_CHAR_LIMIT,
+        BOARD_TASK_ACTIVITY_LIMIT, BOARD_TASK_RUNTIME_LOG_LIMIT, TASK_STALE_TIMEOUT_SECS,
     };
     use crate::task_ops::{
         detect_project_stack, mark_task_running_with_provider, sanitize_credential_hint,
@@ -5123,6 +5123,26 @@ process.stdin.on('data', (chunk) => {
 
         let merged_branches = ensure_git_ok(&workspace_root, &["branch", "--merged", "main"]);
         assert!(merged_branches.contains(&format!("task/{task_id}")));
+
+        let _ = fs::remove_dir_all(
+            workspace_root
+                .parent()
+                .expect("local clone should have parent directory"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_worktree_reports_failure_for_non_worktree_path() {
+        let workspace_root = init_git_test_workspace();
+        let bogus_path = workspace_root.join(".spotlight").join("runtime-worktrees").join("bogus");
+        fs::create_dir_all(&bogus_path).unwrap();
+
+        let activities = cleanup_task_worktree_in_repo(&workspace_root, &bogus_path).await;
+
+        assert!(activities
+            .iter()
+            .any(|(kind, _)| kind == "git.task_worktree_cleanup_blocked"));
+        assert!(bogus_path.exists());
 
         let _ = fs::remove_dir_all(
             workspace_root
